@@ -606,13 +606,14 @@ Tick boxes as tasks finish. Estimates are guesses. Slice 1 (M0–M6) ≈ 8–9 w
 ### M0 · Spike
 **Status:** ⬜ · **Estimate:** 2 h · **Depends on:** nothing · **Confirms:** U1, U8 in practice
 
-Goal: confirm the working-directory identity (A1 c) with real tools before writing code. Documentation research already answered these questions; this is a hands-on check, not open research.
+Goal: confirm the working-directory identity (A1 c) with real tools before writing code. Documentation research already answered these questions; this is a hands-on check, not open research. One permanent item is included by request: Dependabot plus CI automatic checks (task 6); unlike the rest of M0, those files are kept.
 
 - [ ] 1. Write a tiny stdio MCP server (TypeScript) with one tool returning `process.cwd()`, `argv`, and the environment variable names
 - [ ] 2. Register it in OpenCode's project MCP config; call the tool in the main directory and again inside a git worktree; record both `cwd` values
 - [ ] 3. Create a worktree; run `git check-ignore -v .artinarey.json` with the entry only in `.git/info/exclude`; commit in the worktree and confirm a hook in the shared hooks directory fires
 - [ ] 4. Start `opencode serve`; create a session scoped to a worktree; confirm the shim's `cwd` is that worktree and that config comes from the canonical checkout
 - [ ] 5. Fill in the Spike results table
+- [ ] 6. Add Dependabot and CI automatic checks (`.github/dependabot.yml`, `.github/workflows/ci.yml`) — repository infrastructure, retained after the spike
 
 **Done when:** every check has a recorded result.
 **Exit rule:** if the shim's `cwd` is not the worktree, fall back to a static header or environment value supplied per session by the daemon (identity still tied to the directory record). Subagents and Codex are out of scope; both were settled in section 17.

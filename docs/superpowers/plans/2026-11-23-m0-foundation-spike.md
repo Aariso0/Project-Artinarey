@@ -36,6 +36,8 @@ Nothing built here is product code. The only durable outputs are:
 
 **Out of scope:** daemon, mail store, leases, GUI, pidfd liveness, storage Move, pre-merge checks, subagents, Claude Code / Codex / Antigravity, model API adapter. These were settled in `plan.md` §17 and must not be reopened here.
 
+**One explicit addition by user request:** Task 11 adds Dependabot and CI automatic checks. This is retained repository infrastructure, not a throwaway spike artifact, and is the only item that survives the Task 10 cleanup.
+
 ---
 
 ## 2. Environment facts (verified 2026-11-23 — inputs, not assumptions)
@@ -483,6 +485,93 @@ git add -A && git commit -m "spike(m0): record results and clean up"
 5. Leave this plan document on the branch as the deliverable. Report to the user: each check's result, whether the exit rule fired, and the recommended next action.
 
 **Commit:** as above.
+
+---
+
+### Task 11 — Dependabot and CI/CD automatic checks (permanent, retained)
+
+**Purpose:** added by user request. Unlike Tasks 1–10, these files are repository infrastructure, not throwaway spikes: **do not delete them in Task 10**. Keep this task last so cleanup in Task 10 does not touch `.github/`.
+
+Create `.github/dependabot.yml`:
+
+```yaml
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+```
+
+The npm entry is inert until a root `package.json` exists; that is intentional — M1 will add one.
+
+Create `.github/workflows/ci.yml`:
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main, "MO/**"]
+  pull_request:
+    branches: [main, "MO/**"]
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Required docs and GPL license
+        run: |
+          test -f README.md
+          test -f plan.md
+          test -f LICENSE
+          grep -q 'GPL-3.0' README.md
+          grep -q 'GNU GENERAL PUBLIC LICENSE' LICENSE
+      - name: Root doc relative links resolve
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+          bad = []
+          for name in ('README.md', 'plan.md'):
+              md = pathlib.Path(name)
+              for target in re.findall(r'\]\(([^)#]+)(?:#[^)]*)?\)', md.read_text(errors='ignore')):
+                  if '://' in target or target.startswith('mailto:'):
+                      continue
+                  if not (md.parent / target).resolve().exists():
+                      bad.append(f'{name}: {target}')
+          if bad:
+              print('\n'.join(bad))
+              sys.exit(1)
+          PY
+
+  node:
+    if: ${{ hashFiles('package.json') != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+```
+
+**Test locally** (no GitHub runner needed):
+
+```bash
+cd /mnt/shareddata/projects/Project-Artinarey
+python3 -c "import yaml,sys; [yaml.safe_load(open(f)) for f in ['.github/dependabot.yml','.github/workflows/ci.yml']]"
+```
+
+If PyYAML is missing, install it in `/tmp/opencode` or validate with `ruby -e "require 'yaml'; ..."` — do not add it as a project dependency.
+
+**Commit:** `spike(m0): add dependabot and CI checks`
 
 ---
 
