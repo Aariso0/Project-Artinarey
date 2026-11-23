@@ -1,0 +1,2 @@
+npm notice run shim@1.0.0 start
+npm notice run tsx src/index.ts
