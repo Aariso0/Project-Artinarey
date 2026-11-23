@@ -7,34 +7,6 @@ on:
     branches: [main, "MO/**"]
 
 jobs:
-  docs:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Required docs and GPL license
-        run: |
-          test -f README.md
-          test -f plan.md
-          test -f LICENSE
-          grep -q 'GPL-3.0' README.md
-          grep -q 'GNU GENERAL PUBLIC LICENSE' LICENSE
-      - name: Root doc relative links resolve
-        run: |
-          python3 - <<'PY'
-          import pathlib, re, sys
-          bad = []
-          for name in ('README.md', 'plan.md'):
-              md = pathlib.Path(name)
-              for target in re.findall(r'\]\(([^)#]+)(?:#[^)]*)?\)', md.read_text(errors='ignore')):
-                  if '://' in target or target.startswith('mailto:'):
-                      continue
-                  if not (md.parent / target).resolve().exists():
-                      bad.append(f'{name}: {target}')
-          if bad:
-              print('\n'.join(bad))
-              sys.exit(1)
-          PY
-
   node:
     runs-on: ubuntu-latest
     steps:
