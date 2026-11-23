@@ -1,5 +1,9 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import type { ArtinareyErrorCode } from './errors.ts';
+import { readPersona, writePersona } from './persona-store.ts';
+import { appendJournal } from './store.ts';
+import type { Registry } from './registry.ts';
 
 export type Marker = {
   schema: 1;
@@ -41,4 +45,224 @@ export function findMarker(startDir: string): { dir: string; marker: Marker } | 
     if (parent === current) return undefined;
     current = parent;
   }
+}
+
+export type Identity = {
+  projectId: string;
+  worktreeId: string;
+  markerDir: string;
+  storeDir: string;
+  personaId?: string;
+  role?: string;
+};
+
+export type IdentityFailure = {
+  ok: false;
+  code: ArtinareyErrorCode;
+  message: string;
+};
+
+export type IdentityResult = { ok: true; identity: Identity } | IdentityFailure;
+export type ClaimResult =
+  | { ok: true; identity: Identity; personaId: string; created: boolean }
+  | IdentityFailure;
+
+export type RosterEntry = {
+  personaId: string;
+  name: string;
+  role: string;
+  state: string;
+  homeWorktreeId: string | null;
+  lastTask: string;
+};
+
+function audit(storeDir: string, event: Record<string, unknown>): void {
+  appendJournal(join(storeDir, 'events', 'audit.jsonl'), {
+    ...event,
+    created_at: new Date().toISOString(),
+  });
+}
+
+function sameDirectory(a: string, b: string): boolean {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return resolve(a) === resolve(b);
+  }
+}
+
+/** Marker → registered worktree → bound persona. Every mismatch is audited. */
+export function resolveIdentity(registry: Registry, cwd: string): IdentityResult {
+  const found = findMarker(cwd);
+  if (!found) {
+    return { ok: false, code: 'NO_PROJECT', message: 'no .artinarey.json found; run artinarey init' };
+  }
+
+  let registeredPath: string | undefined;
+  let storeDir: string | undefined;
+  for (const project of registry.projects.list()) {
+    const worktree = registry.worktrees.list(project.id)
+      .find((wt) => wt.id === found.marker.worktree_id);
+    if (worktree && project.id === found.marker.project_id) {
+      registeredPath = worktree.path;
+      storeDir = project.storeDir;
+      break;
+    }
+  }
+
+  if (!registeredPath || !storeDir || !sameDirectory(found.dir, registeredPath)) {
+    audit(storeDir ?? join(cwd, '.artinarey-unmanaged'), {
+      type: 'worktree_unmanaged',
+      worktree_id: found.marker.worktree_id,
+      marker_dir: found.dir,
+      registered_path: registeredPath ?? null,
+    });
+    return {
+      ok: false,
+      code: 'WORKTREE_UNMANAGED',
+      message: 'marker does not match a registered worktree; run artinarey worktree adopt',
+    };
+  }
+
+  const binding = registry.bindings.forWorktree(found.marker.worktree_id);
+  const identity: Identity = {
+    projectId: found.marker.project_id,
+    worktreeId: found.marker.worktree_id,
+    markerDir: found.dir,
+    storeDir,
+    ...(binding ? { personaId: binding.id, role: binding.role } : {}),
+  };
+  return { ok: true, identity };
+}
+
+export function createPersona(
+  registry: Registry,
+  storeDir: string,
+  projectId: string,
+  role: string,
+  name: string,
+): string {
+  const persona = registry.personas.create({ projectId, role, name });
+  writePersona(storeDir, persona.id, {
+    role, name, home_worktree_id: null, state: 'new', vendor: null, last_vendor_session_id: null,
+  });
+  audit(storeDir, { type: 'persona_created', persona_id: persona.id, role, name });
+  return persona.id;
+}
+
+export function roster(registry: Registry, storeDir: string, projectId: string): RosterEntry[] {
+  return registry.personas.list(projectId).map((persona) => {
+    const state = readPersona(storeDir, persona.id);
+    const statusFile = join(storeDir, 'personas', persona.id, 'status.md');
+    const lastTask = existsSync(statusFile)
+      ? readFileSync(statusFile, 'utf8').trim().replace(/\s+/g, ' ')
+      : '';
+    return {
+      personaId: persona.id,
+      name: persona.name,
+      role: persona.role,
+      state: state.state,
+      homeWorktreeId: state.home_worktree_id,
+      lastTask,
+    };
+  });
+}
+
+export type ClaimOptions = {
+  personaId?: string;
+  newRole?: string;
+  name?: string;
+  confirmMove?: boolean;
+  rehome?: boolean;
+};
+
+/** Bind a persona to the attached worktree, enforcing the settled one-per-directory rules. */
+export function claimPersona(
+  registry: Registry,
+  storeDir: string,
+  identity: Identity,
+  options: ClaimOptions,
+): ClaimResult {
+  let personaId = options.personaId;
+  let created = false;
+  if (!personaId && options.newRole) {
+    personaId = createPersona(
+      registry, storeDir, identity.projectId, options.newRole, options.name ?? options.newRole,
+    );
+    created = true;
+  }
+  if (!personaId) {
+    return { ok: false, code: 'INVALID_INPUT', message: 'provide persona_id or new_role' };
+  }
+
+  const persona = registry.personas.get(personaId);
+  if (!persona || persona.projectId !== identity.projectId) {
+    return { ok: false, code: 'NOT_FOUND', message: `unknown persona: ${personaId}` };
+  }
+
+  const busy = registry.bindings.forWorktree(identity.worktreeId);
+  if (busy && busy.id !== personaId) {
+    audit(storeDir, { type: 'claim_refused', code: 'DIRECTORY_BUSY', persona_id: personaId,
+      worktree_id: identity.worktreeId, other_persona_id: busy.id });
+    return {
+      ok: false,
+      code: 'DIRECTORY_BUSY',
+      message: `directory is already bound to ${busy.role} (${busy.name}); stop and tell the user`,
+    };
+  }
+
+  const personaState = readPersona(storeDir, personaId);
+  const home = personaState.home_worktree_id;
+  const isSeniorDev = persona.role === 'senior-dev';
+  if (home && home !== identity.worktreeId && !options.confirmMove && !options.rehome && !isSeniorDev) {
+    audit(storeDir, { type: 'claim_needs_confirmation', persona_id: personaId,
+      home_worktree_id: home, worktree_id: identity.worktreeId });
+    return {
+      ok: false,
+      code: 'NEEDS_CONFIRMATION',
+      message: `${persona.role} is home in another worktree; ask the user, then repeat with confirm_move=true (or rehome=true)`,
+    };
+  }
+
+  registry.bindings.bind(personaId, identity.worktreeId);
+  const nextHome = options.rehome || !home ? identity.worktreeId : home;
+  writePersona(storeDir, personaId, { ...personaState, home_worktree_id: nextHome, state: 'active' });
+  audit(storeDir, { type: 'persona_claimed', persona_id: personaId,
+    worktree_id: identity.worktreeId, home_worktree_id: nextHome,
+    confirmed_move: Boolean(options.confirmMove), rehome: Boolean(options.rehome) });
+
+  return {
+    ok: true,
+    personaId,
+    created,
+    identity: { ...identity, personaId, role: persona.role },
+  };
+}
+
+export function releasePersona(
+  registry: Registry,
+  storeDir: string,
+  personaId: string,
+): void {
+  registry.bindings.release(personaId);
+  const state = readPersona(storeDir, personaId);
+  if (state.state !== 'new' || state.role) {
+    writePersona(storeDir, personaId, { ...state, state: 'idle' });
+  }
+  audit(storeDir, { type: 'persona_released', persona_id: personaId });
+}
+
+/** User-initiated override via `artinarey release --force`. Returns false if nothing was bound. */
+export function releaseWorktreeForce(
+  registry: Registry,
+  storeDir: string,
+  worktreeId: string,
+): boolean {
+  const bound = registry.bindings.forWorktree(worktreeId);
+  if (!bound) return false;
+  releasePersona(registry, storeDir, bound.id);
+  audit(storeDir, {
+    type: 'forced_release', persona_id: bound.id, worktree_id: worktreeId,
+  });
+  return true;
 }
