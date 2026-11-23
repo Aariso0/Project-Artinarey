@@ -459,17 +459,8 @@ kill "$(cat spike/m0/evidence/serve.pid)"
 **Purpose:** turn observations into durable evidence and leave a clean tree.
 
 1. Fill `plan.md` lines 57–64 with the five real values and short notes (include the fact that MCP `cwd`/`environment` were deliberately unset).
-2. Create a decision record via chatter:
-
-```bash
-export CHATTER_AGENT=opencode CHATTER_PERSONA=researcher
-python3 .agents/skills/chatter/scripts/chatter.py decision --title "M0 spike result" --kind decision <<'EOF'
-C1..C5 PASS/FAIL with the exact observed cwd values. Exit rule: triggered / not triggered.
-If triggered: daemon supplies identity via MCP environment or cwd field; identity stays tied to the directory record.
-EOF
-```
-
-3. Copy raw evidence (all of `spike/m0/evidence/` plus `evidence.md`) into `chat/researcher/journal/23-11-2026.md` or a dedicated `chat/researcher/spike-m0-evidence.md`. **Do this before deleting anything.**
+2. Record the decision in local, untracked notes: C1..C5 PASS/FAIL with the exact observed cwd values; exit rule triggered or not triggered; if triggered, the daemon supplies identity via MCP environment or cwd field and identity stays tied to the directory record.
+3. Copy raw evidence (all of `spike/m0/evidence/` plus `evidence.md`) into local, untracked notes. **Do this before deleting anything.**
 4. Remove throwaway artifacts:
 
 ```bash
@@ -623,4 +614,4 @@ The fallback is concrete, not hypothetical: OpenCode's local MCP entry supports 
 | `core.hooksPath` leaks into later work | Explicitly unset in Task 10; verify with `git config --get core.hooksPath`. |
 | `opencode serve` requires auth | 20-min cap, then fallback to `--standalone`; auth question is out of scope. |
 | Nested worktree pollutes `git status` | Worktree lives in a sibling directory, not under the main checkout. |
-| Evidence lost during cleanup | Copy to `chat/researcher/` before deleting `spike/m0/`. |
+| Evidence lost during cleanup | Copy raw evidence into local, untracked notes before deleting `spike/m0/`. |

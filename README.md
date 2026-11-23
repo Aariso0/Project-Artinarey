@@ -15,7 +15,7 @@
 
 </div>
 
-> **Design settled. Foundation implemented and tested; end-to-end behavior unverified.** Nothing is installable yet. The full design, the evidence behind every decision, and the progress tracker live in [`plan.md`](plan.md).
+> **Design settled. Foundation and MCP shim implemented and tested; two-agent mail exchange verified in OpenCode.** Nothing is installable yet. The full design, the evidence behind every decision, and the progress tracker live in [`plan.md`](plan.md).
 
 ---
 
@@ -233,13 +233,13 @@ Any tool you start by hand with `artinarey run` still gets mail and tasks, as lo
 
 ## Progress
 
-`██░░░░░░░░░░░░░░░░` **2 of 9 milestones. Design settled, M1 foundation implemented and tested; end-to-end behavior unverified.** The M0 spike passed on 2026-11-23, then M1 added the store, mail, registry and daemon; no shim, adapter or window exists yet.
+`███░░░░░░░░░░░░░░░` **3 of 9 milestones. Design settled, M2 implemented and tested; two-agent mail exchange verified in OpenCode.** The M0 spike passed on 2026-11-23, M1 added the store, mail, registry and daemon, and M2 added the MCP shim, folder-based identity and eight tools; no adapter or window exists yet.
 
 | | Milestone | Status |
 |---|---|---|
 | M0 | Spike: can the MCP shim see the agent's folder? | ✅ |
 | M1 | Store, mail files, daemon | ✅ |
-| M2 | MCP shim and identity by folder | — |
+| M2 | MCP shim and identity by folder | ✅ |
 | M3 | Worktree manager and home-worktree warnings | — |
 | M4 | Leases and pre-merge check | — |
 | M5 | OpenCode adapter, spawning and approvals | — |
@@ -315,7 +315,7 @@ Artinarey is licensed under the **GNU General Public License, version 3 (GPL-3.0
 
 `SPDX-License-Identifier: GPL-3.0-only`
 
-This is a strong copyleft license: if you distribute a derivative work, you must make its source available under the same terms. No code or dependency manifest exists yet, so dependency licenses have not been audited — check GPL compatibility before adding a dependency.
+This is a strong copyleft license: if you distribute a derivative work, you must make its source available under the same terms. Dependencies are pinned in the workspace manifests; GPL compatibility has not been audited — check before publishing.
 
 ---
 

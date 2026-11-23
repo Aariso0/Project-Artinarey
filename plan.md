@@ -17,7 +17,7 @@ Legend: ⬜ not started · 🟨 in progress · ✅ done · 🟥 blocked
 |---|---|---|---|---|
 | M0 | Spike: does the shim see the agent's folder? | 2 h | ✅ | Slice 1 |
 | M1 | Store, mail files, registry, daemon skeleton | 1–1.5 d | ✅ | Slice 1 |
-| M2 | MCP shim, tools, identity by folder | 1 d | ⬜ | Slice 1 |
+| M2 | MCP shim, tools, identity by folder | 1 d | ✅ | Slice 1 |
 | M3 | Worktree manager, home-worktree warnings, `run` | 1 d | ⬜ | Slice 1 |
 | M4 | Leases, git hook, pre-merge check | 1 d | ⬜ | Slice 1 |
 | M5 | OpenCode adapter, spawn cap, role cards | 2 d | ⬜ | Slice 1 |
@@ -50,7 +50,7 @@ Each row flips to ✅ verified, or 🟥 failed (then the fallback in the last co
 | U11 | Which MCP clients use the 2026-07-28 revision | M2 | ✅ | OpenCode probes or opts in; Claude Code needs the v2 runtime; Codex unconfirmed. The stateless shim supports both revisions. |
 | U12 | Name "Artinarey" is free | before publishing | ✅ | No footprint in npm, PyPI, crates.io, GitHub or `.com` RDAP on 2026-11-23. Negative evidence, not proof. |
 | U13 | OS is Linux | M1 | ✅ | User confirmed on 2026-11-23: Linux for now. |
-| U14 | Parent-pid liveness as release signal | M2 | 🟥 | `ppid` changes on reparenting and PIDs are reused. Use pidfd (section 6). |
+| U14 | Parent-pid liveness as release signal | M2 | 🟥 | `ppid` changes on reparenting and PIDs are reused. Use pidfd (section 6). Node 26 has no pidfd API yet; M2 releases on shim socket close with a pid liveness cross-check (section 15). |
 
 ### Spike results (fill in during M0)
 
@@ -636,18 +636,20 @@ Goal: confirm the working-directory identity (A1 c) with real tools before writi
 **Notes / blockers:** 41 tests pass; `pnpm test`, `pnpm typecheck`, `pnpm lint`, `pnpm build` all green. `better-sqlite3@13.2.0` ships prebuilt binaries, so no native build step is needed in CI. Implementation plan: `docs/superpowers/plans/2026-11-23-m1-foundation.md`.
 
 ### M2 · MCP shim, tools, identity by folder
-**Status:** ⬜ · **Estimate:** 1 d · **Depends on:** M1 · **Checks:** U11, U14
+**Status:** ✅ · **Estimate:** 1 d · **Depends on:** M1 · **Checks:** U11, U14
 
-- [ ] Shim: stdio MCP server using the official SDK; forwards `cwd` and a pidfd-based liveness handle to the daemon
-- [ ] Marker finder and the resolver: folder to worktree to persona
-- [ ] Tools 1–7 and 13 (`check_in`, `claim_persona`, `inbox`, `read_mail`, `send_mail`, `mark_done`, `report`, `worktrees`)
-- [ ] Reply format (`unread`, `next`) and error texts that say stop or retry-after
-- [ ] Roster, `DIRECTORY_BUSY`, release rules, force release
-- [ ] `artinarey connect opencode`
-- [ ] Test: two directories, two personas, mail both ways through real OpenCode
+- [x] Shim: stdio MCP server using the official SDK; forwards `cwd` and a liveness handle to the daemon
+- [x] Marker finder and the resolver: folder to worktree to persona
+- [x] Tools 1–7 and 13 (`check_in`, `claim_persona`, `inbox`, `read_mail`, `send_mail`, `mark_done`, `report`, `worktrees`)
+- [x] Reply format (`unread`, `next`) and error texts that say stop or retry-after
+- [x] Roster, `DIRECTORY_BUSY`, release rules, force release
+- [x] `artinarey connect opencode`
+- [x] Test: two directories, two personas, mail both ways through real OpenCode
 
 **Done when:** the real-OpenCode mail test passes.
-**Notes / blockers:**
+**Notes / blockers:** 69 tests pass; `pnpm test`, `pnpm typecheck`, `pnpm lint`, `pnpm build` all green. Two real OpenCode sessions in separate directories claimed different personas and exchanged mail in both directions; `DIRECTORY_BUSY`, `NEEDS_CONFIRMATION`, `NO_PROJECT` and `WORKTREE_UNMANAGED` all have recorded results. Implementation plan: `docs/superpowers/plans/2026-11-23-m2-mcp-shim-identity.md`.
+
+Implementation deviation (no decision changes): Node 26 exposes no pidfd API. The shim holds one long-lived socket per session; the daemon releases the binding when that socket closes and cross-checks the forwarded pid with `process.kill(pid, 0)`. This is event-driven, not polled, and keeps the settled intent of tying liveness to the session rather than the parent pid. Revisit if Node gains pidfd support. Manual `release <worktree> --force` remains the user's override.
 
 ### M3 · Worktree manager and home-worktree rule
 **Status:** ⬜ · **Estimate:** 1 d · **Depends on:** M2
