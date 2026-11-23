@@ -2,8 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   claimPersona, createPersona, findMarker, isUlid, newId, openRegistry, readPersona,
   releasePersona, resolveIdentity, resolveXdgPaths, writeMarker, writePersona,
@@ -601,6 +603,31 @@ function stubVendor(dir: string, exitCode = 0): { command: string; out: string }
   return { command, out };
 }
 
+/** A vendor that opens the same isolated registry and moves the binding mid-run. */
+function stubRebindVendor(
+  dir: string, personaId: string, worktreeId: string, worktreePath: string,
+): string {
+  const require = createRequire(import.meta.url);
+  const coreUrl = pathToFileURL(require.resolve('@artinarey/core')).href;
+  const script = join(dir, 'rebind-vendor.mjs');
+  writeFileSync(script, [
+    `const core = await import(${JSON.stringify(coreUrl)});`,
+    'const registry = core.openRegistry(core.resolveXdgPaths(process.env).registryFile);',
+    'try {',
+    `  registry.bindings.bind(${JSON.stringify(personaId)}, ${JSON.stringify(worktreeId)});`,
+    `  core.lockGitWorktree(${JSON.stringify(worktreePath)}, 'mid-run rebind');`,
+    '} finally {',
+    '  registry.close();',
+    '}',
+  ].join('\n'));
+  const command = join(dir, 'rebind-vendor.sh');
+  writeFileSync(command, [
+    '#!/bin/sh',
+    `exec '${process.execPath}' --import '${require.resolve('tsx/esm')}' '${script}'`,
+  ].join('\n'), { mode: 0o755 });
+  return command;
+}
+
 test('run opencode binds a persona, records a complete session and releases on exit', async () => {
   const dir = root();
   const { repo, env, registry, project } = seededRepo(dir);
@@ -645,6 +672,42 @@ test('run returns the vendor exit code and still releases and closes the session
   assert.equal(result.code, 7, `${result.err}${result.out}`);
   assert.equal(readFileSync(vendor.out, 'utf8').trim(), realpathSync(repo));
   assert.equal(registry.bindings.forWorktree(rootRow.id), undefined);
+  const sessions = registry.sessions.list(project.id);
+  assert.equal(sessions.length, 1);
+  assert.ok(sessions[0]?.endedAt);
+  registry.close();
+});
+
+test('run leaves a binding moved to another worktree mid-run intact', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const secondPath = join(repo, '.worktrees', 'rebound');
+  execFileSync('git', ['worktree', 'add', '-q', '-b', 'artinarey/rebound', secondPath],
+    { cwd: repo });
+  const adopted = await captureMain(['worktree', 'adopt', secondPath], env, repo);
+  assert.equal(adopted.code, 0, adopted.err);
+  const secondRow = registry.worktrees.list(project.id).find((wt) => wt.path === secondPath);
+  assert.ok(secondRow);
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-rebind', 'Dev Rebind');
+  const vendor = stubRebindVendor(dir, persona, secondRow.id, secondPath);
+
+  const result = await captureMain(
+    ['run', 'opencode', '--persona', persona],
+    { ...env, ARTINAREY_TEST_VENDOR: vendor }, repo,
+  );
+  assert.equal(result.code, 0, `${result.err}${result.out}`);
+  assert.equal(registry.bindings.forWorktree(rootRow.id), undefined);
+  assert.equal(registry.bindings.forWorktree(secondRow.id)?.id, persona);
+  assert.equal(readPersona(project.storeDir, persona).state, 'active');
+
+  const porcelain = execFileSync('git', ['worktree', 'list', '--porcelain'],
+    { cwd: repo, encoding: 'utf8' });
+  const secondBlock = porcelain.split('\n\n')
+    .find((block) => block.startsWith(`worktree ${realpathSync(secondPath)}\n`));
+  assert.match(secondBlock ?? '', /^locked /m);
+
   const sessions = registry.sessions.list(project.id);
   assert.equal(sessions.length, 1);
   assert.ok(sessions[0]?.endedAt);

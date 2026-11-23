@@ -418,6 +418,7 @@ export async function main(
     const rehome = args.includes('--rehome');
     let registry: RegistryHandle | undefined;
     let claimed: ClaimedPersona | undefined;
+    let claimedWorktreeId: string | undefined;
     let sessionId: string | undefined;
     try {
       registry = openRegistry(resolveXdgPaths(env).registryFile);
@@ -448,6 +449,7 @@ export async function main(
         return 1;
       }
       claimed = claim;
+      claimedWorktreeId = claim.identity.worktreeId;
 
       sessionId = registry.sessions.append({
         projectId: identity.projectId,
@@ -469,7 +471,10 @@ export async function main(
     } finally {
       if (registry) {
         if (sessionId) registry.sessions.end(sessionId, new Date().toISOString());
-        if (claimed) releasePersona(registry, claimed.identity.storeDir, claimed.personaId);
+        if (claimed && claimedWorktreeId
+          && registry.bindings.forWorktree(claimedWorktreeId)?.id === claimed.personaId) {
+          releasePersona(registry, claimed.identity.storeDir, claimed.personaId);
+        }
         registry.close();
       }
     }
