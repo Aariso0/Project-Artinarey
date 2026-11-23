@@ -424,3 +424,38 @@ test('worktree remove <name> refuses a bound worktree, then removes it after rel
   assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', 'refs/heads/artinarey/gone'], repo), true);
   registry.close();
 });
+
+test('worktree remove <name> leaves a dirty worktree and all of its state untouched', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const target = join(repo, '.worktrees', 'dirty');
+  execFileSync('git', ['worktree', 'add', '-q', '-b', 'artinarey/dirty', target], { cwd: repo });
+  assert.equal(await main(['worktree', 'adopt', target], env, repo), 0);
+  const row = registry.worktrees.list(project.id).find((wt) => wt.path === target);
+  assert.ok(row, 'adopted worktree not registered');
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-dirty', 'Dirty');
+  registry.bindings.bind(persona, row.id);
+  releasePersona(registry, project.storeDir, persona); // reach the dirty guard, not the binding guard
+  writeFileSync(join(target, '.env'), 'SECRET=kept\n');
+  writeFileSync(join(target, 'untracked.txt'), 'user data\n');
+
+  let errors = '';
+  const originalError = console.error;
+  console.error = (s: unknown) => { errors += `${String(s)}\n`; };
+  let code: number;
+  try {
+    code = await main(['worktree', 'remove', 'dirty'], env, repo);
+  } finally {
+    console.error = originalError;
+  }
+
+  assert.equal(code, 1);
+  assert.match(errors, /uncommitted or untracked/);
+  assert.equal(existsSync(join(target, '.artinarey.json')), true);
+  assert.equal(readFileSync(join(target, '.env'), 'utf8'), 'SECRET=kept\n');
+  assert.equal(readFileSync(join(target, 'untracked.txt'), 'utf8'), 'user data\n');
+  assert.equal(registry.bindings.forWorktree(row.id), undefined);
+  assert.equal(registry.worktrees.list(project.id).some((wt) => wt.id === row.id), true);
+  assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', 'refs/heads/artinarey/dirty'], repo), true);
+  registry.close();
+});

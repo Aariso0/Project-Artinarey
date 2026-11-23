@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { ArtinareyError } from './errors.ts';
@@ -424,6 +424,31 @@ export function adoptWorktree(
 }
 
 /**
+ * Git refuses to remove a locked or dirty worktree without --force. Check before
+ * deleting anything so a refused removal leaves every file exactly where it was.
+ */
+function assertRemovableWorktree(path: string): void {
+  let locked = false;
+  let status = '';
+  try {
+    locked = listGitWorktrees(path).some((wt) => samePath(wt.path, path) && wt.locked);
+    status = execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], {
+      cwd: path, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    throw new ArtinareyError('INVALID_INPUT', `worktree is not removable: ${path}`);
+  }
+  if (locked) throw new ArtinareyError('INVALID_INPUT', `worktree is locked: ${path}`);
+  // .env files are the only generated files not covered by the exclude block.
+  const dirt = status.split('\n').filter((line) =>
+    line !== '' && !(line.startsWith('?? ') && ENV_FILES.includes(line.slice(3))));
+  if (dirt.length > 0) {
+    throw new ArtinareyError('INVALID_INPUT',
+      `worktree has uncommitted or untracked files: ${path}`);
+  }
+}
+
+/**
  * Remove a managed worktree without ever forcing git or deleting a branch. Session
  * history goes with the worktree so the foreign-key-constrained row can be deleted.
  */
@@ -433,17 +458,24 @@ export function removeWorktree(registry: Registry, projectId: string, id: string
   if (registry.bindings.forWorktree(id)) {
     throw new ArtinareyError('INVALID_INPUT', `worktree is bound to a persona: ${id}`);
   }
+  assertRemovableWorktree(worktree.path);
 
   const project = registry.projects.get(projectId);
   const sessionsRemoved = registry.sessions.list(projectId)
     .filter((session) => session.worktreeId === id).length;
-  // Git refuses an unclean worktree without --force; drop only artinarey's own files.
-  for (const file of [MARKER_FILE, '.env.artinarey', ...ENV_FILES]) {
-    rmSync(join(worktree.path, file), { recursive: true, force: true });
+  // Keep the env contents in case git still refuses at the last moment.
+  const envFiles = ENV_FILES.map((name) => join(worktree.path, name))
+    .filter((file) => existsSync(file))
+    .map((file) => ({ file, content: readFileSync(file), mode: statSync(file).mode & 0o777 }));
+  try {
+    for (const { file } of envFiles) rmSync(file, { force: true });
+    execFileSync('git', ['worktree', 'remove', worktree.path], {
+      cwd: worktree.path, stdio: 'ignore',
+    });
+  } catch (err) {
+    for (const { file, content, mode } of envFiles) writeFileSync(file, content, { mode });
+    throw err;
   }
-  execFileSync('git', ['worktree', 'remove', worktree.path], {
-    cwd: worktree.path, stdio: 'ignore',
-  });
   registry.sessions.deleteForWorktree(id);
   registry.worktrees.delete(id);
   if (project) auditWorktreeRemoval(project.storeDir, id, sessionsRemoved);

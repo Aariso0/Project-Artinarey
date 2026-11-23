@@ -566,6 +566,56 @@ test('removeWorktree after release drops git worktree, sessions and only its reg
   }
 });
 
+test('removeWorktree refuses a dirty or locked worktree without changing any of its files or state', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    const target = join(repo, '.worktrees', 'dirty');
+    git(['worktree', 'add', '-q', '-b', 'artinarey/dirty', target], repo);
+    const worktree = core.adoptWorktree(registry, storeDir, project.id, target);
+    const persona = core.createPersona(registry, storeDir, project.id, 'dev-dirty', 'Dirty');
+    registry.bindings.bind(persona, worktree.id);
+    core.releasePersona(registry, storeDir, persona); // reach the dirty/locked guards, not the binding guard
+    writeFileSync(join(target, '.env'), 'SECRET=kept\n');
+    writeFileSync(join(target, '.env.artinarey'), 'ARTINAREY_PORT_OFFSET=10\n');
+    registry.sessions.append({
+      projectId: project.id, worktreeId: worktree.id, personaId: persona,
+      vendor: 'opencode', startedAt: '2026-11-24T12:00:00Z',
+    });
+    const userFile = join(target, 'untracked.txt');
+    writeFileSync(userFile, 'user data\n');
+
+    expectInvalidInput(
+      () => core.removeWorktree(registry, project.id, worktree.id),
+      'dirty worktree',
+    );
+
+    assert.equal(readFileSync(join(target, '.artinarey.json'), 'utf8').includes(worktree.id), true);
+    assert.equal(readFileSync(join(target, '.env'), 'utf8'), 'SECRET=kept\n');
+    assert.equal(readFileSync(join(target, '.env.artinarey'), 'utf8'), 'ARTINAREY_PORT_OFFSET=10\n');
+    assert.equal(readFileSync(userFile, 'utf8'), 'user data\n');
+    assert.equal(registry.bindings.forWorktree(worktree.id), undefined);
+    assert.equal(registry.worktrees.list(project.id).some((row) => row.id === worktree.id), true);
+    assert.equal(registry.sessions.list(project.id).some((s) => s.worktreeId === worktree.id), true);
+    assert.equal(gitSucceeds(
+      ['show-ref', '--verify', '--quiet', 'refs/heads/artinarey/dirty'], repo,
+    ), true);
+
+    rmSync(userFile, { force: true });
+    assert.equal(core.lockGitWorktree(target, 'manual hold'), true);
+    expectInvalidInput(
+      () => core.removeWorktree(registry, project.id, worktree.id),
+      'locked worktree',
+    );
+    assert.equal(readFileSync(join(target, '.artinarey.json'), 'utf8').includes(worktree.id), true);
+    assert.equal(readFileSync(join(target, '.env'), 'utf8'), 'SECRET=kept\n');
+    assert.equal(registry.worktrees.list(project.id).some((row) => row.id === worktree.id), true);
+    assert.equal(core.unlockGitWorktree(target), true);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('lockGitWorktree and unlockGitWorktree toggle a real worktree and return false in a plain dir', () => {
   const { dir, repo, registry } = newProjectRepo();
   try {
