@@ -233,14 +233,14 @@ Any tool you start by hand with `artinarey run` still gets mail and tasks, as lo
 
 ## Progress
 
-`███░░░░░░░░░░░░░░░` **3 of 9 milestones. Design settled, M2 implemented and tested; two-agent mail exchange verified in OpenCode.** The M0 spike passed on 2026-11-23, M1 added the store, mail, registry and daemon, and M2 added the MCP shim, folder-based identity and eight tools; no adapter or window exists yet.
+`████░░░░░░░░░░░░░░` **4 of 9 milestones. Design settled, M3 implemented and tested; two-agent mail exchange verified in OpenCode and the worktree lifecycle smoke-tested.** The M0 spike passed on 2026-11-23, M1 added the store, mail, registry and daemon, M2 added the MCP shim, folder-based identity and eight tools, and M3 added worktree create/adopt/list/remove, home-worktree warnings and `run`; no adapter or window exists yet.
 
 | | Milestone | Status |
 |---|---|---|
 | M0 | Spike: can the MCP shim see the agent's folder? | ✅ |
 | M1 | Store, mail files, daemon | ✅ |
 | M2 | MCP shim and identity by folder | ✅ |
-| M3 | Worktree manager and home-worktree warnings | — |
+| M3 | Worktree manager and home-worktree warnings | ✅ create/list/remove and `run` smoke-tested |
 | M4 | Leases and pre-merge check | — |
 | M5 | OpenCode adapter, spawning and approvals | — |
 | M6 | Read-only window *(first usable slice)* | — |

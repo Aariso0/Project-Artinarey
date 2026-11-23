@@ -18,7 +18,7 @@ Legend: ⬜ not started · 🟨 in progress · ✅ done · 🟥 blocked
 | M0 | Spike: does the shim see the agent's folder? | 2 h | ✅ | Slice 1 |
 | M1 | Store, mail files, registry, daemon skeleton | 1–1.5 d | ✅ | Slice 1 |
 | M2 | MCP shim, tools, identity by folder | 1 d | ✅ | Slice 1 |
-| M3 | Worktree manager, home-worktree warnings, `run` | 1 d | ⬜ | Slice 1 |
+| M3 | Worktree manager, home-worktree warnings, `run` | 1 d | ✅ | Slice 1 |
 | M4 | Leases, git hook, pre-merge check | 1 d | ⬜ | Slice 1 |
 | M5 | OpenCode adapter, spawn cap, role cards | 2 d | ⬜ | Slice 1 |
 | M6 | Read-only desktop window | 1.5 d | ⬜ | Slice 1 |
@@ -652,19 +652,19 @@ Goal: confirm the working-directory identity (A1 c) with real tools before writi
 Implementation deviation (no decision changes): Node 26 exposes no pidfd API. The shim holds one long-lived socket per session; the daemon releases the binding when that socket closes and cross-checks the forwarded pid with `process.kill(pid, 0)`. This is event-driven, not polled, and keeps the settled intent of tying liveness to the session rather than the parent pid. Revisit if Node gains pidfd support. Manual `release <worktree> --force` remains the user's override.
 
 ### M3 · Worktree manager and home-worktree rule
-**Status:** ⬜ · **Estimate:** 1 d · **Depends on:** M2
+**Status:** ✅ · **Estimate:** 1 d · **Depends on:** M2
 
-- [ ] Parser for `git worktree list --porcelain` with captured fixtures (detached, locked, prunable, bare)
-- [ ] Reconcile: managed, unmanaged, missing
-- [ ] `artinarey init`: marker, exclude block, registry entry, report of global ignore coverage (read-only)
-- [ ] `worktree new`: preflight, C4 warning, port offset, env copy
-- [ ] `worktree adopt` and `remove`; lock and unlock while bound
-- [ ] Home-worktree rule: warning, confirm, `rehome`, audit line; senior dev exempt
-- [ ] `artinarey run <vendor>`: bind, warn, exec, release on exit
-- [ ] `persona rehome` (same project only)
+- [x] Parser for `git worktree list --porcelain` with captured fixtures (detached, locked, prunable, bare)
+- [x] Reconcile: managed, unmanaged, missing
+- [x] `artinarey init`: marker, exclude block, registry entry, report of global ignore coverage (read-only)
+- [x] `worktree new`: preflight, C4 warning, port offset, env copy
+- [x] `worktree adopt` and `remove`; lock and unlock while bound
+- [x] Home-worktree rule: warning, confirm, `rehome`, audit line; senior dev exempt
+- [x] `artinarey run <vendor>`: bind, warn, exec, release on exit
+- [x] `persona rehome` (same project only)
 
 **Done when:** create, adopt, list, remove all work, and the warning fires on a mismatch.
-**Notes / blockers:**
+**Notes / blockers:** 116 tests pass; `pnpm test`, `pnpm typecheck`, `pnpm lint`, `pnpm build` all green. Real CLI smoke check in a fresh temp git repo with isolated XDG roots: `init` → `worktree list` → `worktree new smoke --yes` → `worktree list` → `worktree remove smoke` → `worktree list` all exited 0; two managed rows appeared and list returned to one after removal. Tracked files and `.gitignore` were unchanged, no generated `opencode.json`, `.env*` or registry artifacts landed in the checkout, and the temp repo was removed.
 
 ### M4 · Leases and enforcement
 **Status:** ⬜ · **Estimate:** 1 d · **Depends on:** M3 · **Checks:** U3
