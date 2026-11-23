@@ -1,12 +1,13 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { connect } from 'node:net';
 import { dirname, join } from 'node:path';
-import { ArtinareyError, newId, type XdgPaths } from '@artinarey/core';
+import { ArtinareyError, newId, openRegistry, type XdgPaths } from '@artinarey/core';
 import { acquireLock } from './lock.ts';
 import { createRpcServer, type RpcResponse } from './server.ts';
 
 export * from './lock.ts';
 export * from './server.ts';
+export * from './tools.ts';
 
 export function daemonPaths(paths: XdgPaths): { socketPath: string; lockFile: string } {
   return {
@@ -19,11 +20,16 @@ export async function startDaemon(paths: XdgPaths): Promise<{ socketPath: string
   const { socketPath, lockFile } = daemonPaths(paths);
   mkdirSync(dirname(socketPath), { recursive: true });
   const lock = acquireLock(lockFile);
-  const server = createRpcServer(socketPath, () => lock.release());
+  const registry = openRegistry(paths.registryFile);
+  const server = createRpcServer(socketPath, () => {
+    lock.release();
+    registry.close();
+  }, { registry, paths });
   try {
     await server.start();
   } catch (err) {
     lock.release();
+    registry.close();
     throw err;
   }
   return { socketPath };
