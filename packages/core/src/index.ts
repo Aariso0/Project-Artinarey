@@ -9,3 +9,4 @@ export * from './index-builder.ts';
 export * from './identity.ts';
 export * from './persona-store.ts';
 export * from './reply.ts';
+export * from './worktree.ts';
