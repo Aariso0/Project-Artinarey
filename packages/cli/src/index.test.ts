@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { newId, openRegistry, sendMail } from '@artinarey/core';
+import { newId, openRegistry, sendMail, type XdgPaths } from '@artinarey/core';
 import { main } from './index.ts';
 
 function capture(write: (s: string) => void) {
@@ -12,14 +12,13 @@ function capture(write: (s: string) => void) {
   return () => { console.log = original; };
 }
 
-test('artinarey reindex builds a cache index from the registered store', async () => {
+function tempEnv(): { env: NodeJS.ProcessEnv; paths: XdgPaths } {
   const root = join(tmpdir(), `artinarey-cli-${newId()}`);
   const configDir = join(root, 'config');
   const dataRoot = join(root, 'data');
   const cacheRoot = join(root, 'cache');
   const runtimeDir = join(root, 'runtime');
   for (const dir of [configDir, dataRoot, cacheRoot, runtimeDir]) mkdirSync(dir, { recursive: true });
-
   const env = {
     HOME: root,
     XDG_CONFIG_HOME: configDir,
@@ -28,13 +27,23 @@ test('artinarey reindex builds a cache index from the registered store', async (
     XDG_RUNTIME_DIR: runtimeDir,
     PATH: process.env.PATH ?? '',
   };
+  return { env, paths: {
+    configDir: join(configDir, 'artinarey'),
+    registryFile: join(configDir, 'artinarey', 'registry.sqlite'),
+    tokenFile: join(configDir, 'artinarey', 'token'),
+    socketPath: join(runtimeDir, 'artinarey', 'daemon.sock'),
+    dataRoot: join(dataRoot, 'artinarey'),
+    cacheRoot: join(cacheRoot, 'artinarey'),
+  } };
+}
 
-  const registryFile = join(configDir, 'artinarey', 'registry.sqlite');
-  const registry = openRegistry(registryFile);
+test('artinarey reindex builds a cache index from the registered store', async () => {
+  const { env, paths } = tempEnv();
+  const registry = openRegistry(paths.registryFile);
   const project = registry.projects.create({
     name: 'Cli Test',
     repoCommonDir: '/r/cli/.git',
-    storeDir: join(dataRoot, 'artinarey', 'store'),
+    storeDir: join(paths.dataRoot, 'store'),
   });
   registry.close();
 
@@ -54,21 +63,11 @@ test('artinarey reindex builds a cache index from the registered store', async (
 
   assert.equal(code, 0);
   assert.match(output, /indexed 1 mail/);
-  assert.equal(typeof readFileSync(join(cacheRoot, 'artinarey', project.id, 'index.sqlite')).length, 'number');
+  assert.equal(typeof readFileSync(join(paths.cacheRoot, project.id, 'index.sqlite')).length, 'number');
 });
 
 test('artinarey reindex reports unknown projects without throwing', async () => {
-  const root = join(tmpdir(), `artinarey-cli-${newId()}`);
-  for (const dir of ['config', 'data', 'cache', 'runtime']) mkdirSync(join(root, dir), { recursive: true });
-  const env = {
-    HOME: root,
-    XDG_CONFIG_HOME: join(root, 'config'),
-    XDG_DATA_HOME: join(root, 'data'),
-    XDG_CACHE_HOME: join(root, 'cache'),
-    XDG_RUNTIME_DIR: join(root, 'runtime'),
-    PATH: process.env.PATH ?? '',
-  };
-
+  const { env } = tempEnv();
   const original = console.error;
   let error = '';
   console.error = (s: unknown) => { error += `${String(s)}\n`; };
@@ -80,4 +79,51 @@ test('artinarey reindex reports unknown projects without throwing', async () => 
   }
   assert.equal(code, 1);
   assert.match(error, /unknown project/);
+});
+
+test('daemon start, status, and stop work through the CLI', async () => {
+  const { env } = tempEnv();
+  let output = '';
+  const restore = capture((s) => { output += `${s}\n`; });
+  try {
+    assert.equal(await main(['daemon', 'status'], env), 0);
+    assert.match(output, /daemon not running/);
+
+    output = '';
+    assert.equal(await main(['daemon', 'start'], env), 0);
+    assert.match(output, /daemon started/);
+
+    output = '';
+    assert.equal(await main(['daemon', 'status'], env), 0);
+    assert.match(output, /running/);
+
+    output = '';
+    assert.equal(await main(['daemon', 'stop'], env), 0);
+    assert.match(output, /daemon stopped/);
+
+    output = '';
+    assert.equal(await main(['daemon', 'status'], env), 0);
+    assert.match(output, /daemon not running/);
+  } finally {
+    restore();
+    const originalError = console.error;
+    console.error = () => {};
+    await main(['daemon', 'stop'], env).catch(() => 0);
+    console.error = originalError;
+  }
+});
+
+test('a second daemon start is rejected with ALREADY_RUNNING', async () => {
+  const { env } = tempEnv();
+  const restore = capture(() => {});
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    assert.equal(await main(['daemon', 'start'], env), 0);
+    assert.equal(await main(['daemon', 'start'], env), 1);
+  } finally {
+    await main(['daemon', 'stop'], env).catch(() => 0);
+    restore();
+    console.error = originalError;
+  }
 });
