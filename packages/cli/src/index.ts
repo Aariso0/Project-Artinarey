@@ -1,10 +1,100 @@
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { buildIndex, openRegistry, resolveXdgPaths } from '@artinarey/core';
-import { daemonStatus, startDaemon, stopDaemon } from '@artinarey/daemon';
+import { existsSync, readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { atomicWrite, buildIndex, openRegistry, resolveXdgPaths } from '@artinarey/core';
+import { callDaemon, daemonStatus, startDaemon, stopDaemon } from '@artinarey/daemon';
 
-export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {
+const MCP_TOOLS = [
+  'check_in', 'claim_persona', 'inbox', 'read_mail',
+  'send_mail', 'mark_done', 'report', 'worktrees',
+] as const;
+
+function shimCommand(): string[] {
+  const require = createRequire(import.meta.url);
+  return [
+    process.execPath,
+    '--import',
+    require.resolve('tsx/esm'),
+    join(rootDir(), 'packages', 'shim', 'src', 'index.ts'),
+  ];
+}
+
+function rootDir(): string {
+  return process.env.ARTINAREY_ROOT ?? resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+}
+
+type OpenCodeConfig = Record<string, unknown> & {
+  mcp?: { servers?: Record<string, unknown> };
+  permissions?: Array<{ action: string; resource: string; effect: string }>;
+};
+
+function connectOpencode(cwd: string): void {
+  const file = join(cwd, 'opencode.json');
+  const config: OpenCodeConfig = existsSync(file)
+    ? JSON.parse(readFileSync(file, 'utf8')) as OpenCodeConfig
+    : {};
+
+  config.mcp = {
+    ...config.mcp,
+    servers: {
+      ...config.mcp?.servers,
+      artinarey: { type: 'local', command: shimCommand(), disabled: false },
+    },
+  };
+
+  const ours = new Set(MCP_TOOLS.map((tool) => `artinarey_${tool}`));
+  const kept = (config.permissions ?? []).filter((rule) => !ours.has(rule.action));
+  config.permissions = [
+    ...kept,
+    ...MCP_TOOLS.map((tool) => ({ action: `artinarey_${tool}`, resource: '*', effect: 'allow' })),
+  ];
+
+  atomicWrite(file, `${JSON.stringify(config, null, 2)}\n`);
+}
+
+export async function main(
+  argv: string[],
+  env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd(),
+): Promise<number> {
   const [command, ...args] = argv;
+
+  if (command === 'connect') {
+    if (args[0] !== 'opencode') {
+      console.error('usage: artinarey connect opencode');
+      return 2;
+    }
+    try {
+      connectOpencode(cwd);
+      console.log('connected OpenCode to Artinarey');
+      return 0;
+    } catch (err) {
+      console.error(`connect failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
+  if (command === 'release') {
+    const worktreeId = args[0];
+    if (!worktreeId || !args.includes('--force')) {
+      console.error('usage: artinarey release <worktree> --force');
+      return 2;
+    }
+    try {
+      const response = await callDaemon(resolveXdgPaths(env), 'release_force', { worktreeId });
+      if (!response.ok) {
+        console.error(response.error.message);
+        return 1;
+      }
+      const released = (response.result as { released: boolean }).released;
+      console.log(released ? `released ${worktreeId}` : `nothing bound to ${worktreeId}`);
+      return 0;
+    } catch (err) {
+      console.error(`release failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
 
   if (command === 'reindex') {
     const projectId = args[0];

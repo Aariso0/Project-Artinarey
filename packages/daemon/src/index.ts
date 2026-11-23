@@ -35,7 +35,12 @@ export async function startDaemon(paths: XdgPaths): Promise<{ socketPath: string
   return { socketPath };
 }
 
-function rpcCall(socketPath: string, method: string, timeoutMs = 2000): Promise<RpcResponse> {
+function rpcCall(
+  socketPath: string,
+  method: string,
+  params: Record<string, unknown> = {},
+  timeoutMs = 2000,
+): Promise<RpcResponse> {
   return new Promise((resolve, reject) => {
     const socket = connect(socketPath);
     let buffer = '';
@@ -44,7 +49,7 @@ function rpcCall(socketPath: string, method: string, timeoutMs = 2000): Promise<
       reject(new ArtinareyError('STORE_OFFLINE', 'daemon request timed out'));
     }, timeoutMs);
 
-    socket.on('connect', () => socket.write(`${JSON.stringify({ id: newId(), method })}\n`));
+    socket.on('connect', () => socket.write(`${JSON.stringify({ id: newId(), method, params })}\n`));
     socket.on('data', (chunk) => {
       buffer += chunk.toString();
       const end = buffer.indexOf('\n');
@@ -58,6 +63,15 @@ function rpcCall(socketPath: string, method: string, timeoutMs = 2000): Promise<
       reject(err);
     });
   });
+}
+
+/** Generic call used by CLI commands such as `release --force`. */
+export function callDaemon(
+  paths: XdgPaths,
+  method: string,
+  params: Record<string, unknown> = {},
+): Promise<RpcResponse> {
+  return rpcCall(daemonPaths(paths).socketPath, method, params);
 }
 
 export async function daemonStatus(paths: XdgPaths): Promise<unknown | undefined> {
