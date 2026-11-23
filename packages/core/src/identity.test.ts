@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -52,6 +53,10 @@ test('findMarker returns undefined when no valid marker exists', () => {
   assert.equal(findMarker(root), undefined);
 });
 
+function git(args: string[], cwd: string): void {
+  execFileSync('git', args, { cwd, encoding: 'utf8' });
+}
+
 function setup() {
   const root = tempRoot();
   const storeDir = join(root, 'store');
@@ -94,6 +99,45 @@ test('resolveIdentity reports NO_PROJECT and WORKTREE_UNMANAGED', () => {
   assert.equal(unmanaged.ok, false);
   if (!unmanaged.ok) assert.equal(unmanaged.code, 'WORKTREE_UNMANAGED');
   s.registry.close();
+});
+
+test('resolveIdentity pauses when the git worktree branch changed, auditing one mismatch', () => {
+  const root = tempRoot();
+  const repo = join(root, 'repo');
+  const worktree = join(root, 'branch-changed');
+  mkdirSync(repo, { recursive: true });
+  git(['init', '-q'], repo);
+  git(['-c', 'user.name=Tester', '-c', 'user.email=tester@example.com',
+    'commit', '--allow-empty', '-q', '-m', 'init'], repo);
+  git(['worktree', 'add', '-q', '-b', 'feature/new', worktree], repo);
+
+  const registry = openRegistry(join(root, 'registry.sqlite'));
+  try {
+    const project = registry.projects.create({
+      name: 'Git', repoCommonDir: join(repo, '.git'), storeDir: join(root, 'store'),
+    });
+    const id = newId();
+    registry.worktrees.upsert({ id, projectId: project.id, path: worktree,
+      branch: 'registered-branch' });
+    writeMarker(worktree, project.id, id);
+
+    const result = resolveIdentity(registry, worktree);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.code, 'WORKTREE_UNMANAGED');
+      assert.match(result.message, /branch changed; confirm the move/);
+      assert.match(result.message, /feature\/new/);
+    }
+
+    const events = readFileSync(join(project.storeDir, 'events', 'audit.jsonl'), 'utf8')
+      .trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+    const mismatches = events.filter((event) => event.type === 'worktree_unmanaged');
+    assert.equal(mismatches.length, 1);
+    assert.equal(mismatches[0]?.git_branch, 'feature/new');
+    assert.match(String(mismatches[0]?.message), /branch changed/);
+  } finally {
+    registry.close();
+  }
 });
 
 test('roster reports every persona with state, home worktree, and last task', () => {

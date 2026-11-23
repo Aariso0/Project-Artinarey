@@ -4,8 +4,8 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   atomicWrite, buildIndex, ensureExcludeBlock, findMarker, globalIgnoreCoverage,
-  listGitWorktrees, newId, openRegistry, projectStore, resolveRepo, resolveXdgPaths,
-  writeMarker,
+  listGitWorktrees, newId, openRegistry, projectStore, reconcileWorktrees, resolveRepo,
+  resolveXdgPaths, writeMarker,
 } from '@artinarey/core';
 import { callDaemon, daemonStatus, startDaemon, stopDaemon } from '@artinarey/daemon';
 
@@ -105,6 +105,40 @@ export async function main(
       }
     } catch (err) {
       console.error(`init failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
+  if (command === 'worktree') {
+    if (args[0] !== 'list') {
+      console.error('usage: artinarey worktree list');
+      return 2;
+    }
+    try {
+      const { root } = resolveRepo(cwd);
+      const marker = findMarker(cwd);
+      if (!marker) {
+        console.error('no .artinarey.json found; run artinarey init');
+        return 1;
+      }
+      const registry = openRegistry(resolveXdgPaths(env).registryFile);
+      try {
+        const project = registry.projects.get(marker.marker.project_id);
+        if (!project) {
+          console.error(`unknown project: ${marker.marker.project_id}`);
+          return 1;
+        }
+        for (const row of reconcileWorktrees(registry, project.id, listGitWorktrees(root))) {
+          const id = row.worktreeId ? ` ${row.worktreeId}` : '';
+          const flag = row.flag ? ` ${row.flag}` : '';
+          console.log(`${row.state} ${row.path} (${row.branch ?? 'detached'})${id}${flag}`);
+        }
+        return 0;
+      } finally {
+        registry.close();
+      }
+    } catch (err) {
+      console.error(`worktree list failed: ${(err as Error).message}`);
       return 1;
     }
   }

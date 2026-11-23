@@ -131,6 +131,70 @@ test('artinarey init registers a project, writes the marker, and is idempotent',
   registry.close();
 });
 
+test('worktree list prints each state and no registry id for unmanaged rows', async () => {
+  const dir = root();
+  const repo = join(dir, 'repo');
+  const moved = join(dir, 'moved');
+  const other = join(dir, 'other');
+  mkdirSync(repo, { recursive: true });
+  execFileSync('git', ['init', '-q'], { cwd: repo });
+  execFileSync('git', [
+    '-c', 'user.name=Tester', '-c', 'user.email=tester@example.com',
+    'commit', '--allow-empty', '-q', '-m', 'init',
+  ], { cwd: repo });
+  const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'],
+    { cwd: repo, encoding: 'utf8' }).trim();
+  execFileSync('git', ['worktree', 'add', '-q', '-b', 'artinarey/moved', moved], { cwd: repo });
+  execFileSync('git', ['worktree', 'add', '-q', '-b', 'artinarey/other', other], { cwd: repo });
+
+  const env = envFor(dir);
+  const registry = openRegistry(resolveXdgPaths(env).registryFile);
+  const project = registry.projects.create({
+    name: 'List', repoCommonDir: join(repo, '.git'), storeDir: join(dir, 'data', 'store'),
+  });
+  const rootId = newId();
+  const movedId = newId();
+  const missingId = newId();
+  registry.worktrees.upsert({ id: rootId, projectId: project.id, path: repo, branch });
+  registry.worktrees.upsert({ id: movedId, projectId: project.id, path: join(dir, 'old'),
+    branch: 'artinarey/moved' });
+  registry.worktrees.upsert({ id: missingId, projectId: project.id, path: join(dir, 'gone'),
+    branch: 'artinarey/gone' });
+  writeMarker(repo, project.id, rootId);
+
+  let output = '';
+  let errors = '';
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (s: unknown) => { output += `${String(s)}\n`; };
+  console.error = (s: unknown) => { errors += `${String(s)}\n`; };
+  let code: number;
+  try {
+    code = await main(['worktree', 'list'], env, repo);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+  assert.equal(code, 0, errors);
+
+  const lineFor = (path: string): string => {
+    const line = output.split('\n').find((l) => l.includes(path));
+    assert.ok(line, `no output line for ${path}: ${output}`);
+    return line;
+  };
+  assert.match(lineFor(repo), /^managed /);
+  assert.ok(lineFor(repo).includes(rootId));
+  assert.match(lineFor(moved), /^managed .* moved\b/);
+  assert.ok(lineFor(moved).includes(movedId));
+  assert.match(lineFor(join(dir, 'gone')), /^missing /);
+  assert.ok(lineFor(join(dir, 'gone')).includes(missingId));
+  const unmanaged = lineFor(other);
+  assert.match(unmanaged, /^unmanaged /);
+  assert.equal(unmanaged.split(/\s+/).some(isUlid), false,
+    `unmanaged row must not print a registry id: ${unmanaged}`);
+  registry.close();
+});
+
 test('release <worktree> --force frees a binding through the daemon', async () => {
   const dir = root();
   const env = envFor(dir);

@@ -240,3 +240,51 @@ test('globalIgnoreCoverage checks the global file only, not the local exclude bl
     rmSync(global, { recursive: true, force: true });
   }
 });
+
+test('reconcileWorktrees matches by path then branch, then reports missing and unmanaged', () => {
+  const base = mkdtempSync(join(tmpdir(), 'artinarey-reconcile-'));
+  const registry = core.openRegistry(join(base, 'registry.sqlite'));
+  try {
+    const project = registry.projects.create({
+      name: 'R', repoCommonDir: join(base, '.git'), storeDir: join(base, 'store'),
+    });
+    const same = join(base, 'same');
+    const old = join(base, 'old');
+    const moved = join(base, 'new');
+    const missing = join(base, 'gone');
+    const other = join(base, 'other');
+    for (const path of [same, old, moved, other]) mkdirSync(path);
+
+    const sameId = core.newId();
+    const movedId = core.newId();
+    const missingId = core.newId();
+    registry.worktrees.upsert({ id: sameId, projectId: project.id, path: same, branch: 'main' });
+    registry.worktrees.upsert({ id: movedId, projectId: project.id, path: old, branch: 'feature/moved' });
+    registry.worktrees.upsert({ id: missingId, projectId: project.id, path: missing,
+      branch: 'feature/gone' });
+
+    const head1 = 'a'.repeat(40);
+    const head2 = 'b'.repeat(40);
+    const head3 = 'c'.repeat(40);
+    const gitWorktrees: core.GitWorktree[] = [
+      { path: same, head: head1, branch: 'main', detached: false, locked: false,
+        prunable: false, bare: false },
+      { path: moved, head: head2, branch: 'feature/moved', detached: false, locked: false,
+        prunable: false, bare: false },
+      { path: other, head: head3, branch: 'feature/other', detached: false, locked: false,
+        prunable: false, bare: false },
+    ];
+
+    const rows = core.reconcileWorktrees(registry, project.id, gitWorktrees);
+    assert.deepEqual(rows.map((r) => [r.state, r.flag ?? null, r.path, r.branch, r.head,
+      r.worktreeId ?? null]), [
+      ['managed', null, same, 'main', head1, sameId],
+      ['managed', 'moved', moved, 'feature/moved', head2, movedId],
+      ['unmanaged', null, other, 'feature/other', head3, null],
+      ['missing', null, missing, 'feature/gone', '', missingId],
+    ]);
+  } finally {
+    registry.close();
+    rmSync(base, { recursive: true, force: true });
+  }
+});

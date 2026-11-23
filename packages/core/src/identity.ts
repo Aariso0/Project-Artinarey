@@ -1,9 +1,10 @@
 import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import type { ArtinareyErrorCode } from './errors.ts';
 import { readPersona, writePersona } from './persona-store.ts';
 import { appendJournal } from './store.ts';
 import type { Registry } from './registry.ts';
+import { listGitWorktrees } from './worktree.ts';
 
 export type Marker = {
   schema: 1;
@@ -99,29 +100,50 @@ export function resolveIdentity(registry: Registry, cwd: string): IdentityResult
   }
 
   let registeredPath: string | undefined;
+  let registeredBranch: string | null = null;
   let storeDir: string | undefined;
   for (const project of registry.projects.list()) {
     const worktree = registry.worktrees.list(project.id)
       .find((wt) => wt.id === found.marker.worktree_id);
     if (worktree && project.id === found.marker.project_id) {
       registeredPath = worktree.path;
+      registeredBranch = worktree.branch;
       storeDir = project.storeDir;
       break;
     }
   }
 
-  if (!registeredPath || !storeDir || !sameDirectory(found.dir, registeredPath)) {
+  const pathMatches = registeredPath !== undefined && storeDir !== undefined
+    && sameDirectory(found.dir, registeredPath);
+  let branchMismatch: { registered: string | null; git: string | null } | undefined;
+  if (pathMatches) {
+    try {
+      const gitWorktree = listGitWorktrees(found.dir).find((wt) =>
+        sameDirectory(wt.path, found.dir) || found.dir.startsWith(`${wt.path}${sep}`));
+      if (gitWorktree && gitWorktree.branch !== registeredBranch) {
+        branchMismatch = { registered: registeredBranch, git: gitWorktree.branch };
+      }
+    } catch {
+      // No git worktree here (e.g. a plain temp dir): nothing to compare against.
+    }
+  }
+
+  if (!pathMatches || !storeDir || branchMismatch) {
+    const message = branchMismatch
+      ? `branch changed; confirm the move (registered: ${branchMismatch.registered ?? 'detached'}, git: ${branchMismatch.git ?? 'detached'})`
+      : 'marker does not match a registered worktree; run artinarey worktree adopt';
     audit(storeDir ?? join(cwd, '.artinarey-unmanaged'), {
       type: 'worktree_unmanaged',
       worktree_id: found.marker.worktree_id,
       marker_dir: found.dir,
       registered_path: registeredPath ?? null,
+      ...(branchMismatch ? {
+        registered_branch: branchMismatch.registered,
+        git_branch: branchMismatch.git,
+        message,
+      } : {}),
     });
-    return {
-      ok: false,
-      code: 'WORKTREE_UNMANAGED',
-      message: 'marker does not match a registered worktree; run artinarey worktree adopt',
-    };
+    return { ok: false, code: 'WORKTREE_UNMANAGED', message };
   }
 
   const binding = registry.bindings.forWorktree(found.marker.worktree_id);

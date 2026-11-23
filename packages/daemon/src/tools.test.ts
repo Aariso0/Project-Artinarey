@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { connect, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -47,6 +48,10 @@ async function openClient(path: string): Promise<Client> {
       socket.destroy();
     },
   };
+}
+
+function git(args: string[], cwd: string): void {
+  execFileSync('git', args, { cwd, encoding: 'utf8' });
 }
 
 function setup() {
@@ -229,6 +234,42 @@ test('release_force frees a binding held by another live connection', async () =
   admin.close();
   await server.close();
   s.registry.close();
+});
+
+test('attach pauses on a registered worktree whose git branch changed', async () => {
+  const s = setup();
+  const repo = join(s.root, 'repo');
+  const worktree = join(s.root, 'branch-changed');
+  mkdirSync(repo, { recursive: true });
+  git(['init', '-q'], repo);
+  git(['-c', 'user.name=Tester', '-c', 'user.email=tester@example.com',
+    'commit', '--allow-empty', '-q', '-m', 'init'], repo);
+  git(['worktree', 'add', '-q', '-b', 'feature/new', worktree], repo);
+
+  const id = newId();
+  s.registry.worktrees.upsert({ id, projectId: s.project.id, path: worktree,
+    branch: 'registered-branch' });
+  writeMarker(worktree, s.project.id, id);
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+
+  const { server, socketPath } = await serve(s);
+  const client = await openClient(socketPath);
+  try {
+    const response = await client.call('attach', { cwd: worktree, pid: process.pid });
+    assert.equal(response.ok, false, JSON.stringify(response));
+    if (!response.ok) {
+      assert.equal(response.error.code, 'WORKTREE_UNMANAGED');
+      assert.match(response.error.message, /branch changed; confirm the move/);
+      assert.match(response.error.message, /feature\/new/, 'message names the changed branch');
+    }
+    const claim = await client.call('claim_persona', { persona_id: dev });
+    assert.equal(claim.ok, false, 'a paused attach must not leave a claimable binding');
+    assert.equal(s.registry.bindings.forWorktree(id), undefined);
+  } finally {
+    client.close();
+    await server.close();
+    s.registry.close();
+  }
 });
 
 test('RPC replies always end with unread and next', async () => {
