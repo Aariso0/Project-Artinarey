@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
@@ -586,5 +586,142 @@ test('worktree remove <name> leaves a dirty worktree and all of its state untouc
   assert.equal(registry.bindings.forWorktree(row.id), undefined);
   assert.equal(registry.worktrees.list(project.id).some((wt) => wt.id === row.id), true);
   assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', 'refs/heads/artinarey/dirty'], repo), true);
+  registry.close();
+});
+
+function stubVendor(dir: string, exitCode = 0): { command: string; out: string } {
+  const command = join(dir, `stub-vendor-${exitCode}`);
+  const out = join(dir, `stub-vendor-${exitCode}.out`);
+  writeFileSync(command, [
+    '#!/bin/sh',
+    `pwd -P > '${out}'`,
+    "printf 'VENDOR_MARKER\\n'",
+    `exit ${exitCode}`,
+  ].join('\n'), { mode: 0o755 });
+  return { command, out };
+}
+
+test('run opencode binds a persona, records a complete session and releases on exit', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-run', 'Dev Run');
+  const vendor = stubVendor(dir);
+
+  const result = await captureMain(
+    ['run', 'opencode', '--persona', persona],
+    { ...env, ARTINAREY_TEST_VENDOR: vendor.command }, repo,
+  );
+  assert.equal(result.code, 0, `${result.err}${result.out}`);
+  assert.equal(readFileSync(vendor.out, 'utf8').trim(), realpathSync(repo));
+  assert.equal(registry.bindings.forWorktree(rootRow.id), undefined);
+  assert.equal(readPersona(project.storeDir, persona).state, 'idle');
+
+  const sessions = registry.sessions.list(project.id);
+  assert.equal(sessions.length, 1);
+  const session = sessions[0];
+  assert.equal(session?.vendor, 'opencode');
+  assert.equal(session?.personaId, persona);
+  assert.equal(session?.worktreeId, rootRow.id);
+  assert.ok(session?.startedAt);
+  assert.ok(session?.endedAt);
+  assert.ok(session!.endedAt! >= session!.startedAt);
+  registry.close();
+});
+
+test('run returns the vendor exit code and still releases and closes the session', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-fail', 'Dev Fail');
+  const vendor = stubVendor(dir, 7);
+
+  const result = await captureMain(
+    ['run', 'opencode', '--persona', persona],
+    { ...env, ARTINAREY_TEST_VENDOR: vendor.command }, repo,
+  );
+  assert.equal(result.code, 7, `${result.err}${result.out}`);
+  assert.equal(readFileSync(vendor.out, 'utf8').trim(), realpathSync(repo));
+  assert.equal(registry.bindings.forWorktree(rootRow.id), undefined);
+  const sessions = registry.sessions.list(project.id);
+  assert.equal(sessions.length, 1);
+  assert.ok(sessions[0]?.endedAt);
+  registry.close();
+});
+
+test('run warns on a home mismatch without flags and honours --confirm-move and --rehome', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-home', 'Dev Home');
+  const otherHome = newId();
+  writePersona(project.storeDir, persona, {
+    role: 'dev-home', name: 'Dev Home', home_worktree_id: otherHome,
+    state: 'idle', vendor: null, last_vendor_session_id: null,
+  });
+  const vendor = stubVendor(dir);
+  const runEnv = { ...env, ARTINAREY_TEST_VENDOR: vendor.command };
+
+  const refused = await captureMain(['run', 'opencode', '--persona', persona], runEnv, repo);
+  assert.equal(refused.code, 1, refused.out);
+  assert.match(refused.out, /another worktree|confirm_move|confirm-move/i);
+  assert.equal(existsSync(vendor.out), false);
+  assert.equal(registry.bindings.forWorktree(rootRow.id), undefined);
+  assert.equal(registry.sessions.list(project.id).length, 0);
+
+  const confirmed = await captureMain(
+    ['run', 'opencode', '--persona', persona, '--confirm-move'], runEnv, repo,
+  );
+  assert.equal(confirmed.code, 0, `${confirmed.err}${confirmed.out}`);
+  assert.equal(readFileSync(vendor.out, 'utf8').trim(), realpathSync(repo));
+  assert.equal(readPersona(project.storeDir, persona).home_worktree_id, otherHome);
+  assert.equal(registry.bindings.forWorktree(rootRow.id), undefined);
+  assert.equal(registry.sessions.list(project.id).length, 1);
+
+  const rehomed = await captureMain(
+    ['run', 'opencode', '--persona', persona, '--rehome'], runEnv, repo,
+  );
+  assert.equal(rehomed.code, 0, `${rehomed.err}${rehomed.out}`);
+  assert.equal(readPersona(project.storeDir, persona).home_worktree_id, rootRow.id);
+  assert.equal(registry.bindings.forWorktree(rootRow.id), undefined);
+  assert.equal(registry.sessions.list(project.id).length, 2);
+  registry.close();
+});
+
+test('run rejects unknown vendors, a missing --persona and unmanaged worktrees', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const vendor = stubVendor(dir);
+
+  const unknown = await captureMain(['run', 'mystery', '--persona', 'anyone'], env, repo);
+  assert.equal(unknown.code, 2, unknown.out);
+  assert.match(unknown.err, /unknown vendor/);
+  assert.equal(existsSync(vendor.out), false);
+
+  const missing = await captureMain(
+    ['run', 'opencode'], { ...env, ARTINAREY_TEST_VENDOR: vendor.command }, repo,
+  );
+  assert.equal(missing.code, 2, missing.out);
+  assert.match(missing.err, /--persona/);
+  assert.equal(existsSync(vendor.out), false);
+
+  const loose = join(dir, 'loose-wt');
+  mkdirSync(loose, { recursive: true });
+  const looseId = newId();
+  registry.worktrees.upsert({ id: looseId, projectId: project.id, path: loose, branch: null });
+  writeMarker(loose, project.id, looseId);
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-loose', 'Loose');
+  const unmanaged = await captureMain(
+    ['run', 'opencode', '--persona', persona],
+    { ...env, ARTINAREY_TEST_VENDOR: vendor.command }, loose,
+  );
+  assert.equal(unmanaged.code, 1, unmanaged.out);
+  assert.match(unmanaged.err, /WORKTREE_UNMANAGED/);
+  assert.equal(existsSync(vendor.out), false);
+  assert.equal(registry.bindings.forWorktree(looseId), undefined);
+  assert.equal(registry.sessions.list(project.id).length, 0);
   registry.close();
 });

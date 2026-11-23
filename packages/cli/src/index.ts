@@ -1,12 +1,14 @@
+import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { basename, dirname, join, resolve } from 'node:path';
+import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
-  adoptWorktree, atomicWrite, buildIndex, createWorktree, ensureExcludeBlock, findMarker,
-  globalIgnoreCoverage, listGitWorktrees, newId, openRegistry, planWorktree, projectStore,
-  reconcileWorktrees, rehomePersona, removeWorktree, resolveRepo, resolveXdgPaths, roster,
-  writeMarker,
+  adoptWorktree, atomicWrite, buildIndex, claimPersona, createWorktree, ensureExcludeBlock,
+  findMarker, globalIgnoreCoverage, listGitWorktrees, newId, openRegistry, planWorktree,
+  projectStore, reconcileWorktrees, rehomePersona, releasePersona, removeWorktree, resolveIdentity,
+  resolveRepo, resolveXdgPaths, roster, writeMarker,
 } from '@artinarey/core';
 import { callDaemon, daemonStatus, startDaemon, stopDaemon } from '@artinarey/daemon';
 
@@ -14,6 +16,10 @@ const MCP_TOOLS = [
   'check_in', 'claim_persona', 'inbox', 'read_mail',
   'send_mail', 'mark_done', 'report', 'worktrees',
 ] as const;
+
+const VENDOR_COMMANDS: Record<string, string> = { opencode: 'opencode' };
+const RUN_USAGE =
+  'usage: artinarey run <vendor> --persona <persona> [--confirm-move] [--rehome] [--yes]';
 
 function shimCommand(): string[] {
   const require = createRequire(import.meta.url);
@@ -35,6 +41,7 @@ type OpenCodeConfig = Record<string, unknown> & {
 };
 
 type RegistryHandle = ReturnType<typeof openRegistry>;
+type ClaimedPersona = Extract<ReturnType<typeof claimPersona>, { ok: true }>;
 type Resolution = { id?: string; error?: string };
 
 /** Exact id first, then a unique role. Personas are resolved inside the current project. */
@@ -55,6 +62,30 @@ function resolveWorktree(registry: RegistryHandle, token: string): Resolution {
       || worktree.branch === `artinarey/${token}`);
   if (matches.length > 1) return { error: `ambiguous worktree: ${token}` };
   return { id: matches[0]?.id };
+}
+
+/** Git is the authority on whether a registered worktree is still attached here. */
+function isManagedWorktree(
+  registry: RegistryHandle, projectId: string, worktreeId: string, markerDir: string,
+): boolean {
+  try {
+    const { root } = resolveRepo(markerDir);
+    return reconcileWorktrees(registry, projectId, listGitWorktrees(root))
+      .some((row) => row.state === 'managed' && row.worktreeId === worktreeId);
+  } catch {
+    return false;
+  }
+}
+
+async function confirmInTerminal(question: string): Promise<boolean> {
+  if (!process.stdin.isTTY) return false;
+  const prompt = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await new Promise<string>((done) => prompt.question(question, done));
+    return answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes';
+  } finally {
+    prompt.close();
+  }
 }
 
 function connectOpencode(cwd: string): void {
@@ -359,6 +390,88 @@ export async function main(
     } catch (err) {
       console.error(`connect failed: ${(err as Error).message}`);
       return 1;
+    }
+  }
+
+  if (command === 'run') {
+    const vendor = args[0];
+    const personaIndex = args.indexOf('--persona');
+    const personaToken = personaIndex === -1 ? undefined : args[personaIndex + 1];
+    const vendorCommand = env.ARTINAREY_TEST_VENDOR
+      || (vendor ? VENDOR_COMMANDS[vendor] : undefined);
+    if (!vendor || vendor.startsWith('--')) {
+      console.error(RUN_USAGE);
+      return 2;
+    }
+    if (!vendorCommand) {
+      console.error(`unknown vendor: ${vendor}`);
+      console.error(RUN_USAGE);
+      return 2;
+    }
+    if (!personaToken || personaToken.startsWith('--')) {
+      console.error('run requires --persona <persona>');
+      console.error(RUN_USAGE);
+      return 2;
+    }
+
+    const confirmMove = args.includes('--confirm-move') || args.includes('--yes');
+    const rehome = args.includes('--rehome');
+    let registry: RegistryHandle | undefined;
+    let claimed: ClaimedPersona | undefined;
+    let sessionId: string | undefined;
+    try {
+      registry = openRegistry(resolveXdgPaths(env).registryFile);
+      const resolved = resolveIdentity(registry, cwd);
+      if (!resolved.ok) {
+        console.error(`${resolved.code}: ${resolved.message}`);
+        return 1;
+      }
+      const identity = resolved.identity;
+      if (!isManagedWorktree(registry, identity.projectId, identity.worktreeId, identity.markerDir)) {
+        console.error('WORKTREE_UNMANAGED: worktree is not managed by git; run artinarey worktree list');
+        return 1;
+      }
+
+      const options = { personaId: personaToken, confirmMove, rehome };
+      let claim = claimPersona(registry, identity.storeDir, identity, options);
+      if (!claim.ok && claim.code === 'NEEDS_CONFIRMATION') {
+        console.log(`warning: ${claim.message}`);
+        const accepted = !confirmMove && !rehome
+          ? await confirmInTerminal('Bind this persona here anyway? [y/N] ')
+          : false;
+        if (!accepted) return 1;
+        claim = claimPersona(registry, identity.storeDir, identity,
+          { ...options, confirmMove: true });
+      }
+      if (!claim.ok) {
+        console.error(`${claim.code}: ${claim.message}`);
+        return 1;
+      }
+      claimed = claim;
+
+      sessionId = registry.sessions.append({
+        projectId: identity.projectId,
+        worktreeId: identity.worktreeId,
+        personaId: claim.personaId,
+        vendor,
+        startedAt: new Date().toISOString(),
+      });
+      const child = spawn(vendorCommand, [], {
+        cwd: identity.markerDir, stdio: 'inherit', env,
+      });
+      return await new Promise<number>((done, fail) => {
+        child.once('error', fail);
+        child.once('exit', (code, signal) => done(signal ? 1 : code ?? 1));
+      });
+    } catch (err) {
+      console.error(`run failed: ${(err as Error).message}`);
+      return 1;
+    } finally {
+      if (registry) {
+        if (sessionId) registry.sessions.end(sessionId, new Date().toISOString());
+        if (claimed) releasePersona(registry, claimed.identity.storeDir, claimed.personaId);
+        registry.close();
+      }
     }
   }
 

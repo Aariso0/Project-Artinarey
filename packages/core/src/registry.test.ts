@@ -128,6 +128,37 @@ test('sessions and moves append and list in insertion order', () => {
   db.close();
 });
 
+test('sessions: append returns its id and end stamps only that session', () => {
+  const db = openTempRegistry();
+  const project = db.projects.create({ name: 'Alpha', repoCommonDir: '/r/a/.git', storeDir: '/d/a' });
+  const persona = db.personas.create({ projectId: project.id, role: 'dev-a', name: 'A' });
+  const wt = newId();
+  db.worktrees.upsert({ id: wt, projectId: project.id, path: '/w/a', branch: null });
+
+  const first = db.sessions.append({
+    projectId: project.id, worktreeId: wt, personaId: persona.id,
+    vendor: 'opencode', startedAt: '2026-11-24T10:00:00Z',
+  });
+  const second = db.sessions.append({
+    projectId: project.id, worktreeId: wt, personaId: persona.id,
+    vendor: 'opencode', startedAt: '2026-11-24T11:00:00Z',
+  });
+  assert.equal(isUlid(first), true);
+  assert.equal(isUlid(second), true);
+  assert.notEqual(first, second);
+  assert.equal(db.sessions.list(project.id).find((s) => s.id === first)?.endedAt, null);
+
+  db.sessions.end(first, '2026-11-24T10:30:00Z');
+  const rows = db.sessions.list(project.id);
+  assert.equal(rows.find((s) => s.id === first)?.endedAt, '2026-11-24T10:30:00Z');
+  assert.equal(rows.find((s) => s.id === second)?.endedAt, null);
+
+  // An unknown id is a no-op; the store is data, never a source of authority.
+  db.sessions.end('missing', '2026-11-24T12:00:00Z');
+  assert.deepEqual(db.sessions.list(project.id), rows);
+  db.close();
+});
+
 test('foreign keys are enforced', () => {
   const db = openTempRegistry();
   assert.throws(

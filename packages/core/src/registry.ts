@@ -180,7 +180,8 @@ export type Registry = {
     release(personaId: string): void;
   };
   sessions: {
-    append(event: SessionInput): void;
+    append(event: SessionInput): string;
+    end(id: string, endedAt: string): void;
     list(projectId: string): SessionEvent[];
     deleteForWorktree(worktreeId: string): void;
   };
@@ -278,10 +279,15 @@ export function openRegistry(file: string): Registry {
     },
     sessions: {
       append(event) {
+        const id = newId();
         db.prepare(`INSERT INTO sessions (id, project_id, worktree_id, persona_id, vendor, started_at, ended_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)`)
-          .run(newId(), event.projectId, event.worktreeId, event.personaId, event.vendor,
+          .run(id, event.projectId, event.worktreeId, event.personaId, event.vendor,
             event.startedAt, event.endedAt ?? null);
+        return id;
+      },
+      end(id, endedAt) {
+        db.prepare('UPDATE sessions SET ended_at = ? WHERE id = ?').run(endedAt, id);
       },
       list(projectId) {
         return (db.prepare('SELECT * FROM sessions WHERE project_id = ? ORDER BY id')
