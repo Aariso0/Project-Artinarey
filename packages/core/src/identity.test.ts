@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newId } from './ids.ts';
@@ -11,6 +11,7 @@ import {
   claimPersona,
   createPersona,
   findMarker,
+  rehomePersona,
   releasePersona,
   releaseWorktreeForce,
   resolveIdentity,
@@ -55,6 +56,20 @@ test('findMarker returns undefined when no valid marker exists', () => {
 
 function git(args: string[], cwd: string): void {
   execFileSync('git', args, { cwd, encoding: 'utf8' });
+}
+
+function registryProject(registry: ReturnType<typeof openRegistry>, root: string) {
+  return registry.projects.create({
+    name: 'Other', repoCommonDir: join(root, 'other.git'), storeDir: join(root, 'other-store'),
+  });
+}
+
+function auditEvents(storeDir: string, type: string): Array<Record<string, unknown>> {
+  const file = join(storeDir, 'events', 'audit.jsonl');
+  if (!existsSync(file)) return [];
+  return readFileSync(file, 'utf8').trim().split('\n').filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((event) => event.type === type);
 }
 
 function setup() {
@@ -228,5 +243,76 @@ test('release and force release free the binding and mark the persona idle', () 
   assert.equal(releaseWorktreeForce(s.registry, s.storeDir, s.wt1), true);
   assert.equal(releaseWorktreeForce(s.registry, s.storeDir, s.wt1), false);
   assert.equal(s.registry.bindings.forWorktree(s.wt1), undefined);
+  s.registry.close();
+});
+
+test('rehomePersona writes the new home worktree and one persona_rehome audit line', () => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.storeDir, s.project.id, 'dev-auth', 'Dev');
+
+  assert.deepEqual(rehomePersona(s.registry, s.storeDir, dev, s.wt2), { ok: true });
+  assert.equal(readPersona(s.storeDir, dev).home_worktree_id, s.wt2);
+
+  const events = auditEvents(s.storeDir, 'persona_rehome');
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.persona_id, dev);
+  assert.equal(events[0]?.worktree_id, s.wt2);
+  assert.equal(events[0]?.previous_home_worktree_id, null);
+  s.registry.close();
+});
+
+test('rehomePersona refuses cross-project and unknown ids without a successful audit', () => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.storeDir, s.project.id, 'dev-auth', 'Dev');
+  writePersona(s.storeDir, dev, {
+    role: 'dev-auth', name: 'Dev', home_worktree_id: s.wt1,
+    state: 'idle', vendor: null, last_vendor_session_id: null,
+  });
+  const otherProject = registryProject(s.registry, s.root);
+  const foreignWt = newId();
+  s.registry.worktrees.upsert({ id: foreignWt, projectId: otherProject.id,
+    path: join(s.root, 'foreign'), branch: null });
+
+  const cross = rehomePersona(s.registry, s.storeDir, dev, foreignWt);
+  assert.equal(cross.ok, false);
+  if (!cross.ok) {
+    assert.equal(cross.code, 'INVALID_INPUT');
+    assert.match(cross.message, /different project/i);
+  }
+  assert.equal(readPersona(s.storeDir, dev).home_worktree_id, s.wt1);
+  assert.equal(auditEvents(s.storeDir, 'persona_rehome').length, 0);
+
+  for (const [personaId, worktreeId, code] of [
+    [newId(), s.wt2, 'NOT_FOUND'],
+    [dev, newId(), 'NOT_FOUND'],
+    ['', s.wt2, 'INVALID_INPUT'],
+    [dev, '', 'INVALID_INPUT'],
+  ] as const) {
+    const result = rehomePersona(s.registry, s.storeDir, personaId, worktreeId);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, code);
+  }
+  assert.equal(readPersona(s.storeDir, dev).home_worktree_id, s.wt1);
+  assert.equal(auditEvents(s.storeDir, 'persona_rehome').length, 0);
+  s.registry.close();
+});
+
+test('rehomePersona clears the home mismatch that would otherwise need confirmation', () => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.storeDir, s.project.id, 'dev-auth', 'Dev');
+  writePersona(s.storeDir, dev, {
+    role: 'dev-auth', name: 'Dev', home_worktree_id: s.wt1,
+    state: 'idle', vendor: null, last_vendor_session_id: null,
+  });
+  const other = resolveIdentity(s.registry, join(s.root, 'wt2'));
+  assert.equal(other.ok, true);
+  if (!other.ok) return;
+
+  const mismatch = claimPersona(s.registry, s.storeDir, other.identity, { personaId: dev });
+  assert.equal(mismatch.ok, false);
+  if (!mismatch.ok) assert.equal(mismatch.code, 'NEEDS_CONFIRMATION');
+
+  assert.deepEqual(rehomePersona(s.registry, s.storeDir, dev, s.wt2), { ok: true });
+  assert.equal(claimPersona(s.registry, s.storeDir, other.identity, { personaId: dev }).ok, true);
   s.registry.close();
 });

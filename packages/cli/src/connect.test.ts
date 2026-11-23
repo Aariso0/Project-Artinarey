@@ -5,8 +5,8 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
-  createPersona, findMarker, isUlid, newId, openRegistry, releasePersona,
-  resolveXdgPaths, writeMarker,
+  claimPersona, createPersona, findMarker, isUlid, newId, openRegistry, readPersona,
+  releasePersona, resolveIdentity, resolveXdgPaths, writeMarker, writePersona,
 } from '@artinarey/core';
 import { createRpcServer } from '@artinarey/daemon';
 import { main } from './index.ts';
@@ -28,6 +28,31 @@ function envFor(dir: string): NodeJS.ProcessEnv {
     XDG_RUNTIME_DIR: join(dir, 'runtime'),
     PATH: process.env.PATH ?? '',
   };
+}
+
+async function captureMain(
+  argv: string[], env: NodeJS.ProcessEnv, cwd: string,
+): Promise<{ code: number; out: string; err: string }> {
+  let out = '';
+  let err = '';
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (s: unknown) => { out += `${String(s)}\n`; };
+  console.error = (s: unknown) => { err += `${String(s)}\n`; };
+  try {
+    return { code: await main(argv, env, cwd), out, err };
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+}
+
+function rehomeEvents(storeDir: string): Array<Record<string, unknown>> {
+  const file = join(storeDir, 'events', 'audit.jsonl');
+  if (!existsSync(file)) return [];
+  return readFileSync(file, 'utf8').trim().split('\n').filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((event) => event.type === 'persona_rehome');
 }
 
 function gitSucceeds(args: string[], cwd: string): boolean {
@@ -422,6 +447,110 @@ test('worktree remove <name> refuses a bound worktree, then removes it after rel
   assert.equal(existsSync(target), false);
   assert.equal(registry.worktrees.list(project.id).some((wt) => wt.id === row.id), false);
   assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', 'refs/heads/artinarey/gone'], repo), true);
+  registry.close();
+});
+
+test('persona list prints role, name, home and state for the current project only', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const dev = createPersona(registry, project.storeDir, project.id, 'dev-auth', 'Auth dev');
+  writePersona(project.storeDir, dev, {
+    role: 'dev-auth', name: 'Auth dev', home_worktree_id: rootRow.id,
+    state: 'active', vendor: null, last_vendor_session_id: null,
+  });
+  const otherProject = registry.projects.create({
+    name: 'Other', repoCommonDir: join(dir, 'other.git'),
+    storeDir: join(dir, 'data', 'other-store'),
+  });
+  createPersona(registry, otherProject.storeDir, otherProject.id, 'foreign', 'Foreign dev');
+
+  const result = await captureMain(['persona', 'list'], env, repo);
+  assert.equal(result.code, 0, result.err);
+  assert.match(result.out, /dev-auth/);
+  assert.match(result.out, /Auth dev/);
+  assert.match(result.out, new RegExp(rootRow.id));
+  assert.match(result.out, /active/);
+  assert.doesNotMatch(result.out, /foreign|Foreign dev/);
+  registry.close();
+});
+
+test('persona rehome resolves role and path, then clears the confirmation requirement', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const target = join(dir, 'wt2');
+  mkdirSync(target, { recursive: true });
+  const targetId = newId();
+  registry.worktrees.upsert({ id: targetId, projectId: project.id, path: target,
+    branch: 'artinarey/wt2' });
+  writeMarker(target, project.id, targetId);
+  const dev = createPersona(registry, project.storeDir, project.id, 'dev-auth', 'Auth dev');
+  writePersona(project.storeDir, dev, {
+    role: 'dev-auth', name: 'Auth dev', home_worktree_id: rootRow.id,
+    state: 'idle', vendor: null, last_vendor_session_id: null,
+  });
+
+  const identity = resolveIdentity(registry, target);
+  assert.equal(identity.ok, true);
+  if (!identity.ok) return;
+  const blocked = claimPersona(registry, project.storeDir, identity.identity, { personaId: dev });
+  assert.equal(blocked.ok, false);
+  if (!blocked.ok) assert.equal(blocked.code, 'NEEDS_CONFIRMATION');
+
+  const result = await captureMain(['persona', 'rehome', 'dev-auth', 'wt2'], env, repo);
+  assert.equal(result.code, 0, `${result.err}${result.out}`);
+  assert.match(result.out, /rehomed/);
+  assert.equal(readPersona(project.storeDir, dev).home_worktree_id, targetId);
+  const events = rehomeEvents(project.storeDir);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.persona_id, dev);
+  assert.equal(events[0]?.worktree_id, targetId);
+
+  assert.equal(claimPersona(registry, project.storeDir, identity.identity, { personaId: dev }).ok, true);
+  registry.close();
+});
+
+test('persona rehome refuses another project, unknown ids and missing arguments', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const dev = createPersona(registry, project.storeDir, project.id, 'dev-auth', 'Auth dev');
+  writePersona(project.storeDir, dev, {
+    role: 'dev-auth', name: 'Auth dev', home_worktree_id: rootRow.id,
+    state: 'idle', vendor: null, last_vendor_session_id: null,
+  });
+  const otherProject = registry.projects.create({
+    name: 'Other', repoCommonDir: join(dir, 'other.git'),
+    storeDir: join(dir, 'data', 'other-store'),
+  });
+  const foreignWt = newId();
+  registry.worktrees.upsert({ id: foreignWt, projectId: otherProject.id,
+    path: join(dir, 'foreign-wt'), branch: 'artinarey/foreign' });
+
+  const cross = await captureMain(['persona', 'rehome', dev, foreignWt], env, repo);
+  assert.equal(cross.code, 1, cross.out);
+  assert.match(cross.err, /different project/i);
+  assert.equal(readPersona(project.storeDir, dev).home_worktree_id, rootRow.id);
+  assert.equal(rehomeEvents(project.storeDir).length, 0);
+
+  const foreign = createPersona(registry, otherProject.storeDir, otherProject.id, 'foreign', 'Foreign');
+  const foreignPersona = await captureMain(['persona', 'rehome', foreign, rootRow.id], env, repo);
+  assert.equal(foreignPersona.code, 1, foreignPersona.out);
+  assert.match(foreignPersona.err, /unknown persona/);
+
+  const unknown = await captureMain(['persona', 'rehome', 'nobody', 'wt2'], env, repo);
+  assert.equal(unknown.code, 1, unknown.out);
+  assert.match(unknown.err, /unknown persona/);
+  assert.equal(rehomeEvents(project.storeDir).length, 0);
+  assert.equal(rehomeEvents(otherProject.storeDir).length, 0);
+
+  const usage = await captureMain(['persona', 'rehome', 'dev-auth'], env, repo);
+  assert.equal(usage.code, 2, usage.out);
+  assert.match(usage.err, /usage: artinarey persona list \| rehome <persona> <worktree>/);
   registry.close();
 });
 

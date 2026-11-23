@@ -209,6 +209,47 @@ export function roster(registry: Registry, storeDir: string, projectId: string):
   });
 }
 
+export type RehomeResult =
+  | { ok: true }
+  | { ok: false; code: 'INVALID_INPUT' | 'NOT_FOUND'; message: string };
+
+/** Point a persona's home at a worktree of the same project. Bindings are untouched. */
+export function rehomePersona(
+  registry: Registry,
+  storeDir: string,
+  personaId: string,
+  worktreeId: string,
+): RehomeResult {
+  if (!personaId || !worktreeId) {
+    return { ok: false, code: 'INVALID_INPUT', message: 'provide a persona and a worktree' };
+  }
+  const persona = registry.personas.get(personaId);
+  if (!persona) {
+    return { ok: false, code: 'NOT_FOUND', message: `unknown persona: ${personaId}` };
+  }
+  const worktree = registry.projects.list()
+    .flatMap((project) => registry.worktrees.list(project.id))
+    .find((candidate) => candidate.id === worktreeId);
+  if (!worktree) {
+    return { ok: false, code: 'NOT_FOUND', message: `unknown worktree: ${worktreeId}` };
+  }
+  if (persona.projectId !== worktree.projectId) {
+    return {
+      ok: false,
+      code: 'INVALID_INPUT',
+      message: 'persona and worktree belong to different projects',
+    };
+  }
+
+  const state = readPersona(storeDir, personaId);
+  writePersona(storeDir, personaId, { ...state, home_worktree_id: worktreeId });
+  audit(storeDir, {
+    type: 'persona_rehome', persona_id: personaId, worktree_id: worktreeId,
+    previous_home_worktree_id: state.home_worktree_id,
+  });
+  return { ok: true };
+}
+
 export type ClaimOptions = {
   personaId?: string;
   newRole?: string;

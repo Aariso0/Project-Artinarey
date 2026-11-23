@@ -5,7 +5,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   adoptWorktree, atomicWrite, buildIndex, createWorktree, ensureExcludeBlock, findMarker,
   globalIgnoreCoverage, listGitWorktrees, newId, openRegistry, planWorktree, projectStore,
-  reconcileWorktrees, removeWorktree, resolveRepo, resolveXdgPaths, writeMarker,
+  reconcileWorktrees, rehomePersona, removeWorktree, resolveRepo, resolveXdgPaths, roster,
+  writeMarker,
 } from '@artinarey/core';
 import { callDaemon, daemonStatus, startDaemon, stopDaemon } from '@artinarey/daemon';
 
@@ -32,6 +33,29 @@ type OpenCodeConfig = Record<string, unknown> & {
   mcp?: { servers?: Record<string, unknown> };
   permissions?: Array<{ action: string; resource: string; effect: string }>;
 };
+
+type RegistryHandle = ReturnType<typeof openRegistry>;
+type Resolution = { id?: string; error?: string };
+
+/** Exact id first, then a unique role. Personas are resolved inside the current project. */
+function resolvePersona(registry: RegistryHandle, projectId: string, token: string): Resolution {
+  const personas = registry.personas.list(projectId);
+  const exact = personas.find((persona) => persona.id === token);
+  if (exact) return { id: exact.id };
+  const matches = personas.filter((persona) => persona.role === token);
+  if (matches.length > 1) return { error: `ambiguous persona: ${token}` };
+  return { id: matches[0]?.id };
+}
+
+function resolveWorktree(registry: RegistryHandle, token: string): Resolution {
+  const matches = registry.projects.list()
+    .flatMap((project) => registry.worktrees.list(project.id))
+    .filter((worktree) => worktree.id === token || worktree.path === token
+      || basename(worktree.path) === token || worktree.branch === token
+      || worktree.branch === `artinarey/${token}`);
+  if (matches.length > 1) return { error: `ambiguous worktree: ${token}` };
+  return { id: matches[0]?.id };
+}
 
 function connectOpencode(cwd: string): void {
   const file = join(cwd, 'opencode.json');
@@ -254,6 +278,71 @@ export async function main(
       }
     } catch (err) {
       console.error(`worktree list failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
+  if (command === 'persona') {
+    const subcommand = args[0];
+    const usage = 'usage: artinarey persona list | rehome <persona> <worktree>';
+    if ((subcommand !== 'list' && subcommand !== 'rehome')
+        || (subcommand === 'rehome' && (args.length !== 3
+          || args[1]?.startsWith('--') || args[2]?.startsWith('--')))) {
+      console.error(usage);
+      return 2;
+    }
+    try {
+      const marker = findMarker(cwd);
+      if (!marker) {
+        console.error('no .artinarey.json found; run artinarey init');
+        return 1;
+      }
+      const registry = openRegistry(resolveXdgPaths(env).registryFile);
+      try {
+        const project = registry.projects.get(marker.marker.project_id);
+        if (!project) {
+          console.error(`unknown project: ${marker.marker.project_id}`);
+          return 1;
+        }
+        if (subcommand === 'list') {
+          const paths = new Map(registry.projects.list()
+            .flatMap((row) => registry.worktrees.list(row.id)
+              .map((worktree): [string, string] => [worktree.id, worktree.path])));
+          for (const entry of roster(registry, project.storeDir, project.id)) {
+            const home = entry.homeWorktreeId
+              ? `${entry.homeWorktreeId} ${paths.get(entry.homeWorktreeId) ?? ''}`.trim()
+              : '-';
+            console.log(`${entry.role} ${entry.name} ${home} ${entry.state}`);
+          }
+          return 0;
+        }
+
+        const persona = resolvePersona(registry, project.id, args[1] ?? '');
+        const worktree = resolveWorktree(registry, args[2] ?? '');
+        if (persona.error || worktree.error) {
+          console.error(persona.error ?? worktree.error);
+          return 1;
+        }
+        if (!persona.id) {
+          console.error(`unknown persona: ${args[1]}`);
+          return 1;
+        }
+        if (!worktree.id) {
+          console.error(`unknown worktree: ${args[2]}`);
+          return 1;
+        }
+        const result = rehomePersona(registry, project.storeDir, persona.id, worktree.id);
+        if (!result.ok) {
+          console.error(result.message);
+          return 1;
+        }
+        console.log(`rehomed ${persona.id} to ${worktree.id}`);
+        return 0;
+      } finally {
+        registry.close();
+      }
+    } catch (err) {
+      console.error(`persona ${subcommand} failed: ${(err as Error).message}`);
       return 1;
     }
   }
