@@ -9,6 +9,7 @@
     "build": "tsc --noEmit -p tsconfig.json --pretty false"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.6.6",
     "eslint": "^10.15.0",
     "tsx": "^4.23.15",

@@ -4,3 +4,4 @@ export * from './paths.ts';
 export * from './config.ts';
 export * from './store.ts';
 export * from './mail.ts';
+export * from './registry.ts';

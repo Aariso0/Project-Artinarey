@@ -4,6 +4,7 @@
   "type": "module",
   "main": "src/index.ts",
   "dependencies": {
+    "better-sqlite3": "13.2.0",
     "ulid": "^3.0.2"
   }
 }
