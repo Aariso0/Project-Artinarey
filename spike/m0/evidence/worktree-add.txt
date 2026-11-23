@@ -1,0 +1,2 @@
+Preparing worktree (new branch 'spike/m0-wt')
+HEAD is now at 1dac32f spike(m0): register throwaway MCP shim

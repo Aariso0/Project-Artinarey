@@ -1,0 +1,9 @@
+✓ artinarey-m0  connected
+✓ context7      connected
+✓ ddg-search    connected
+✓ deckcraft     connected
+✓ github        connected
+✓ gridcraft     connected
+✓ pdfcraft      connected
+✓ playwright    connected
+✓ wordcraft     connected
