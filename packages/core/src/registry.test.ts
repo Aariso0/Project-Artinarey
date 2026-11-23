@@ -216,6 +216,12 @@ test('worktrees: portOffset defaults to 0 and round-trips through upsert', () =>
 
   db.worktrees.upsert({ id, projectId: project.id, path: '/w/a', branch: 'main', portOffset: 30 });
   assert.equal(db.worktrees.list(project.id)[0]?.portOffset, 30);
+
+  // An upsert without an offset keeps the stored one; an explicit 0 still clears it.
+  db.worktrees.upsert({ id, projectId: project.id, path: '/w/a', branch: 'main' });
+  assert.equal(db.worktrees.list(project.id)[0]?.portOffset, 30);
+  db.worktrees.upsert({ id, projectId: project.id, path: '/w/a', branch: 'main', portOffset: 0 });
+  assert.equal(db.worktrees.list(project.id)[0]?.portOffset, 0);
   db.close();
 });
 

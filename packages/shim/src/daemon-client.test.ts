@@ -1,14 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   createPersona, newId, openRegistry, resolveXdgPaths, writeMarker,
 } from '@artinarey/core';
 import { createRpcServer } from '@artinarey/daemon';
 import { createDaemonClient } from './daemon-client.ts';
 import { toMcp } from './tools.ts';
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 
 function setup() {
   const root = join(tmpdir(), `artinarey-shim-${newId()}`);
@@ -31,7 +34,7 @@ function setup() {
   registry.worktrees.upsert({ id: worktreeId, projectId: project.id, path: cwd, branch: null });
   writeMarker(cwd, project.id, worktreeId);
   const persona = createPersona(registry, project.storeDir, project.id, 'dev-shim', 'Shim Dev');
-  return { paths, registry, project, cwd, persona };
+  return { paths, registry, project, cwd, persona, worktreeId };
 }
 
 test('the shim client attaches once and forwards tool calls to the daemon', async () => {
@@ -91,4 +94,95 @@ test('MCP results carry the tool text and isError flag', () => {
   const result = toMcp({ text: 'NO_PROJECT: stop', isError: true });
   assert.equal(result.isError, true);
   assert.deepEqual(result.content, [{ type: 'text', text: 'NO_PROJECT: stop' }]);
+});
+
+/** A stand-in daemon so auto-start tests never touch the real XDG runtime dir. */
+function fakeDaemonRoot(root: string): string {
+  const fakeRoot = join(root, 'fake-root');
+  const entry = join(fakeRoot, 'packages', 'cli', 'src', 'index.ts');
+  mkdirSync(dirname(entry), { recursive: true });
+  symlinkSync(join(repoRoot, 'node_modules'), join(fakeRoot, 'node_modules'), 'dir');
+  writeFileSync(entry, [
+    "import { mkdirSync, unlinkSync, writeFileSync, existsSync } from 'node:fs';",
+    "import { createServer } from 'node:net';",
+    "import { dirname } from 'node:path';",
+    'const socketPath = process.env.FAKE_DAEMON_SOCKET;',
+    'mkdirSync(dirname(socketPath), { recursive: true });',
+    'if (existsSync(socketPath)) unlinkSync(socketPath);',
+    'writeFileSync(process.env.FAKE_DAEMON_PID, String(process.pid));',
+    'createServer((socket) => {',
+    "  socket.setEncoding('utf8');",
+    "  let buffer = '';",
+    "  socket.on('data', (chunk) => {",
+    '    buffer += chunk;',
+    '    let end;',
+    "    while ((end = buffer.indexOf('\\n')) >= 0) {",
+    '      const line = buffer.slice(0, end);',
+    '      buffer = buffer.slice(end + 1);',
+    '      const id = JSON.parse(line).id;',
+    '      socket.write(`${JSON.stringify({ id, ok: true, result: { text: \'ok\', isError: false } })}\\n`);',
+    '    }',
+    '  });',
+    '}).listen(socketPath);',
+  ].join('\n'));
+  return fakeRoot;
+}
+
+test('a stale socket file triggers auto-start and connection retries', async () => {
+  const s = setup();
+  const runtimeDir = dirname(s.paths.socketPath);
+  const pidFile = join(runtimeDir, 'fake-daemon.pid');
+  const fakeRoot = fakeDaemonRoot(runtimeDir);
+  writeFileSync(s.paths.socketPath, 'stale');
+  const previous = {
+    root: process.env.ARTINAREY_ROOT,
+    socket: process.env.FAKE_DAEMON_SOCKET,
+    pid: process.env.FAKE_DAEMON_PID,
+  };
+  process.env.ARTINAREY_ROOT = fakeRoot;
+  process.env.FAKE_DAEMON_SOCKET = s.paths.socketPath;
+  process.env.FAKE_DAEMON_PID = pidFile;
+
+  const client = createDaemonClient({
+    paths: s.paths, cwd: s.cwd, pid: process.pid, timeoutMs: 2000,
+  });
+  try {
+    const reply = await client.invoke('check_in', {});
+    assert.equal(reply.isError, false, reply.text);
+    assert.equal(reply.text, 'ok');
+  } finally {
+    client.close();
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    if (existsSync(pidFile)) {
+      try { process.kill(Number(readFileSync(pidFile, 'utf8').trim())); } catch { /* already gone */ }
+    }
+    s.registry.close();
+  }
+});
+
+test('close during connection setup discards the late socket', async () => {
+  const s = setup();
+  const server = createRpcServer(s.paths.socketPath, undefined, {
+    registry: s.registry, paths: s.paths,
+  });
+  await server.start();
+
+  const client = createDaemonClient({
+    paths: s.paths, cwd: s.cwd, pid: process.pid, autoStart: false,
+  });
+  try {
+    const pending = client.invoke('claim_persona', { persona_id: s.persona });
+    client.close();
+    const reply = await pending;
+    assert.equal(reply.isError, true);
+    assert.match(reply.text, /STORE_OFFLINE/);
+    assert.equal(s.registry.bindings.forWorktree(s.worktreeId), undefined);
+  } finally {
+    client.close();
+    await server.close();
+    s.registry.close();
+  }
 });

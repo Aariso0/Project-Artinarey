@@ -13,5 +13,7 @@ serveStdio(() => {
     cwd: process.cwd(),
     pid: process.pid,
   });
-  return createShimServer((method, params) => client.invoke(method, params));
+  const server = createShimServer((method, params) => client.invoke(method, params));
+  server.server.onclose = () => client.close();
+  return server;
 });

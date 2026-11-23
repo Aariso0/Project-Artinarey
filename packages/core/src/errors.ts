@@ -2,6 +2,8 @@ export type ArtinareyErrorCode =
   | 'INVALID_INPUT'
   | 'STORE_OFFLINE'
   | 'MAIL_REJECTED'
+  /** Mail file committed, audit append failed: the id is already durable. */
+  | 'MAIL_PARTIAL'
   | 'NOT_FOUND'
   | 'ALREADY_RUNNING'
   | 'INDEX_ERROR'
@@ -19,6 +21,8 @@ export class ArtinareyError extends Error {
   constructor(
     public readonly code: ArtinareyErrorCode,
     message: string,
+    /** Set when a mail file was committed but a later write step failed. */
+    public readonly mailId?: string,
   ) {
     super(message);
     this.name = 'ArtinareyError';

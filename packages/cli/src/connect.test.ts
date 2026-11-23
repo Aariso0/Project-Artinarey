@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -326,6 +326,41 @@ test('worktree new prints the C4 warning and changes nothing without --yes', asy
   registry.close();
 });
 
+test('worktree new refuses a nested repo whose git root is not the project repo', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const nested = join(repo, 'nested');
+  mkdirSync(nested);
+  execFileSync('git', ['init', '-q'], { cwd: nested });
+  execFileSync('git', [
+    '-c', 'user.name=Tester', '-c', 'user.email=tester@example.com',
+    'commit', '--allow-empty', '-q', '-m', 'nested',
+  ], { cwd: nested });
+
+  const result = await captureMain(['worktree', 'new', 'preview', '--yes'], env, nested);
+  assert.equal(result.code, 1, `${result.err}${result.out}`);
+  assert.match(result.err, /repo|project/i);
+  assert.equal(existsSync(join(nested, '.worktrees', 'preview')), false);
+  assert.equal(registry.worktrees.list(project.id).length, 1);
+  registry.close();
+});
+
+test('worktree new still works from a linked worktree of the same project', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const linked = join(dir, 'linked');
+  execFileSync('git', ['worktree', 'add', '-q', '-b', 'artinarey/linked', linked], { cwd: repo });
+  assert.equal(await main(['worktree', 'adopt', linked], env, repo), 0);
+
+  const result = await captureMain(['worktree', 'new', 'from-linked', '--yes'], env, linked);
+  assert.equal(result.code, 0, `${result.err}${result.out}`);
+  const target = join(linked, '.worktrees', 'from-linked');
+  const row = registry.worktrees.list(project.id).find((wt) => wt.path === target);
+  assert.ok(row, 'new worktree not registered under the project');
+  assert.equal(findMarker(target)?.marker.worktree_id, row.id);
+  registry.close();
+});
+
 test('worktree new --yes creates the worktree with marker, env files and offset', async () => {
   const dir = root();
   const { repo, env, registry, project } = seededRepo(dir);
@@ -627,6 +662,105 @@ function stubRebindVendor(
   ].join('\n'), { mode: 0o755 });
   return command;
 }
+
+function worktreeLocked(cwd: string): boolean {
+  const porcelain = execFileSync('git', ['worktree', 'list', '--porcelain'], {
+    cwd, encoding: 'utf8',
+  });
+  const block = porcelain.split('\n\n')
+    .find((part) => part.startsWith(`worktree ${realpathSync(cwd)}\n`));
+  return /^locked /m.test(block ?? '');
+}
+
+/** A vendor that records a newer active session, as a later overlapping claim would. */
+function stubLaterSessionVendor(
+  dir: string, projectId: string, worktreeId: string, personaId: string,
+): string {
+  const require = createRequire(import.meta.url);
+  const coreUrl = pathToFileURL(require.resolve('@artinarey/core')).href;
+  const script = join(dir, 'later-session.mjs');
+  writeFileSync(script, [
+    `const core = await import(${JSON.stringify(coreUrl)});`,
+    'const registry = core.openRegistry(core.resolveXdgPaths(process.env).registryFile);',
+    'try {',
+    `  registry.sessions.append({ projectId: ${JSON.stringify(projectId)},`,
+    `    worktreeId: ${JSON.stringify(worktreeId)}, personaId: ${JSON.stringify(personaId)},`,
+    `    vendor: 'opencode', startedAt: new Date(Date.now() + 60000).toISOString() });`,
+    '} finally {',
+    '  registry.close();',
+    '}',
+  ].join('\n'));
+  const command = join(dir, 'later-session.sh');
+  writeFileSync(command, [
+    '#!/bin/sh',
+    `exec '${process.execPath}' --import '${require.resolve('tsx/esm')}' '${script}'`,
+  ].join('\n'), { mode: 0o755 });
+  return command;
+}
+
+test('run rolls back binding, lock and persona state when the claim audit fails', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-failed', 'Failed');
+  const beforeState = readPersona(project.storeDir, persona);
+  const vendor = stubVendor(dir);
+  const auditFile = join(project.storeDir, 'events', 'audit.jsonl');
+  rmSync(auditFile, { force: true });
+  mkdirSync(auditFile);
+
+  const result = await captureMain(
+    ['run', 'opencode', '--persona', persona],
+    { ...env, ARTINAREY_TEST_VENDOR: vendor.command }, repo,
+  );
+  assert.equal(result.code, 1, `${result.err}${result.out}`);
+  assert.equal(existsSync(vendor.out), false);
+  assert.equal(registry.bindings.forWorktree(rootRow.id), undefined);
+  assert.deepEqual(readPersona(project.storeDir, persona), beforeState);
+  assert.equal(worktreeLocked(repo), false);
+  registry.close();
+});
+
+test('run preserves a pre-existing binding when the claim audit fails', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-existing', 'Existing');
+  registry.bindings.bind(persona, rootRow.id);
+  const vendor = stubVendor(dir);
+  const auditFile = join(project.storeDir, 'events', 'audit.jsonl');
+  rmSync(auditFile, { force: true });
+  mkdirSync(auditFile);
+
+  const result = await captureMain(
+    ['run', 'opencode', '--persona', persona],
+    { ...env, ARTINAREY_TEST_VENDOR: vendor.command }, repo,
+  );
+  assert.equal(result.code, 1, `${result.err}${result.out}`);
+  assert.equal(registry.bindings.forWorktree(rootRow.id)?.id, persona);
+  registry.close();
+});
+
+test('run leaves a newer overlapping claim bound when its own session ends', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-overlap', 'Overlap');
+  const vendor = stubLaterSessionVendor(dir, project.id, rootRow.id, persona);
+
+  const result = await captureMain(
+    ['run', 'opencode', '--persona', persona],
+    { ...env, ARTINAREY_TEST_VENDOR: vendor }, repo,
+  );
+  assert.equal(result.code, 0, `${result.err}${result.out}`);
+  assert.equal(registry.bindings.forWorktree(rootRow.id)?.id, persona);
+  assert.equal(readPersona(project.storeDir, persona).state, 'active');
+  assert.equal(registry.sessions.list(project.id).length, 2);
+  registry.close();
+});
 
 test('run opencode binds a persona, records a complete session and releases on exit', async () => {
   const dir = root();

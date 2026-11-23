@@ -222,12 +222,15 @@ export function openRegistry(file: string): Registry {
     },
     worktrees: {
       upsert(input) {
+        // Insert defaults to 0; an update without an explicit offset keeps the stored one.
         db.prepare(`INSERT INTO worktrees (id, project_id, path, branch, created_at, port_offset)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    VALUES (@id, @projectId, @path, @branch, @createdAt, COALESCE(@portOffset, 0))
                     ON CONFLICT(id) DO UPDATE SET path = excluded.path, branch = excluded.branch,
-                      port_offset = excluded.port_offset`)
-          .run(input.id, input.projectId, input.path, input.branch, new Date().toISOString(),
-            input.portOffset ?? 0);
+                      port_offset = COALESCE(@portOffset, worktrees.port_offset)`)
+          .run({
+            id: input.id, projectId: input.projectId, path: input.path, branch: input.branch,
+            createdAt: new Date().toISOString(), portOffset: input.portOffset ?? null,
+          });
       },
       list(projectId) {
         return (db.prepare('SELECT * FROM worktrees WHERE project_id = ? ORDER BY id')

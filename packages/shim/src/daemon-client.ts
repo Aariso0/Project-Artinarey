@@ -1,5 +1,4 @@
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
 import { connect, type Socket } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -32,15 +31,19 @@ function connectSocket(path: string): Promise<Socket> {
   });
 }
 
-function waitForSocket(path: string, timeoutMs: number): Promise<void> {
+/** A socket file is not readiness: a crashed daemon can leave a file with no listener. */
+function waitForDaemon(path: string, timeoutMs: number): Promise<Socket> {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolvePromise, reject) => {
-    const check = () => {
-      if (existsSync(path)) return resolvePromise();
-      if (Date.now() >= deadline) return reject(new Error('daemon did not start in time'));
-      setTimeout(check, 50);
+    const attempt = () => {
+      connectSocket(path).then(resolvePromise, (err: NodeJS.ErrnoException) => {
+        if (Date.now() >= deadline) {
+          return reject(new Error(`daemon did not start in time: ${err.message}`));
+        }
+        setTimeout(attempt, 50);
+      });
     };
-    check();
+    attempt();
   });
 }
 
@@ -70,6 +73,7 @@ export function createDaemonClient(options: DaemonClientOptions): DaemonClient {
   const timeoutMs = options.timeoutMs ?? 5000;
   let socket: Socket | undefined;
   let connecting: Promise<Socket> | undefined;
+  let closed = false;
   let attached = false;
   const pending = new Map<string, {
     resolve: (response: RpcResponse) => void;
@@ -77,6 +81,7 @@ export function createDaemonClient(options: DaemonClientOptions): DaemonClient {
   }>();
 
   async function ensureConnected(): Promise<Socket> {
+    if (closed) throw new Error('daemon client closed');
     if (socket && !socket.destroyed) return socket;
     if (!connecting) {
       connecting = (async () => {
@@ -84,10 +89,10 @@ export function createDaemonClient(options: DaemonClientOptions): DaemonClient {
         try {
           connected = await connectSocket(options.paths.socketPath);
         } catch (err) {
-          if (!autoStart || (err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+          const code = (err as NodeJS.ErrnoException).code;
+          if (!autoStart || (code !== 'ENOENT' && code !== 'ECONNREFUSED')) throw err;
           startDaemon();
-          await waitForSocket(options.paths.socketPath, timeoutMs);
-          connected = await connectSocket(options.paths.socketPath);
+          connected = await waitForDaemon(options.paths.socketPath, timeoutMs);
         }
 
         connected.setEncoding('utf8');
@@ -121,8 +126,14 @@ export function createDaemonClient(options: DaemonClientOptions): DaemonClient {
         return connected;
       })().finally(() => { connecting = undefined; });
     }
-    socket = await connecting;
-    return socket;
+    const connectionAttempt = connecting;
+    const active = await connectionAttempt;
+    if (closed) {
+      active.destroy();
+      throw new Error('daemon client closed');
+    }
+    socket = active;
+    return active;
   }
 
   function request(active: Socket, method: string, params: Record<string, unknown>): Promise<RpcResponse> {
@@ -150,6 +161,10 @@ export function createDaemonClient(options: DaemonClientOptions): DaemonClient {
     async invoke(method, params) {
       try {
         const active = await ensureConnected();
+        if (closed || socket !== active) {
+          active.destroy();
+          return { text: 'STORE_OFFLINE: daemon client closed', isError: true };
+        }
         if (!attached) {
           const handshake = await request(active, 'attach', {
             cwd: options.cwd ?? process.cwd(),
@@ -168,6 +183,7 @@ export function createDaemonClient(options: DaemonClientOptions): DaemonClient {
       }
     },
     close() {
+      closed = true;
       attached = false;
       socket?.destroy();
       socket = undefined;

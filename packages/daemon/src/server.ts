@@ -1,7 +1,9 @@
 import { chmodSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
 import { dirname } from 'node:path';
-import { dispatchTool, isToolMethod, releaseConnection, type RpcContext } from './tools.ts';
+import {
+  dispatchTool, invalidateWorktree, isToolMethod, releaseConnection, type RpcContext,
+} from './tools.ts';
 
 export type RpcRequest = { id: string; method: string; params?: unknown };
 export type RpcResponse =
@@ -62,7 +64,9 @@ export function createRpcServer(
 ): RpcServer {
   let server: Server | undefined;
   let closePromise: Promise<void> | undefined;
+  let closing = false;
   const sockets = new Set<Socket>();
+  const contexts = new Set<RpcContext>();
   const closed = new Set<Promise<void>>();
 
   const rpcServer: RpcServer = {
@@ -71,15 +75,42 @@ export function createRpcServer(
       mkdirSync(dirname(socketPath), { recursive: true });
       if (existsSync(socketPath)) unlinkSync(socketPath);
       server = createServer((socket) => {
+        if (closing) {
+          socket.destroy();
+          return;
+        }
         sockets.add(socket);
         let markClosed!: () => void;
         const closedPromise = new Promise<void>((resolve) => { markClosed = resolve; });
         closed.add(closedPromise);
         const ctx: RpcContext | undefined = shared ? { ...shared } : undefined;
+        if (ctx) {
+          // A forced release affects every connection bound to that worktree.
+          ctx.invalidateWorktree = (worktreeId) => {
+            for (const active of contexts) invalidateWorktree(active, worktreeId);
+          };
+          contexts.add(ctx);
+        }
+        socket.on('error', (err) => {
+          console.error(`client socket error: ${(err as Error).message ?? String(err)}`);
+          socket.destroy();
+        });
         socket.on('close', () => {
           sockets.delete(socket);
-          if (ctx) releaseConnection(ctx);
-          markClosed();
+          if (ctx) {
+            contexts.delete(ctx);
+            try {
+              releaseConnection(ctx);
+            } catch (err) {
+              console.error(`connection cleanup failed: ${(err as Error).message ?? String(err)}`);
+            } finally {
+              closed.delete(closedPromise);
+              markClosed();
+            }
+          } else {
+            closed.delete(closedPromise);
+            markClosed();
+          }
         });
         socket.setEncoding('utf8');
         let buffer = '';
@@ -93,12 +124,13 @@ export function createRpcServer(
               buffer = buffer.slice(end + 1);
               if (!line.trim()) continue;
 
+              let request: RpcRequest | undefined;
               let response: RpcResponse;
               let shutdown = false;
               try {
-                const request = JSON.parse(line) as RpcRequest;
-                shutdown = request?.method === 'shutdown';
+                request = JSON.parse(line) as RpcRequest;
                 response = await dispatchRequest(request, ctx);
+                shutdown = response.ok && request?.method === 'shutdown';
               } catch (err) {
                 response = {
                   id: 'invalid',
@@ -117,7 +149,9 @@ export function createRpcServer(
                 });
               }
             }
-          })();
+          })().catch((err) => {
+            console.error(`request failed: ${(err as Error).message ?? String(err)}`);
+          });
         });
       });
 
@@ -126,13 +160,20 @@ export function createRpcServer(
         server!.once('error', onError);
         server!.listen(socketPath, () => {
           server!.off('error', onError);
-          chmodSync(socketPath, 0o600);
+          try {
+            chmodSync(socketPath, 0o600);
+          } catch (err) {
+            server!.close();
+            reject(err);
+            return;
+          }
           resolve();
         });
       });
     },
     async close() {
       if (!closePromise) {
+        closing = true;
         closePromise = (async () => {
           for (const socket of sockets) socket.destroy();
           sockets.clear();

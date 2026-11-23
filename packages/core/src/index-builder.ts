@@ -7,6 +7,7 @@ export type IndexedMail = {
   thread: string;
   from: string;
   to: string[];
+  cc: string[];
   subject: string;
   kind: string;
   createdAt: string;
@@ -74,42 +75,54 @@ export function buildIndex(indexFile: string, storeDir: string): IndexReport {
       thread TEXT NOT NULL,
       from_id TEXT NOT NULL,
       to_json TEXT NOT NULL,
+      cc_json TEXT NOT NULL DEFAULT '[]',
       subject TEXT NOT NULL,
       kind TEXT NOT NULL,
       created_at TEXT NOT NULL,
       file TEXT NOT NULL
     )`);
-    db.prepare('DELETE FROM mail').run();
-
-    const insert = db.prepare(`INSERT INTO mail (id, thread, from_id, to_json, subject, kind, created_at, file)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET subject = excluded.subject, file = excluded.file`);
-
-    let indexed = 0;
-    let skipped = 0;
-    for (const file of mailFiles(storeDir)) {
-      const frontmatter = parseFrontmatter(readFileSync(file, 'utf8'));
-      const to = frontmatter?.to;
-      if (!frontmatter || !isScalar(frontmatter.id) || !isScalar(frontmatter.thread) ||
-          !isScalar(frontmatter.from) || !isScalar(frontmatter.subject) ||
-          !isScalar(frontmatter.kind) || !isScalar(frontmatter.created_at) ||
-          !Array.isArray(to)) {
-        skipped++;
-        continue;
-      }
-      insert.run(frontmatter.id, frontmatter.thread, frontmatter.from,
-        JSON.stringify(to), frontmatter.subject, frontmatter.kind,
-        frontmatter.created_at, file);
-      indexed++;
+    const columns = db.pragma('table_info(mail)') as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === 'cc_json')) {
+      db.exec("ALTER TABLE mail ADD COLUMN cc_json TEXT NOT NULL DEFAULT '[]'");
     }
-    return { indexed, skipped };
+
+    // The delete and every insert stand or fall together: a failed read must not
+    // leave the index empty or half rebuilt.
+    const rebuild = db.transaction((): IndexReport => {
+      db.prepare('DELETE FROM mail').run();
+      const insert = db.prepare(`INSERT INTO mail (id, thread, from_id, to_json, cc_json, subject, kind, created_at, file)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET subject = excluded.subject, file = excluded.file,
+          cc_json = excluded.cc_json`);
+
+      let indexed = 0;
+      let skipped = 0;
+      for (const file of mailFiles(storeDir)) {
+        const frontmatter = parseFrontmatter(readFileSync(file, 'utf8'));
+        const to = frontmatter?.to;
+        if (!frontmatter || !isScalar(frontmatter.id) || !isScalar(frontmatter.thread) ||
+            !isScalar(frontmatter.from) || !isScalar(frontmatter.subject) ||
+            !isScalar(frontmatter.kind) || !isScalar(frontmatter.created_at) ||
+            !Array.isArray(to)) {
+          skipped++;
+          continue;
+        }
+        const cc = Array.isArray(frontmatter.cc) ? frontmatter.cc : [];
+        insert.run(frontmatter.id, frontmatter.thread, frontmatter.from,
+          JSON.stringify(to), JSON.stringify(cc), frontmatter.subject, frontmatter.kind,
+          frontmatter.created_at, file);
+        indexed++;
+      }
+      return { indexed, skipped };
+    });
+    return rebuild();
   } finally {
     db.close();
   }
 }
 
 type MailRow = {
-  id: string; thread: string; from_id: string; to_json: string;
+  id: string; thread: string; from_id: string; to_json: string; cc_json: string;
   subject: string; kind: string; created_at: string; file: string;
 };
 
@@ -123,10 +136,12 @@ export function queryMail(indexFile: string, opts: QueryOptions = {}): IndexedMa
     const rows = db.prepare('SELECT * FROM mail ORDER BY id').all() as MailRow[];
     let result: IndexedMail[] = rows.map((r) => ({
       id: r.id, thread: r.thread, from: r.from_id,
-      to: JSON.parse(r.to_json) as string[], subject: r.subject,
-      kind: r.kind, createdAt: r.created_at, file: r.file,
+      to: JSON.parse(r.to_json) as string[], cc: JSON.parse(r.cc_json) as string[],
+      subject: r.subject, kind: r.kind, createdAt: r.created_at, file: r.file,
     }));
-    if (opts.recipient) result = result.filter((m) => m.to.includes(opts.recipient!));
+    if (opts.recipient) {
+      result = result.filter((m) => m.to.includes(opts.recipient!) || m.cc.includes(opts.recipient!));
+    }
     if (opts.thread) result = result.filter((m) => m.thread === opts.thread);
     if (opts.limit !== undefined) result = result.slice(0, opts.limit);
     return result;

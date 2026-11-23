@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ArtinareyError } from './errors.ts';
-import { isUlid } from './ids.ts';
+import { isUlid, newId } from './ids.ts';
 import {
   sendMail,
   serializeMail,
@@ -71,6 +71,12 @@ test('validateMail applies the settled role rules', () => {
   // other personas may not mail a peer without a shared task or a senior-dev cc
   assert.match(rejectionReason({ ...base, to: ['dev-b'] }, ctx), /dev-b/);
   assert.equal(validateMail({ ...base, to: ['dev-b'], cc: ['senior-dev'] }, ctx).ok, true);
+  // the restriction covers cc recipients too; the senior-dev cc exception still applies
+  assert.match(rejectionReason({ ...base, to: ['senior-dev'], cc: ['dev-b'] }, ctx), /dev-b/);
+  assert.equal(
+    validateMail({ ...base, to: ['senior-dev'], cc: ['dev-b', 'senior-dev'] }, ctx).ok,
+    true,
+  );
   // the senior dev may mail anyone
   assert.equal(
     validateMail({ ...base, to: ['dev-b'] }, { ...ctx, role: 'senior-dev' }).ok,
@@ -114,6 +120,49 @@ test('sendMail throws a typed MAIL_REJECTED error for invalid input', async () =
     () => sendMail(tempStore(), { ...base, subject: '' }, ctx),
     (err: unknown) => err instanceof ArtinareyError && err.code === 'MAIL_REJECTED',
   );
+});
+
+test('sendMail refuses an id that is already committed without replacing the mail file', async () => {
+  const dir = tempStore();
+  const id = newId();
+  const input = { ...base, id, subject: 'first' };
+
+  const first = await sendMail(dir, input, ctx);
+  assert.equal(first.id, id);
+  await assert.rejects(
+    () => sendMail(dir, { ...input, subject: 'duplicate' }, ctx),
+    (err: unknown) => err instanceof ArtinareyError && err.code === 'MAIL_REJECTED',
+  );
+
+  const file = join(dir, 'mail', '2026', '11', `${id}.md`);
+  assert.match(readFileSync(file, 'utf8'), /subject: first/);
+  assert.equal(readdirSync(join(dir, 'mail'), { recursive: true }).filter(
+    (p) => String(p).endsWith('.md'),
+  ).length, 1);
+});
+
+test('sendMail reports a committed id when only the audit append fails', async () => {
+  const dir = tempStore();
+  mkdirSync(join(dir, 'events', 'audit.jsonl'), { recursive: true });
+  const id = newId();
+
+  await assert.rejects(
+    () => sendMail(dir, { ...base, id }, ctx),
+    (err: unknown) => {
+      assert.ok(err instanceof ArtinareyError, 'expected a typed error');
+      assert.equal(err.code, 'MAIL_PARTIAL');
+      assert.equal(err.mailId, id);
+      assert.match(err.message, /do not resend/i);
+      assert.match(err.message, new RegExp(id));
+      return true;
+    },
+  );
+
+  // The mail is durable: callers must not resend the same message.
+  const files = readdirSync(join(dir, 'mail'), { recursive: true })
+    .filter((p) => String(p).endsWith('.md'));
+  assert.equal(files.length, 1);
+  assert.match(readFileSync(join(dir, 'mail', '2026', '11', `${id}.md`), 'utf8'), /id: /);
 });
 
 test('50 concurrent sendMail calls give unique ids, 50 immutable files, and 50 audit lines', async () => {

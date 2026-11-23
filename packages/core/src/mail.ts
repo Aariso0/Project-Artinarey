@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { ArtinareyError } from './errors.ts';
 import { newId } from './ids.ts';
@@ -90,7 +91,7 @@ export function validateMail(input: MailInput, ctx: MailContext): ValidationResu
   // may mail anyone; others need a shared task or a senior-dev cc.
   if (ctx.role !== SENIOR_DEV) {
     const shared = (ctx.sharedTasks?.length ?? 0) > 0 || (input.cc ?? []).includes(SENIOR_DEV);
-    for (const recipient of input.to) {
+    for (const recipient of recipients) {
       if (recipient === SENIOR_DEV || recipient === USER || shared) continue;
       return reject(`role ${ctx.role} may not mail ${recipient} without a shared task or senior-dev cc`);
     }
@@ -162,15 +163,27 @@ export async function sendMail(
       `${record.id}.md`,
     );
 
+    if (existsSync(file)) {
+      throw new ArtinareyError('MAIL_REJECTED', `mail id already exists: ${record.id}`);
+    }
     atomicWrite(file, serializeMail(record), 0o444);
-    appendJournal(join(storeDir, 'events', 'audit.jsonl'), {
-      type: 'mail_sent',
-      id: record.id,
-      thread: record.thread,
-      from: record.from,
-      to: record.to,
-      created_at: record.created_at,
-    });
+    try {
+      appendJournal(join(storeDir, 'events', 'audit.jsonl'), {
+        type: 'mail_sent',
+        id: record.id,
+        thread: record.thread,
+        from: record.from,
+        to: record.to,
+        created_at: record.created_at,
+      });
+    } catch {
+      // The mail file is already committed: a retry would duplicate the message.
+      throw new ArtinareyError(
+        'MAIL_PARTIAL',
+        `mail ${record.id} is committed but the audit append failed; do not resend`,
+        record.id,
+      );
+    }
     return record;
   });
 }

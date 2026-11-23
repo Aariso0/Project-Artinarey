@@ -1,18 +1,48 @@
 import {
   closeSync,
   existsSync,
+  fstatSync,
   fsyncSync,
   openSync,
   readFileSync,
+  statSync,
   unlinkSync,
   writeSync,
 } from 'node:fs';
-import { ArtinareyError } from '@artinarey/core';
+import { ArtinareyError, withProjectLock } from '@artinarey/core';
 
 export type InstanceLock = {
   pid: number;
   release(): void;
 };
+
+type FileId = { dev: number; ino: number };
+
+function fileId(stats: FileId): FileId {
+  return { dev: stats.dev, ino: stats.ino };
+}
+
+function statIfExists(file: string): FileId | undefined {
+  try {
+    return fileId(statSync(file));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw err;
+  }
+}
+
+function sameFile(a: FileId | undefined, b: FileId | undefined): boolean {
+  return Boolean(a && b && a.dev === b.dev && a.ino === b.ino);
+}
+
+function removeIfSame(file: string, id: FileId | undefined): void {
+  try {
+    if (!sameFile(statIfExists(file), id)) return;
+    unlinkSync(file);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+}
 
 function isAlive(pid: number): boolean {
   try {
@@ -25,54 +55,80 @@ function isAlive(pid: number): boolean {
 }
 
 export function readLock(file: string): number | undefined {
-  if (!existsSync(file)) return undefined;
+  let content: string;
   try {
-    const pid = Number(readFileSync(file, 'utf8').trim());
-    return Number.isInteger(pid) && pid > 0 ? pid : undefined;
-  } catch {
-    return undefined;
+    content = readFileSync(file, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw err;
+  }
+  const pid = Number(content.trim());
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+/** Wait briefly for a racing creator to publish its pid; an unreadable file still throws. */
+async function publishedPid(file: string): Promise<number | undefined> {
+  const deadline = Date.now() + 50;
+  for (;;) {
+    const pid = readLock(file);
+    if (pid !== undefined || Date.now() >= deadline) return pid;
+    await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
 
 /** Single-instance pidfile. A dead pid's lock is replaced automatically. */
-export function acquireLock(file: string): InstanceLock {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = openSync(file, 'wx', 0o600);
+export async function acquireLock(file: string): Promise<InstanceLock> {
+  return withProjectLock(file, async () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        writeSync(fd, String(process.pid));
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-
-      let released = false;
-      return {
-        pid: process.pid,
-        release() {
-          if (released) return;
-          released = true;
-          if (readLock(file) === process.pid) {
-            try {
-              unlinkSync(file);
-            } catch {
-              // already gone
-            }
-          }
-        },
-      };
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-      const pid = readLock(file);
-      if (pid !== undefined && isAlive(pid)) {
-        throw new ArtinareyError('ALREADY_RUNNING', `daemon already running with pid ${pid}`);
-      }
-      try {
-        unlinkSync(file);
-      } catch {
-        // already gone
+        const fd = openSync(file, 'wx', 0o600);
+        let owned: FileId | undefined;
+        let committed = false;
+        try {
+          const created = fileId(fstatSync(fd));
+          owned = created;
+          writeSync(fd, String(process.pid));
+          fsyncSync(fd);
+          committed = true;
+          let released = false;
+          return {
+            pid: process.pid,
+            release() {
+              if (released) return;
+              released = true;
+              try {
+                if (readLock(file) !== process.pid) return;
+                removeIfSame(file, created);
+              } catch {
+                // best-effort release; the next starter can reclaim a stale pid
+              }
+            },
+          };
+        } finally {
+          closeSync(fd);
+          // A failed write/fsync must not leave an incomplete lock file behind.
+          if (!committed && owned) removeIfSame(file, owned);
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+        const seen = statIfExists(file);
+        const pid = await publishedPid(file);
+        if (pid === undefined) {
+          if (!existsSync(file)) continue;
+          throw new ArtinareyError('ALREADY_RUNNING', 'daemon lock is being created; retry');
+        }
+        if (isAlive(pid)) {
+          throw new ArtinareyError('ALREADY_RUNNING', `daemon already running with pid ${pid}`);
+        }
+        // Only reclaim the same file we inspected; a replacement belongs to another starter.
+        if (!sameFile(seen, statIfExists(file)) || readLock(file) !== pid) continue;
+        try {
+          unlinkSync(file);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+        }
       }
     }
-  }
-  throw new ArtinareyError('ALREADY_RUNNING', 'could not acquire the daemon lock');
+    throw new ArtinareyError('ALREADY_RUNNING', 'could not acquire the daemon lock');
+  });
 }

@@ -7,8 +7,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   adoptWorktree, atomicWrite, buildIndex, claimPersona, createWorktree, ensureExcludeBlock,
   findMarker, globalIgnoreCoverage, listGitWorktrees, newId, openRegistry, planWorktree,
-  projectStore, reconcileWorktrees, rehomePersona, releasePersona, removeWorktree, resolveIdentity,
-  resolveRepo, resolveXdgPaths, roster, writeMarker,
+  projectStore, readPersona, reconcileWorktrees, rehomePersona, releasePersona, removeWorktree,
+  resolveIdentity, resolveRepo, resolveXdgPaths, roster, unlockGitWorktree, writeMarker, writePersona,
 } from '@artinarey/core';
 import { callDaemon, daemonStatus, startDaemon, stopDaemon } from '@artinarey/daemon';
 
@@ -62,6 +62,21 @@ function resolveWorktree(registry: RegistryHandle, token: string): Resolution {
       || worktree.branch === `artinarey/${token}`);
   if (matches.length > 1) return { error: `ambiguous worktree: ${token}` };
   return { id: matches[0]?.id };
+}
+
+/** Undo the binding, persona state and lock if claimPersona throws after acquiring them. */
+function rollbackFailedClaim(
+  registry: RegistryHandle,
+  identity: Parameters<typeof claimPersona>[2],
+  personaId: string | undefined,
+  previousBinding: string | undefined,
+  previousState: ReturnType<typeof readPersona>,
+): void {
+  if (!personaId || registry.bindings.forWorktree(identity.worktreeId)?.id !== personaId) return;
+  writePersona(identity.storeDir, personaId, previousState);
+  if (previousBinding === personaId) return;
+  registry.bindings.release(personaId);
+  unlockGitWorktree(identity.markerDir);
 }
 
 /** Git is the authority on whether a registered worktree is still attached here. */
@@ -175,7 +190,7 @@ export async function main(
       return 2;
     }
     try {
-      const { root } = resolveRepo(cwd);
+      const { root, commonDir } = resolveRepo(cwd);
       const marker = findMarker(cwd);
       if (!marker) {
         console.error('no .artinarey.json found; run artinarey init');
@@ -186,6 +201,10 @@ export async function main(
         const project = registry.projects.get(marker.marker.project_id);
         if (!project) {
           console.error(`unknown project: ${marker.marker.project_id}`);
+          return 1;
+        }
+        if (project.repoCommonDir !== commonDir) {
+          console.error('marker project belongs to a different git repository');
           return 1;
         }
         const plan = planWorktree(registry, project.id, root, name, base);
@@ -434,15 +453,26 @@ export async function main(
       }
 
       const options = { personaId: personaToken, confirmMove, rehome };
-      let claim = claimPersona(registry, identity.storeDir, identity, options);
+      const attemptedId = resolvePersona(registry, identity.projectId, personaToken).id ?? personaToken;
+      const previousBinding = registry.bindings.forWorktree(identity.worktreeId)?.id;
+      const previousState = readPersona(identity.storeDir, attemptedId);
+      const db = registry;
+      const tryClaim = (claimOptions: Parameters<typeof claimPersona>[3]) => {
+        try {
+          return claimPersona(db, identity.storeDir, identity, claimOptions);
+        } catch (err) {
+          rollbackFailedClaim(db, identity, attemptedId, previousBinding, previousState);
+          throw err;
+        }
+      };
+      let claim = tryClaim(options);
       if (!claim.ok && claim.code === 'NEEDS_CONFIRMATION') {
         console.log(`warning: ${claim.message}`);
         const accepted = !confirmMove && !rehome
           ? await confirmInTerminal('Bind this persona here anyway? [y/N] ')
           : false;
         if (!accepted) return 1;
-        claim = claimPersona(registry, identity.storeDir, identity,
-          { ...options, confirmMove: true });
+        claim = tryClaim({ ...options, confirmMove: true });
       }
       if (!claim.ok) {
         console.error(`${claim.code}: ${claim.message}`);
@@ -470,11 +500,18 @@ export async function main(
       return 1;
     } finally {
       if (registry) {
-        if (sessionId) registry.sessions.end(sessionId, new Date().toISOString());
-        if (claimed && claimedWorktreeId
-          && registry.bindings.forWorktree(claimedWorktreeId)?.id === claimed.personaId) {
-          releasePersona(registry, claimed.identity.storeDir, claimed.personaId);
+        if (claimed && claimedWorktreeId && sessionId) {
+          const record = claimed;
+          const active = registry.sessions.list(record.identity.projectId)
+            .filter((session) => session.worktreeId === claimedWorktreeId
+              && session.personaId === record.personaId && !session.endedAt)
+            .sort((a, b) => a.startedAt.localeCompare(b.startedAt) || a.id.localeCompare(b.id));
+          const ownsClaim = active.at(-1)?.id === sessionId;
+          if (ownsClaim && registry.bindings.forWorktree(claimedWorktreeId)?.id === record.personaId) {
+            releasePersona(registry, record.identity.storeDir, record.personaId);
+          }
         }
+        if (sessionId) registry.sessions.end(sessionId, new Date().toISOString());
         registry.close();
       }
     }

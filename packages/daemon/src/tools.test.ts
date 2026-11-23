@@ -1,7 +1,9 @@
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import {
+  mkdirSync, readFileSync, readdirSync, rmSync,
+} from 'node:fs';
 import { connect, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,14 +17,36 @@ type Client = {
   close(): void;
 };
 
+async function waitUntil(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('condition not met before deadline');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+async function flush(): Promise<void> {
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+}
+
 async function openClient(path: string): Promise<Client> {
   const socket: Socket = connect(path);
   await new Promise<void>((resolve, reject) => {
-    socket.once('connect', resolve);
-    socket.once('error', reject);
+    const onError = (err: Error) => reject(err);
+    socket.once('connect', () => {
+      socket.off('error', onError);
+      resolve();
+    });
+    socket.once('error', onError);
   });
 
-  const pending: Array<(response: RpcResponse) => void> = [];
+  const pending: Array<{
+    resolve: (response: RpcResponse) => void;
+    reject: (err: Error) => void;
+  }> = [];
+  const failPending = (err: Error): void => {
+    while (pending.length) pending.shift()!.reject(err);
+  };
   let buffer = '';
   socket.setEncoding('utf8');
   socket.on('data', (chunk: string) => {
@@ -32,15 +56,22 @@ async function openClient(path: string): Promise<Client> {
       const line = buffer.slice(0, end);
       buffer = buffer.slice(end + 1);
       const next = pending.shift();
-      if (next && line.trim()) next(JSON.parse(line) as RpcResponse);
+      if (!next) continue;
+      try {
+        next.resolve(JSON.parse(line) as RpcResponse);
+      } catch (err) {
+        next.reject(err instanceof Error ? err : new Error('invalid RPC reply'));
+      }
     }
   });
+  socket.on('error', failPending);
+  socket.on('close', () => failPending(new Error('socket closed before a reply')));
 
   let seq = 0;
   return {
     call(method, params) {
-      return new Promise<RpcResponse>((resolve) => {
-        pending.push(resolve);
+      return new Promise<RpcResponse>((resolve, reject) => {
+        pending.push({ resolve, reject });
         socket.write(`${JSON.stringify({ id: String(++seq), method, params })}\n`);
       });
     },
@@ -100,10 +131,32 @@ async function claim(client: Client, personaId: string): Promise<void> {
   assert.equal(response.ok, true, JSON.stringify(response));
 }
 
-test('tool calls before attach are refused with NO_PROJECT', async () => {
+function mailIdOf(response: RpcResponse): string {
+  assert.equal(response.ok, true, JSON.stringify(response));
+  if (!response.ok) return '';
+  return (response.result as { text: string }).text.match(/Sent (\S+) to/)?.[1] ?? '';
+}
+
+/** Register cleanup before any assertion so a failed test cannot leak listeners or fixtures. */
+function track(t: TestContext, s: ReturnType<typeof setup>) {
+  const state: { server?: RpcServer; clients: Client[] } = { clients: [] };
+  t.after(async () => {
+    for (const client of state.clients) client.close();
+    await state.server?.close();
+    s.registry.close();
+    rmSync(s.root, { recursive: true, force: true });
+  });
+  return state;
+}
+
+test('tool calls before attach are refused with NO_PROJECT', async (t) => {
   const s = setup();
-  const { server, socketPath } = await serve(s);
-  const client = await openClient(socketPath);
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
 
   const response = await client.call('check_in');
   assert.equal(response.ok, false);
@@ -111,18 +164,18 @@ test('tool calls before attach are refused with NO_PROJECT', async () => {
     assert.equal(response.error.code, 'NO_PROJECT');
     assert.match(response.error.message, /init|attach/);
   }
-
-  client.close();
-  await server.close();
-  s.registry.close();
 });
 
-test('attach, claim and send_mail work over RPC; disconnect releases the binding', async () => {
+test('attach, claim and send_mail work over RPC; disconnect releases the binding', async (t) => {
   const s = setup();
   const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
   createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
-  const { server, socketPath } = await serve(s);
-  const client = await openClient(socketPath);
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
 
   await attach(client, s.worktrees[0]!);
   await claim(client, dev);
@@ -139,34 +192,87 @@ test('attach, claim and send_mail work over RPC; disconnect releases the binding
 
   assert.ok(s.registry.bindings.forWorktree(s.ids[0]!), 'binding exists while connected');
   client.close();
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  assert.equal(s.registry.bindings.forWorktree(s.ids[0]!), undefined, 'disconnect releases the binding');
-
-  await server.close();
-  s.registry.close();
+  await waitUntil(() => s.registry.bindings.forWorktree(s.ids[0]!) === undefined);
 });
 
-test('inbox, read_mail, report, check_in, worktrees and mark_done dispatch through RPC', async () => {
+test('inbox shows full ids; cc recipients see and read copied mail', async (t) => {
   const s = setup();
   const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
   const lead = createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
-  const { server, socketPath } = await serve(s);
+  const observer = createPersona(s.registry, s.project.storeDir, s.project.id, 'observer', 'Observer');
+  const cleanup = track(t, s);
 
-  const sender = await openClient(socketPath);
-  try {
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const sender = await openClient(started.socketPath);
+  cleanup.clients.push(sender);
+  await attach(sender, s.worktrees[0]!);
+  await claim(sender, dev);
+  const sent = await sender.call('send_mail', {
+    to: ['senior-dev'], cc: ['senior-dev', 'observer'], subject: 'needs review', kind: 'task',
+    action: 'review the shim', body: 'The shim is ready for review.',
+  });
+  const mailId = mailIdOf(sent);
+  assert.ok(mailId, 'send_mail must report the mail id');
+
+  const ownRead = await sender.call('read_mail', { id: mailId });
+  assert.equal(ownRead.ok, true, `sender must be able to read own mail: ${JSON.stringify(ownRead)}`);
+
+  const receiver = await openClient(started.socketPath);
+  cleanup.clients.push(receiver);
+  await attach(receiver, s.worktrees[1]!);
+  await claim(receiver, lead);
+
+  const inbox = await receiver.call('inbox');
+  assert.equal(inbox.ok, true, JSON.stringify(inbox));
+  if (inbox.ok) {
+    const text = (inbox.result as { text: string }).text;
+    assert.match(text, /needs review/);
+    assert.ok(text.includes(mailId), `inbox must show the full id ${mailId}`);
+    assert.match(text, /unread: 1/);
+  }
+
+  const read = await receiver.call('read_mail', { id: mailId });
+  assert.equal(read.ok, true, JSON.stringify(read));
+  if (read.ok) assert.match((read.result as { text: string }).text, /shim is ready/);
+
+  const ccPath = join(s.root, 'wt3');
+  mkdirSync(ccPath, { recursive: true });
+  const ccWorktree = newId();
+  s.registry.worktrees.upsert({ id: ccWorktree, projectId: s.project.id, path: ccPath, branch: null });
+  writeMarker(ccPath, s.project.id, ccWorktree);
+  const ccClient = await openClient(started.socketPath);
+  cleanup.clients.push(ccClient);
+  await attach(ccClient, ccPath);
+  await claim(ccClient, observer);
+  const ccInbox = await ccClient.call('inbox');
+  assert.equal(ccInbox.ok, true, JSON.stringify(ccInbox));
+  if (ccInbox.ok) assert.match((ccInbox.result as { text: string }).text, /needs review/);
+  const ccRead = await ccClient.call('read_mail', { id: mailId });
+  assert.equal(ccRead.ok, true, JSON.stringify(ccRead));
+});
+
+test('inbox, read_mail, report, check_in, worktrees and mark_done dispatch through RPC', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  const lead = createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const sender = await openClient(started.socketPath);
+  cleanup.clients.push(sender);
   await attach(sender, s.worktrees[0]!);
   await claim(sender, dev);
   const sent = await sender.call('send_mail', {
     to: ['senior-dev'], subject: 'needs review', kind: 'task',
     action: 'review the shim', body: 'The shim is ready for review.',
   });
-  assert.equal(sent.ok, true, JSON.stringify(sent));
-  const mailId = sent.ok
-    ? (sent.result as { text: string }).text.match(/Sent (\S+) to/)?.[1] ?? ''
-    : '';
+  const mailId = mailIdOf(sent);
   assert.ok(mailId, 'send_mail must report the mail id');
 
-  const receiver = await openClient(socketPath);
+  const receiver = await openClient(started.socketPath);
+  cleanup.clients.push(receiver);
   await attach(receiver, s.worktrees[1]!);
   await claim(receiver, lead);
 
@@ -207,36 +313,170 @@ test('inbox, read_mail, report, check_in, worktrees and mark_done dispatch throu
     .map((f) => readFileSync(join(s.project.storeDir, 'mail', String(f)), 'utf8'))
     .filter((text) => /^kind: receipt$/m.test(text));
   assert.equal(receipts.length, 1);
+});
 
-  } finally {
-    sender.close();
-    await server.close();
-    s.registry.close();
+test('mark_done is retry-safe', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  const lead = createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const sender = await openClient(started.socketPath);
+  cleanup.clients.push(sender);
+  await attach(sender, s.worktrees[0]!);
+  await claim(sender, dev);
+  const mailId = mailIdOf(await sender.call('send_mail', {
+    to: ['senior-dev'], subject: 'retry me', kind: 'task', action: 'review',
+    body: 'Please review.',
+  }));
+  assert.ok(mailId);
+
+  const receiver = await openClient(started.socketPath);
+  cleanup.clients.push(receiver);
+  await attach(receiver, s.worktrees[1]!);
+  await claim(receiver, lead);
+  for (let i = 0; i < 2; i++) {
+    const done = await receiver.call('mark_done', { id: mailId, note: 'Done twice.' });
+    assert.equal(done.ok, true, JSON.stringify(done));
+  }
+  const receipts = readdirSync(join(s.project.storeDir, 'mail'), { recursive: true })
+    .filter((f) => String(f).endsWith('.md'))
+    .map((f) => readFileSync(join(s.project.storeDir, 'mail', String(f)), 'utf8'))
+    .filter((text) => /^kind: receipt$/m.test(text));
+  assert.equal(receipts.length, 1, 'a retry must not duplicate the receipt');
+  const doneEvents = readFileSync(join(s.project.storeDir, 'events', 'audit.jsonl'), 'utf8')
+    .split('\n').filter((line) => line.includes('"type":"task_done"'));
+  assert.equal(doneEvents.length, 1, 'a retry must not duplicate task_done');
+});
+
+test('send_mail reports the committed id when indexing fails', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, dev);
+
+  const index = join(s.paths.cacheRoot, s.project.id, 'index.sqlite');
+  mkdirSync(index, { recursive: true });
+  t.after(() => rmSync(index, { recursive: true, force: true }));
+  const sent = await client.call('send_mail', {
+    to: ['senior-dev'], subject: 'committed anyway', kind: 'note', action: 'read',
+    body: 'The mail file must survive a broken index.',
+  });
+  assert.equal(sent.ok, true, JSON.stringify(sent));
+  if (sent.ok) {
+    const text = (sent.result as { text: string }).text;
+    assert.match(text, /^Sent \S+ to senior-dev\./);
+    assert.match(text, /Index update failed:/);
   }
 });
 
-test('release_force frees a binding held by another live connection', async () => {
+test('release_force frees a binding held by another live connection', async (t) => {
   const s = setup();
   const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
-  const { server, socketPath } = await serve(s);
+  const cleanup = track(t, s);
 
-  const holder = await openClient(socketPath);
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const holder = await openClient(started.socketPath);
+  cleanup.clients.push(holder);
   await attach(holder, s.worktrees[0]!);
   await claim(holder, dev);
   assert.ok(s.registry.bindings.forWorktree(s.ids[0]!));
 
-  const admin = await openClient(socketPath);
+  const admin = await openClient(started.socketPath);
+  cleanup.clients.push(admin);
   const forced = await admin.call('release_force', { worktreeId: s.ids[0]! });
   assert.equal(forced.ok, true, JSON.stringify(forced));
   assert.equal(s.registry.bindings.forWorktree(s.ids[0]!), undefined);
-
-  holder.close();
-  admin.close();
-  await server.close();
-  s.registry.close();
 });
 
-test('attach pauses on a registered worktree whose git branch changed', async () => {
+test('force release invalidates the old holder and preserves a reclaimed binding', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const holder = await openClient(started.socketPath);
+  cleanup.clients.push(holder);
+  await attach(holder, s.worktrees[0]!);
+  await claim(holder, dev);
+
+  const admin = await openClient(started.socketPath);
+  cleanup.clients.push(admin);
+  const forced = await admin.call('release_force', { worktreeId: s.ids[0]! });
+  assert.equal(forced.ok, true, JSON.stringify(forced));
+
+  const stale = await holder.call('inbox');
+  assert.equal(stale.ok, false, 'the released identity must not stay usable');
+  if (!stale.ok) {
+    assert.equal(stale.error.code, 'INVALID_INPUT');
+    assert.match(stale.error.message, /attach/);
+  }
+
+  await attach(admin, s.worktrees[0]!);
+  await claim(admin, dev);
+  assert.equal(s.registry.bindings.forWorktree(s.ids[0]!)?.id, dev);
+
+  holder.close();
+  cleanup.clients.splice(cleanup.clients.indexOf(holder), 1);
+  await flush();
+  assert.equal(s.registry.bindings.forWorktree(s.ids[0]!)?.id, dev,
+    'the old connection must not release the new binding');
+});
+
+test('a repeat claim of a CLI-created binding does not transfer cleanup ownership', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  s.registry.bindings.bind(dev, s.ids[0]!);
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, dev);
+  client.close();
+  cleanup.clients.splice(cleanup.clients.indexOf(client), 1);
+  await flush();
+  assert.equal(s.registry.bindings.forWorktree(s.ids[0]!)?.id, dev,
+    'the real binding owner keeps its binding');
+});
+
+test('disconnect releases every binding acquired by the connection', async (t) => {
+  const s = setup();
+  const first = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  const second = createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, first);
+  await attach(client, s.worktrees[1]!);
+  await claim(client, second);
+  assert.ok(s.registry.bindings.forWorktree(s.ids[0]!));
+  assert.ok(s.registry.bindings.forWorktree(s.ids[1]!));
+
+  client.close();
+  cleanup.clients.splice(cleanup.clients.indexOf(client), 1);
+  await waitUntil(() => !s.registry.bindings.forWorktree(s.ids[0]!)
+    && !s.registry.bindings.forWorktree(s.ids[1]!));
+});
+
+test('attach pauses on a registered worktree whose git branch changed', async (t) => {
   const s = setup();
   const repo = join(s.root, 'repo');
   const worktree = join(s.root, 'branch-changed');
@@ -251,32 +491,34 @@ test('attach pauses on a registered worktree whose git branch changed', async ()
     branch: 'registered-branch' });
   writeMarker(worktree, s.project.id, id);
   const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  const cleanup = track(t, s);
 
-  const { server, socketPath } = await serve(s);
-  const client = await openClient(socketPath);
-  try {
-    const response = await client.call('attach', { cwd: worktree, pid: process.pid });
-    assert.equal(response.ok, false, JSON.stringify(response));
-    if (!response.ok) {
-      assert.equal(response.error.code, 'WORKTREE_UNMANAGED');
-      assert.match(response.error.message, /branch changed; confirm the move/);
-      assert.match(response.error.message, /feature\/new/, 'message names the changed branch');
-    }
-    const claim = await client.call('claim_persona', { persona_id: dev });
-    assert.equal(claim.ok, false, 'a paused attach must not leave a claimable binding');
-    assert.equal(s.registry.bindings.forWorktree(id), undefined);
-  } finally {
-    client.close();
-    await server.close();
-    s.registry.close();
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+
+  const response = await client.call('attach', { cwd: worktree, pid: process.pid });
+  assert.equal(response.ok, false, JSON.stringify(response));
+  if (!response.ok) {
+    assert.equal(response.error.code, 'WORKTREE_UNMANAGED');
+    assert.match(response.error.message, /branch changed; confirm the move/);
+    assert.match(response.error.message, /feature\/new/, 'message names the changed branch');
   }
+  const claim = await client.call('claim_persona', { persona_id: dev });
+  assert.equal(claim.ok, false, 'a paused attach must not leave a claimable binding');
+  assert.equal(s.registry.bindings.forWorktree(id), undefined);
 });
 
-test('RPC replies always end with unread and next', async () => {
+test('RPC replies always end with unread and next', async (t) => {
   const s = setup();
   const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
-  const { server, socketPath } = await serve(s);
-  const client = await openClient(socketPath);
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
   await attach(client, s.worktrees[0]!);
 
   for (const method of ['check_in', 'claim_persona', 'inbox', 'worktrees']) {
@@ -287,8 +529,4 @@ test('RPC replies always end with unread and next', async () => {
       assert.match(text, /\nunread: \d+\nnext: \S.*$/);
     }
   }
-
-  client.close();
-  await server.close();
-  s.registry.close();
 });

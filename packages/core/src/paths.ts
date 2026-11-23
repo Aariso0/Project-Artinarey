@@ -1,5 +1,5 @@
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 
 export type XdgPaths = {
   configDir: string;
@@ -10,13 +10,18 @@ export type XdgPaths = {
   cacheRoot: string;
 };
 
+/** XDG overrides must be absolute; relative values are ignored. */
+function absoluteOverride(value: string | undefined): string | undefined {
+  return value && isAbsolute(value) ? value : undefined;
+}
+
 export function resolveXdgPaths(env: NodeJS.ProcessEnv = process.env): XdgPaths {
   const home = env.HOME ?? '';
-  const configHome = env.XDG_CONFIG_HOME || join(home, '.config');
-  const dataHome = env.XDG_DATA_HOME || join(home, '.local', 'share');
-  const cacheHome = env.XDG_CACHE_HOME || join(home, '.cache');
-  const runtimeHome =
-    env.XDG_RUNTIME_DIR || join(tmpdir(), `artinarey-runtime-${process.getuid?.() ?? 'user'}`);
+  const configHome = absoluteOverride(env.XDG_CONFIG_HOME) ?? join(home, '.config');
+  const dataHome = absoluteOverride(env.XDG_DATA_HOME) ?? join(home, '.local', 'share');
+  const cacheHome = absoluteOverride(env.XDG_CACHE_HOME) ?? join(home, '.cache');
+  const runtimeHome = absoluteOverride(env.XDG_RUNTIME_DIR)
+    ?? join(tmpdir(), `artinarey-runtime-${process.getuid?.() ?? 'user'}`);
   const configDir = join(configHome, 'artinarey');
 
   return {

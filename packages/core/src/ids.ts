@@ -12,7 +12,7 @@ export function newId(): string {
   return monotonicUlid();
 }
 
-/** Crockford base32, 26 chars: excludes I, L, O, U. */
+/** ULID: 48-bit timestamp (first char 0-7) + 80-bit randomness, Crockford base32 without I, L, O, U. */
 export function isUlid(value: string): boolean {
-  return /^[0-9A-HJKMNP-TV-Z]{26}$/.test(value);
+  return /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(value);
 }

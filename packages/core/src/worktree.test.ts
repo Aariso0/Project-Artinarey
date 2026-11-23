@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
+  statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -171,6 +172,21 @@ test('parses a bare block', () => {
   }]);
 });
 
+test('parses NUL-delimited porcelain records with newlines in paths', () => {
+  const text = [
+    `worktree /repo/wt\0HEAD ${'a'.repeat(40)}\0branch refs/heads/main\0\0`,
+    `worktree /repo/wt\nnext\0HEAD ${'b'.repeat(40)}\0detached\0\0`,
+  ].join('');
+
+  const result = parseWorktreePorcelain(text);
+  assert.equal(result.length, 2);
+  assert.equal(result[0]?.path, '/repo/wt');
+  assert.equal(result[0]?.branch, 'main');
+  assert.equal(result[1]?.path, '/repo/wt\nnext');
+  assert.equal(result[1]?.branch, null);
+  assert.equal(result[1]?.detached, true);
+});
+
 test('empty porcelain output yields no worktrees', () => {
   assert.deepEqual(parseWorktreePorcelain(''), []);
 });
@@ -179,6 +195,21 @@ test('lists this repository as a worktree', () => {
   const worktrees = listGitWorktrees(root);
   assert.ok(worktrees.length >= 1);
   assert.equal(worktrees.some((wt) => wt.path === root), true);
+});
+
+test('listGitWorktrees keeps a worktree path containing a newline intact', () => {
+  const repo = tempRepo();
+  commit(repo, 'init');
+  const path = join(repo, 'wt\nline');
+  try {
+    execFileSync('git', ['worktree', 'add', '-q', '-b', 'feature/newline', path], {
+      cwd: repo, stdio: 'ignore',
+    });
+    const listed = listGitWorktrees(repo);
+    assert.equal(listed.some((wt) => wt.path === path), true, JSON.stringify(listed));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 test('core index re-exports the worktree module', () => {
@@ -283,6 +314,27 @@ test('globalIgnoreCoverage checks the global file only, not the local exclude bl
   }
 });
 
+test('globalIgnoreCoverage uses check-ignore exit status, not verbose output', () => {
+  const repo = tempRepo();
+  const global = mkdtempSync(join(tmpdir(), 'artinarey-global-'));
+  try {
+    const ignoreFile = join(global, 'ignore');
+    const config = join(global, 'gitconfig');
+    writeFileSync(config, `[core]\n\texcludesfile = ${ignoreFile}\n`);
+    // A negated rule prints a matching line in verbose mode but does not ignore.
+    writeFileSync(ignoreFile, '.worktrees/*\n!.worktrees/probe\n');
+
+    withGlobalConfig(config, () => {
+      assert.deepEqual(core.globalIgnoreCoverage(repo), {
+        globalFile: ignoreFile, coversWorktrees: false,
+      });
+    });
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(global, { recursive: true, force: true });
+  }
+});
+
 test('reconcileWorktrees matches by path then branch, then reports missing and unmanaged', () => {
   const base = mkdtempSync(join(tmpdir(), 'artinarey-reconcile-'));
   const registry = core.openRegistry(join(base, 'registry.sqlite'));
@@ -345,6 +397,9 @@ test('planWorktree rejects bad input before creating any artifact', () => {
       'existing branch');
     expectInvalidInput(() => core.planWorktree(registry, project.id, repo, 'fresh', 'no/such/base'),
       'missing base ref');
+    const tree = git(['write-tree'], repo);
+    expectInvalidInput(() => core.planWorktree(registry, project.id, repo, 'tree-base', tree),
+      'tree object used as base');
 
     assert.equal(existsSync(join(repo, '.worktrees', 'fresh')), false);
     assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', 'refs/heads/artinarey/fresh'], repo),
@@ -431,6 +486,76 @@ test('createWorktree rolls back a failed write without registering the worktree'
     assert.equal(listGitWorktrees(repo).some((wt) => wt.path === plan.path), false);
     assert.equal(registry.worktrees.list(project.id).length, 1);
     assert.equal(existsSync(join(plan.path, '.artinarey.json')), false);
+    assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', `refs/heads/${plan.branch}`], repo),
+      false, 'the branch created by the failed attempt must not block a retry');
+
+    // Retrying the same name works once the blocker is gone from git too.
+    git(['rm', '-r', '-f', '.env.artinarey'], repo);
+    commit(repo, 'remove blocker');
+    const retry = core.planWorktree(registry, project.id, repo, 'blocked');
+    assert.equal(core.createWorktree(registry, storeDir, retry).branch, plan.branch);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('createWorktree rollback on add failure leaves a target populated by someone else', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    git(['branch', 'base-tmp'], repo);
+    const plan = core.planWorktree(registry, project.id, repo, 'raced', 'base-tmp');
+    mkdirSync(plan.path, { recursive: true });
+    writeFileSync(join(plan.path, 'mine.txt'), 'user data\n');
+    git(['branch', '-D', 'base-tmp'], repo);
+
+    assert.throws(() => core.createWorktree(registry, storeDir, plan));
+
+    assert.equal(readFileSync(join(plan.path, 'mine.txt'), 'utf8'), 'user data\n');
+    assert.equal(existsSync(join(plan.path, '.artinarey.json')), false);
+    assert.equal(registry.worktrees.list(project.id).length, 1);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('createWorktree refuses a symlinked env destination without writing through it', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    const outside = join(dir, 'outside.env');
+    writeFileSync(outside, 'OUTSIDE\n');
+    symlinkSync(outside, join(repo, '.env'));
+    git(['add', '.env'], repo);
+    commit(repo, 'add symlink');
+
+    const plan = core.planWorktree(registry, project.id, repo, 'symlinked');
+    assert.throws(() => core.createWorktree(registry, storeDir, plan));
+
+    assert.equal(readFileSync(outside, 'utf8'), 'OUTSIDE\n');
+    assert.equal(existsSync(plan.path), false);
+    assert.equal(registry.worktrees.list(project.id).length, 1);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('createWorktree does not overwrite a pre-existing env file or its permissions', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    const tracked = join(repo, '.env');
+    writeFileSync(tracked, 'TRACKED\n');
+    chmodSync(tracked, 0o644);
+    git(['add', '.env'], repo);
+    commit(repo, 'add env');
+
+    const plan = core.planWorktree(registry, project.id, repo, 'existing-env');
+    assert.throws(() => core.createWorktree(registry, storeDir, plan));
+
+    assert.equal(readFileSync(tracked, 'utf8'), 'TRACKED\n');
+    assert.equal(statSync(tracked).mode & 0o777, 0o644);
+    assert.equal(existsSync(plan.path), false);
   } finally {
     registry.close();
     rmSync(dir, { recursive: true, force: true });

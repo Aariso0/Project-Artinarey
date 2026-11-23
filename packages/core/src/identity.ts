@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve, sep } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import type { ArtinareyErrorCode } from './errors.ts';
 import { readPersona, writePersona } from './persona-store.ts';
 import { appendJournal } from './store.ts';
@@ -138,7 +138,7 @@ export function resolveIdentity(registry: Registry, cwd: string): IdentityResult
   if (pathMatches) {
     try {
       const gitWorktree = listGitWorktrees(found.dir).find((wt) =>
-        sameDirectory(wt.path, found.dir) || found.dir.startsWith(`${wt.path}${sep}`));
+        sameDirectory(wt.path, found.dir));
       if (gitWorktree && gitWorktree.branch !== registeredBranch) {
         branchMismatch = { registered: registeredBranch, git: gitWorktree.branch };
       }
@@ -151,17 +151,21 @@ export function resolveIdentity(registry: Registry, cwd: string): IdentityResult
     const message = branchMismatch
       ? `branch changed; confirm the move (registered: ${branchMismatch.registered ?? 'detached'}, git: ${branchMismatch.git ?? 'detached'})`
       : 'marker does not match a registered worktree; run artinarey worktree adopt';
-    audit(storeDir ?? join(cwd, '.artinarey-unmanaged'), {
-      type: 'worktree_unmanaged',
-      worktree_id: found.marker.worktree_id,
-      marker_dir: found.dir,
-      registered_path: registeredPath ?? null,
-      ...(branchMismatch ? {
-        registered_branch: branchMismatch.registered,
-        git_branch: branchMismatch.git,
-        message,
-      } : {}),
-    });
+    try {
+      audit(storeDir ?? join(cwd, '.artinarey-unmanaged'), {
+        type: 'worktree_unmanaged',
+        worktree_id: found.marker.worktree_id,
+        marker_dir: found.dir,
+        registered_path: registeredPath ?? null,
+        ...(branchMismatch ? {
+          registered_branch: branchMismatch.registered,
+          git_branch: branchMismatch.git,
+          message,
+        } : {}),
+      });
+    } catch {
+      // Diagnostics are best-effort: a read-only checkout must still get the typed result.
+    }
     return { ok: false, code: 'WORKTREE_UNMANAGED', message };
   }
 
@@ -265,26 +269,17 @@ export function claimPersona(
   identity: Identity,
   options: ClaimOptions,
 ): ClaimResult {
-  let personaId = options.personaId;
-  let created = false;
-  if (!personaId && options.newRole) {
-    personaId = createPersona(
-      registry, storeDir, identity.projectId, options.newRole, options.name ?? options.newRole,
-    );
-    created = true;
-  }
-  if (!personaId) {
+  const requestedId = options.personaId;
+  const newRole = options.newRole;
+  if (!requestedId && !newRole) {
     return { ok: false, code: 'INVALID_INPUT', message: 'provide persona_id or new_role' };
   }
 
-  const persona = registry.personas.get(personaId);
-  if (!persona || persona.projectId !== identity.projectId) {
-    return { ok: false, code: 'NOT_FOUND', message: `unknown persona: ${personaId}` };
-  }
-
+  // Check the directory before creating a persona: an occupied worktree must not
+  // leave an orphan persona/registry row behind.
   const busy = registry.bindings.forWorktree(identity.worktreeId);
-  if (busy && busy.id !== personaId) {
-    audit(storeDir, { type: 'claim_refused', code: 'DIRECTORY_BUSY', persona_id: personaId,
+  if (busy && busy.id !== requestedId) {
+    audit(storeDir, { type: 'claim_refused', code: 'DIRECTORY_BUSY', persona_id: requestedId ?? null,
       worktree_id: identity.worktreeId, other_persona_id: busy.id });
     return {
       ok: false,
@@ -293,6 +288,21 @@ export function claimPersona(
     };
   }
 
+  let personaId = requestedId;
+  let created = false;
+  if (!personaId) {
+    personaId = createPersona(
+      registry, storeDir, identity.projectId, newRole!, options.name ?? newRole!,
+    );
+    created = true;
+  }
+
+  const persona = registry.personas.get(personaId);
+  if (!persona || persona.projectId !== identity.projectId) {
+    return { ok: false, code: 'NOT_FOUND', message: `unknown persona: ${personaId}` };
+  }
+
+  const previousPath = boundWorktreePath(registry, personaId);
   const personaState = readPersona(storeDir, personaId);
   const home = personaState.home_worktree_id;
   const isSeniorDev = persona.role === 'senior-dev';
@@ -314,6 +324,11 @@ export function claimPersona(
     worktree_id: identity.worktreeId, home_worktree_id: nextHome,
     confirmed_move: Boolean(options.confirmMove), rehome: Boolean(options.rehome) });
 
+  // A confirmed move transfers the lock: release the worktree this persona left.
+  if (previousPath && !sameDirectory(previousPath, identity.markerDir)) {
+    unlockGitWorktree(previousPath);
+  }
+
   return {
     ok: true,
     personaId,
@@ -322,14 +337,13 @@ export function claimPersona(
   };
 }
 
-/** Binding, persona file and audit line; the caller owns the git unlock. */
+/** Binding and persona file only; the caller owns the git unlock and the audits. */
 function releasePersonaCore(registry: Registry, storeDir: string, personaId: string): void {
   registry.bindings.release(personaId);
   const state = readPersona(storeDir, personaId);
   if (state.state !== 'new' || state.role) {
     writePersona(storeDir, personaId, { ...state, state: 'idle' });
   }
-  audit(storeDir, { type: 'persona_released', persona_id: personaId });
 }
 
 export function releasePersona(
@@ -338,8 +352,12 @@ export function releasePersona(
   personaId: string,
 ): void {
   const boundPath = boundWorktreePath(registry, personaId);
-  releasePersonaCore(registry, storeDir, personaId);
-  if (boundPath) unlockGitWorktree(boundPath);
+  try {
+    releasePersonaCore(registry, storeDir, personaId);
+  } finally {
+    if (boundPath) unlockGitWorktree(boundPath);
+  }
+  audit(storeDir, { type: 'persona_released', persona_id: personaId });
 }
 
 /** User-initiated override via `artinarey release --force`. Returns false if nothing was bound. */
@@ -353,10 +371,13 @@ export function releaseWorktreeForce(
   const boundPath = registry.projects.list()
     .flatMap((project) => registry.worktrees.list(project.id))
     .find((worktree) => worktree.id === worktreeId)?.path;
-  releasePersonaCore(registry, storeDir, bound.id);
+  try {
+    releasePersonaCore(registry, storeDir, bound.id);
+  } finally {
+    if (boundPath) unlockGitWorktree(boundPath);
+  }
   audit(storeDir, {
     type: 'forced_release', persona_id: bound.id, worktree_id: worktreeId,
   });
-  if (boundPath) unlockGitWorktree(boundPath);
   return true;
 }

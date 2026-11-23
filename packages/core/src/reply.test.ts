@@ -30,11 +30,18 @@ test('PROJECT_PAUSED carries retry_after', () => {
   assert.match(reply.text, /do not retry/i);
 });
 
+test('MAIL_PARTIAL tells the agent not to resend an already committed mail', () => {
+  const reply = fail('MAIL_PARTIAL', 'mail 01J was committed but the audit append failed');
+  assert.equal(reply.isError, true);
+  assert.match(reply.text, /do not resend/i);
+  assert.match(reply.text, /next: /);
+});
+
 test('every §18 error code has a distinct instruction', () => {
   const codes = [
     'NO_PROJECT', 'WORKTREE_UNMANAGED', 'DIRECTORY_BUSY', 'NEEDS_CONFIRMATION',
     'FORBIDDEN_ROLE', 'LEASE_OVERLAP', 'CAP_REACHED', 'PROJECT_PAUSED',
-    'STORE_OFFLINE', 'MAIL_REJECTED', 'NOT_FOUND',
+    'STORE_OFFLINE', 'MAIL_REJECTED', 'MAIL_PARTIAL', 'NOT_FOUND',
   ] as const;
   const instructions = codes.map((code) => {
     const reply = fail(code, 'example');

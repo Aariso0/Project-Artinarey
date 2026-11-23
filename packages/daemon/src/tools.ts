@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   appendJournal,
@@ -16,6 +16,7 @@ import {
   sendMail,
   type ArtinareyErrorCode,
   type Identity,
+  type IndexedMail,
   type Registry,
   type ToolReply,
   type XdgPaths,
@@ -31,15 +32,24 @@ export function isToolMethod(method: string): boolean {
   return TOOL_METHODS.has(method);
 }
 
+type ClaimedBinding = {
+  personaId: string;
+  storeDir: string;
+  worktreeId: string;
+  /** Audit line of the claim that gave this connection ownership. */
+  claimLine?: number;
+};
+
 export type RpcContext = {
   registry: Registry;
   paths: XdgPaths;
   cwd?: string;
   pid?: number;
   identity?: Identity;
-  /** Only bindings acquired by this connection are released when it disconnects. */
-  claimedPersonaId?: string;
-  claimedStoreDir?: string;
+  /** Every binding this connection acquired and still owns. */
+  claimedBindings?: ClaimedBinding[];
+  /** Installed by the daemon so a force release reaches other connections. */
+  invalidateWorktree?: (worktreeId: string) => void;
 };
 
 function toolOk(id: string, reply: ToolReply): RpcResponse {
@@ -76,29 +86,71 @@ function knownRoles(ctx: RpcContext, projectId: string): string[] {
   return [...ctx.registry.personas.list(projectId).map((p) => p.role), 'user'];
 }
 
-function readIds(storeDir: string, personaRole: string): Set<string> {
+function auditEvents(storeDir: string): Array<{ event: Record<string, unknown>; line: number }> {
   const file = auditFile(storeDir);
-  if (!existsSync(file)) return new Set();
-  const ids = new Set<string>();
-  for (const line of readFileSync(file, 'utf8').split('\n')) {
-    if (!line.trim()) continue;
+  if (!existsSync(file)) return [];
+  const events: Array<{ event: Record<string, unknown>; line: number }> = [];
+  readFileSync(file, 'utf8').split('\n').forEach((line, index) => {
+    if (!line.trim()) return;
     try {
-      const event = JSON.parse(line) as Record<string, unknown>;
-      if (event.type === 'mail_read' && event.persona === personaRole && typeof event.id === 'string') {
-        ids.add(event.id);
-      }
+      events.push({ event: JSON.parse(line) as Record<string, unknown>, line: index });
     } catch {
       // ignore a torn line; the writer recovers it at startup
+    }
+  });
+  return events;
+}
+
+function readIds(storeDir: string, personaRole: string): Set<string> {
+  const ids = new Set<string>();
+  for (const { event } of auditEvents(storeDir)) {
+    if (event.type === 'mail_read' && event.persona === personaRole && typeof event.id === 'string') {
+      ids.add(event.id);
     }
   }
   return ids;
 }
 
+function claimLine(storeDir: string, personaId: string): number | undefined {
+  let line: number | undefined;
+  for (const entry of auditEvents(storeDir)) {
+    if (entry.event.type === 'persona_claimed' && entry.event.persona_id === personaId) {
+      line = entry.line;
+    }
+  }
+  return line;
+}
+
+function hasTaskDone(storeDir: string, personaRole: string, mailId: string): boolean {
+  return auditEvents(storeDir).some(({ event }) => event.type === 'task_done'
+    && event.persona === personaRole && event.id === mailId);
+}
+
+function addressedTo(mail: IndexedMail, role: string): boolean {
+  return mail.to.includes(role) || (mail.cc?.includes(role) ?? false);
+}
+
+function countUnread(mails: IndexedMail[], seen: Set<string>, role: string): number {
+  return mails.filter((mail) => addressedTo(mail, role)
+    && mail.from !== role && !seen.has(mail.id)).length;
+}
+
 function unread(ctx: RpcContext, identity: Identity): number {
   if (!identity.role) return 0;
-  const addressed = queryMail(indexFile(ctx, identity.projectId), { recipient: identity.role });
-  const seen = readIds(identity.storeDir, identity.role);
-  return addressed.filter((mail) => mail.from !== identity.role && !seen.has(mail.id)).length;
+  const mails = queryMail(indexFile(ctx, identity.projectId));
+  return countUnread(mails, readIds(identity.storeDir, identity.role), identity.role);
+}
+
+function receiptExists(storeDir: string, mailId: string, role: string): boolean {
+  const root = join(storeDir, 'mail');
+  if (!existsSync(root)) return false;
+  return readdirSync(root, { recursive: true }).some((entry) => {
+    if (!String(entry).endsWith('.md')) return false;
+    const text = readFileSync(join(root, String(entry)), 'utf8');
+    return /^kind: receipt$/m.test(text)
+      && text.includes(`in_reply_to: ${mailId}`)
+      && text.includes(`from: ${role}`);
+  });
 }
 
 function rosterText(entries: ReturnType<typeof roster>): string {
@@ -110,14 +162,27 @@ function rosterText(entries: ReturnType<typeof roster>): string {
   }).join('\n')}`;
 }
 
+/** Forget a worktree's identity and cleanup ownership, on this context or all of them. */
+export function invalidateWorktree(ctx: RpcContext, worktreeId: string): void {
+  if (ctx.claimedBindings) {
+    ctx.claimedBindings = ctx.claimedBindings.filter((binding) => binding.worktreeId !== worktreeId);
+  }
+  if (ctx.identity?.worktreeId === worktreeId) delete ctx.identity;
+}
+
 function requireIdentity(
   id: string,
   ctx: RpcContext,
 ): { identity: Identity } | { response: RpcResponse } {
   if (!ctx.identity?.personaId || !ctx.identity.role) {
     return {
-      response: toolFail(id, 'INVALID_INPUT', 'call check_in and claim_persona before this tool'),
+      response: toolFail(id, 'INVALID_INPUT', 'call attach and claim_persona before this tool'),
     };
+  }
+  const bound = ctx.registry.bindings.forWorktree(ctx.identity.worktreeId);
+  if (bound?.id !== ctx.identity.personaId) {
+    invalidateWorktree(ctx, ctx.identity.worktreeId);
+    return { response: toolFail(id, 'NO_PROJECT', 'binding was released; call attach again') };
   }
   return { identity: ctx.identity };
 }
@@ -171,9 +236,9 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
     const storeDir = storeDirForWorktree(ctx, worktreeId);
     if (!storeDir) return toolFail(id, 'NOT_FOUND', `unknown worktree: ${worktreeId}`);
     const released = releaseWorktreeForce(ctx.registry, storeDir, worktreeId);
-    if (released && ctx.claimedPersonaId && ctx.identity?.worktreeId === worktreeId) {
-      delete ctx.claimedPersonaId;
-      delete ctx.claimedStoreDir;
+    if (released) {
+      ctx.invalidateWorktree?.(worktreeId);
+      invalidateWorktree(ctx, worktreeId);
     }
     return { id, ok: true, result: { released } };
   }
@@ -194,6 +259,7 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
 
   if (request.method === 'claim_persona') {
     if (!ctx.identity) return toolFail(id, 'NO_PROJECT', 'call attach before claim_persona');
+    const alreadyBound = ctx.registry.bindings.forWorktree(ctx.identity.worktreeId)?.id;
     const result = claimPersona(ctx.registry, ctx.identity.storeDir, ctx.identity, {
       personaId: str(params.persona_id),
       newRole: str(params.new_role),
@@ -203,8 +269,20 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
     });
     if (!result.ok) return toolFail(id, result.code, result.message);
     ctx.identity = result.identity;
-    ctx.claimedPersonaId = result.personaId;
-    ctx.claimedStoreDir = result.identity.storeDir;
+    // A repeat claim only refreshes an existing binding; it does not transfer ownership.
+    if (!alreadyBound) {
+      const bindings = ctx.claimedBindings ?? [];
+      if (!bindings.some((b) => b.worktreeId === result.identity.worktreeId
+          && b.personaId === result.personaId)) {
+        bindings.push({
+          personaId: result.personaId,
+          storeDir: result.identity.storeDir,
+          worktreeId: result.identity.worktreeId,
+          claimLine: claimLine(result.identity.storeDir, result.personaId),
+        });
+      }
+      ctx.claimedBindings = bindings;
+    }
     const who = readPersona(result.identity.storeDir, result.personaId);
     return toolOk(
       id,
@@ -217,16 +295,19 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
     if ('response' in auth) return auth.response;
     const { identity } = auth;
     const limit = int(params.limit) ?? 5;
-    const all = queryMail(indexFile(ctx, identity.projectId), { recipient: identity.role });
+    const mails = queryMail(indexFile(ctx, identity.projectId));
     const seen = readIds(identity.storeDir, identity.role!);
+    const addressed = mails.filter((mail) => addressedTo(mail, identity.role!));
     const includeRead = params.include_read === true;
-    const list = (includeRead ? all : all.filter((m) => m.from !== identity.role && !seen.has(m.id)))
+    const list = (includeRead ? addressed
+      : addressed.filter((m) => m.from !== identity.role && !seen.has(m.id)))
       .slice(-limit)
       .reverse();
     const body = list.length === 0
       ? 'Inbox is empty.'
-      : list.map((m) => `- ${m.id.slice(0, 8)} from ${m.from}: ${m.subject}`).join('\n');
-    return toolOk(id, ok(body, unread(ctx, identity), list.length ? 'read_mail' : 'check_in'));
+      : list.map((m) => `- ${m.id} from ${m.from}: ${m.subject}`).join('\n');
+    return toolOk(id, ok(body, countUnread(addressed, seen, identity.role!),
+      list.length ? 'read_mail' : 'check_in'));
   }
 
   if (request.method === 'read_mail') {
@@ -236,7 +317,7 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
     const mailId = str(params.id);
     if (!mailId) return toolFail(id, 'INVALID_INPUT', 'read_mail needs an id');
     const match = queryMail(indexFile(ctx, identity.projectId))
-      .find((m) => m.id === mailId && (m.to.includes(identity.role!) || m.from === identity.role));
+      .find((m) => m.id === mailId && (addressedTo(m, identity.role!) || m.from === identity.role));
     if (!match) return toolFail(id, 'NOT_FOUND', `no mail with id ${mailId} for your persona`);
     const text = readFileSync(match.file, 'utf8');
     appendJournal(auditFile(identity.storeDir), {
@@ -258,8 +339,9 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
     if (!subject || !kind || !action || !body) {
       return toolFail(id, 'INVALID_INPUT', 'send_mail needs to, subject, kind, action and body');
     }
+    let record;
     try {
-      const record = await sendMail(identity.storeDir, {
+      record = await sendMail(identity.storeDir, {
         from: identity.role!, to, cc, subject,
         kind: kind as Parameters<typeof sendMail>[1]['kind'],
         action, eta: str(params.eta), body,
@@ -269,15 +351,23 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
         role: identity.role!,
         sharedTasks: [],
       });
-      buildIndex(indexFile(ctx, identity.projectId), identity.storeDir);
-      return toolOk(
-        id,
-        ok(`Sent ${record.id} to ${to.join(', ')}.`, unread(ctx, identity), 'inbox'),
-      );
     } catch (err) {
       const e = err as { code?: ArtinareyErrorCode; message?: string };
       return toolFail(id, e.code ?? 'MAIL_REJECTED', e.message ?? 'mail rejected');
     }
+    try {
+      buildIndex(indexFile(ctx, identity.projectId), identity.storeDir);
+    } catch (err) {
+      // The mail is already committed: report its id and ask for a reindex, never a resend.
+      let count = 0;
+      try { count = unread(ctx, identity); } catch { /* the index is unavailable */ }
+      return toolOk(id, ok(`Sent ${record.id} to ${to.join(', ')}.\nIndex update failed: ${(err as Error).message}`,
+        count, 'run artinarey reindex'));
+    }
+    return toolOk(
+      id,
+      ok(`Sent ${record.id} to ${to.join(', ')}.`, unread(ctx, identity), 'inbox'),
+    );
   }
 
   if (request.method === 'mark_done') {
@@ -288,30 +378,35 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
     const note = str(params.note);
     if (!mailId || !note) return toolFail(id, 'INVALID_INPUT', 'mark_done needs id and note');
     const mail = queryMail(indexFile(ctx, identity.projectId))
-      .find((m) => m.id === mailId && m.to.includes(identity.role!));
+      .find((m) => m.id === mailId && addressedTo(m, identity.role!));
     if (!mail) return toolFail(id, 'NOT_FOUND', `no mail with id ${mailId} assigned to you`);
-    appendJournal(auditFile(identity.storeDir), {
-      type: 'task_done', id: mailId, persona: identity.role, note,
-      created_at: new Date().toISOString(),
-    });
-    try {
-      await sendMail(identity.storeDir, {
-        from: identity.role!,
-        to: [mail.from],
-        cc: mail.from === 'senior-dev' || mail.from === 'user' ? [] : ['senior-dev'],
-        subject: `Re: ${mail.subject}`,
-        kind: 'receipt',
-        action: 'done',
-        in_reply_to: mailId,
-        body: note,
-      }, {
-        knownPersonas: knownRoles(ctx, identity.projectId),
-        role: identity.role!,
-        sharedTasks: [],
+    if (!receiptExists(identity.storeDir, mailId, identity.role!)) {
+      try {
+        await sendMail(identity.storeDir, {
+          from: identity.role!,
+          to: [mail.from],
+          cc: mail.from === 'senior-dev' || mail.from === 'user' ? [] : ['senior-dev'],
+          subject: `Re: ${mail.subject}`,
+          kind: 'receipt',
+          action: 'done',
+          in_reply_to: mailId,
+          body: note,
+        }, {
+          knownPersonas: knownRoles(ctx, identity.projectId),
+          role: identity.role!,
+          sharedTasks: [],
+        });
+        buildIndex(indexFile(ctx, identity.projectId), identity.storeDir);
+      } catch (err) {
+        return toolFail(id, 'MAIL_REJECTED', (err as Error).message);
+      }
+    }
+    // The receipt is committed first; retries must not duplicate the completion event.
+    if (!hasTaskDone(identity.storeDir, identity.role!, mailId)) {
+      appendJournal(auditFile(identity.storeDir), {
+        type: 'task_done', id: mailId, persona: identity.role, note,
+        created_at: new Date().toISOString(),
       });
-      buildIndex(indexFile(ctx, identity.projectId), identity.storeDir);
-    } catch (err) {
-      return toolFail(id, 'MAIL_REJECTED', (err as Error).message);
     }
     return toolOk(id, ok(`Marked ${mailId} done and mailed a receipt.`, unread(ctx, identity), 'inbox'));
   }
@@ -344,12 +439,20 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
   return toolFail(id, 'NOT_FOUND', `unknown method: ${request.method}`);
 }
 
-/** A disconnected shim releases only the persona that this connection bound. */
+/** A disconnected shim releases every persona this connection bound. */
 export function releaseConnection(ctx: RpcContext): void {
-  if (!ctx.claimedPersonaId || !ctx.claimedStoreDir) return;
-  const personaId = ctx.claimedPersonaId;
-  const storeDir = ctx.claimedStoreDir;
-  delete ctx.claimedPersonaId;
-  delete ctx.claimedStoreDir;
-  releasePersona(ctx.registry, storeDir, personaId);
+  const bindings = ctx.claimedBindings ?? [];
+  delete ctx.claimedBindings;
+  for (const binding of bindings) {
+    const bound = ctx.registry.bindings.forWorktree(binding.worktreeId);
+    if (bound?.id !== binding.personaId) continue;
+    // A later claim of the same persona is a new binding instance, not ours to release.
+    if (binding.claimLine !== undefined
+        && claimLine(binding.storeDir, binding.personaId) !== binding.claimLine) continue;
+    try {
+      releasePersona(ctx.registry, binding.storeDir, binding.personaId);
+    } catch (err) {
+      console.error(`persona release failed: ${(err as Error).message ?? String(err)}`);
+    }
+  }
 }

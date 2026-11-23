@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newId } from './ids.ts';
 import { openRegistry } from './registry.ts';
 import { readPersona, writePersona } from './persona-store.ts';
+import { listGitWorktrees } from './worktree.ts';
 import {
   claimPersona,
   createPersona,
@@ -54,8 +55,8 @@ test('findMarker returns undefined when no valid marker exists', () => {
   assert.equal(findMarker(root), undefined);
 });
 
-function git(args: string[], cwd: string): void {
-  execFileSync('git', args, { cwd, encoding: 'utf8' });
+function git(args: string[], cwd: string): string {
+  return execFileSync('git', args, { cwd, encoding: 'utf8' });
 }
 
 function registryProject(registry: ReturnType<typeof openRegistry>, root: string) {
@@ -86,6 +87,38 @@ function setup() {
     writeMarker(path, project.id, id);
   }
   return { root, storeDir, registry, project, wt1, wt2 };
+}
+
+/** Real git worktrees so lock/unlock and branch comparisons are observable. */
+function gitRegistrySetup() {
+  const root = tempRoot();
+  const repo = join(root, 'repo');
+  mkdirSync(repo, { recursive: true });
+  git(['init', '-q'], repo);
+  git(['-c', 'user.name=Tester', '-c', 'user.email=tester@example.com',
+    'commit', '--allow-empty', '-q', '-m', 'init'], repo);
+  const storeDir = join(root, 'store');
+  mkdirSync(storeDir, { recursive: true });
+  const registry = openRegistry(join(root, 'registry.sqlite'));
+  const project = registry.projects.create({
+    name: 'Git', repoCommonDir: join(repo, '.git'), storeDir,
+  });
+
+  function add(name: string, parent: string = root) {
+    const path = join(parent, name);
+    const branch = `artinarey/${name}`;
+    git(['worktree', 'add', '-q', '-b', branch, path], repo);
+    const id = newId();
+    registry.worktrees.upsert({ id, projectId: project.id, path, branch });
+    writeMarker(path, project.id, id);
+    return { id, path, branch };
+  }
+
+  return { root, repo, storeDir, registry, project, add };
+}
+
+function isLocked(repo: string, path: string): boolean {
+  return listGitWorktrees(repo).find((wt) => wt.path === path)?.locked === true;
 }
 
 test('resolveIdentity maps a marked directory to its project and worktree', () => {
@@ -220,10 +253,17 @@ test('a home-worktree mismatch needs confirmation or rehome; senior dev is exemp
   assert.equal(readPersona(s.storeDir, dev).home_worktree_id, s.wt2);
 
   const senior = createPersona(s.registry, s.storeDir, s.project.id, 'senior-dev', 'Lead');
+  // A real home elsewhere in a free worktree: the exemption is the only reason
+  // this claim can succeed.
+  writePersona(s.storeDir, senior, {
+    role: 'senior-dev', name: 'Lead', home_worktree_id: s.wt2,
+    state: 'idle', vendor: null, last_vendor_session_id: null,
+  });
   const home = resolveIdentity(s.registry, join(s.root, 'wt1'));
   assert.equal(home.ok, true);
   if (!home.ok) return;
   assert.equal(claimPersona(s.registry, s.storeDir, home.identity, { personaId: senior }).ok, true);
+  assert.equal(readPersona(s.storeDir, senior).home_worktree_id, s.wt2);
   s.registry.close();
 });
 
@@ -294,6 +334,135 @@ test('rehomePersona refuses cross-project and unknown ids without a successful a
   }
   assert.equal(readPersona(s.storeDir, dev).home_worktree_id, s.wt1);
   assert.equal(auditEvents(s.storeDir, 'persona_rehome').length, 0);
+  s.registry.close();
+});
+
+test('resolveIdentity matches a nested worktree by canonical directory, not by prefix', () => {
+  const s = gitRegistrySetup();
+  try {
+    const nested = s.add('nested', join(s.repo, '.worktrees'));
+    const mainId = newId();
+    s.registry.worktrees.upsert({
+      id: mainId, projectId: s.project.id, path: s.repo,
+      branch: git(['rev-parse', '--abbrev-ref', 'HEAD'], s.repo),
+    });
+    writeMarker(s.repo, s.project.id, mainId);
+    // The registered branch is stale for the nested worktree only.
+    s.registry.worktrees.upsert({
+      id: nested.id, projectId: s.project.id, path: nested.path, branch: 'stale/nested',
+    });
+
+    const result = resolveIdentity(s.registry, nested.path);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.code, 'WORKTREE_UNMANAGED');
+      assert.match(result.message, /feature\/nested|artinarey\/nested/);
+      assert.equal(result.message.includes('stale/nested'), true);
+      assert.equal(result.message.includes('registered: stale/nested'), true);
+    }
+    const events = auditEvents(s.storeDir, 'worktree_unmanaged');
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.git_branch, nested.branch);
+  } finally {
+    s.registry.close();
+  }
+});
+
+test('claimPersona unlocks the previous worktree after a confirmed move', () => {
+  const s = gitRegistrySetup();
+  try {
+    const x = s.add('x');
+    const y = s.add('y');
+    const persona = createPersona(s.registry, s.storeDir, s.project.id, 'dev-mover', 'Mover');
+    const fromIdentity = resolveIdentity(s.registry, x.path);
+    const toIdentity = resolveIdentity(s.registry, y.path);
+    assert.equal(fromIdentity.ok, true);
+    assert.equal(toIdentity.ok, true);
+    if (!fromIdentity.ok || !toIdentity.ok) return;
+
+    assert.equal(claimPersona(s.registry, s.storeDir, fromIdentity.identity, { personaId: persona }).ok, true);
+    assert.equal(isLocked(s.repo, x.path), true);
+
+    const moved = claimPersona(s.registry, s.storeDir, toIdentity.identity, {
+      personaId: persona, confirmMove: true,
+    });
+    assert.equal(moved.ok, true);
+    assert.equal(isLocked(s.repo, x.path), false, 'old worktree is unlocked after the move');
+    assert.equal(isLocked(s.repo, y.path), true);
+
+    // A claim on the same worktree must not unlock the new lock.
+    assert.equal(claimPersona(s.registry, s.storeDir, toIdentity.identity, {
+      personaId: persona, confirmMove: true,
+    }).ok, true);
+    assert.equal(isLocked(s.repo, y.path), true);
+  } finally {
+    s.registry.close();
+  }
+});
+
+test('release and force release unlock even when the audit append fails', () => {
+  const s = gitRegistrySetup();
+  try {
+    const x = s.add('x');
+    const y = s.add('y');
+    const persona = createPersona(s.registry, s.storeDir, s.project.id, 'dev-release', 'Release');
+    const other = createPersona(s.registry, s.storeDir, s.project.id, 'dev-force', 'Force');
+    const xIdentity = resolveIdentity(s.registry, x.path);
+    const yIdentity = resolveIdentity(s.registry, y.path);
+    assert.equal(xIdentity.ok, true);
+    assert.equal(yIdentity.ok, true);
+    if (!xIdentity.ok || !yIdentity.ok) return;
+    assert.equal(claimPersona(s.registry, s.storeDir, xIdentity.identity, { personaId: persona }).ok, true);
+    assert.equal(claimPersona(s.registry, s.storeDir, yIdentity.identity, { personaId: other }).ok, true);
+
+    // Making the audit destination a directory makes appendJournal fail.
+    rmSync(join(s.storeDir, 'events', 'audit.jsonl'), { force: true });
+    mkdirSync(join(s.storeDir, 'events', 'audit.jsonl'), { recursive: true });
+    assert.throws(() => releasePersona(s.registry, s.storeDir, persona));
+    assert.equal(s.registry.bindings.forWorktree(x.id), undefined);
+    assert.equal(isLocked(s.repo, x.path), false);
+    assert.equal(isLocked(s.repo, y.path), true);
+
+    assert.throws(() => releaseWorktreeForce(s.registry, s.storeDir, y.id));
+    assert.equal(s.registry.bindings.forWorktree(y.id), undefined);
+    assert.equal(isLocked(s.repo, y.path), false);
+  } finally {
+    s.registry.close();
+  }
+});
+
+test('resolveIdentity returns WORKTREE_UNMANAGED when the diagnostic audit fails', () => {
+  const s = setup();
+  const bogus = join(s.root, 'bogus');
+  mkdirSync(bogus);
+  // A known worktree at the wrong path keeps storeDir defined, so the diagnostic
+  // audit is attempted in the project store.
+  writeMarker(bogus, s.project.id, s.wt1);
+  mkdirSync(join(s.storeDir, 'events', 'audit.jsonl'), { recursive: true });
+
+  const result = resolveIdentity(s.registry, bogus);
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.code, 'WORKTREE_UNMANAGED');
+  s.registry.close();
+});
+
+test('claimPersona refuses a busy directory before creating a new persona', () => {
+  const s = setup();
+  const a = createPersona(s.registry, s.storeDir, s.project.id, 'dev-a', 'A');
+  const identity = resolveIdentity(s.registry, join(s.root, 'wt1'));
+  assert.equal(identity.ok, true);
+  if (!identity.ok) return;
+  assert.equal(claimPersona(s.registry, s.storeDir, identity.identity, { personaId: a }).ok, true);
+
+  const refused = claimPersona(s.registry, s.storeDir, identity.identity, {
+    newRole: 'dev-orphan', name: 'Orphan',
+  });
+  assert.equal(refused.ok, false);
+  if (!refused.ok) assert.equal(refused.code, 'DIRECTORY_BUSY');
+  assert.deepEqual(s.registry.personas.list(s.project.id).map((p) => p.role), ['dev-a']);
+
+  // A persona claiming its own binding is still allowed.
+  assert.equal(claimPersona(s.registry, s.storeDir, identity.identity, { personaId: a }).ok, true);
   s.registry.close();
 });
 

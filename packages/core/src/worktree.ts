@@ -1,5 +1,8 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync,
+  rmdirSync, rmSync, statSync, writeFileSync, writeSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { ArtinareyError } from './errors.ts';
@@ -17,56 +20,64 @@ export type GitWorktree = {
   bare: boolean;
 };
 
-/** Parses the block-oriented output of `git worktree list --porcelain`. */
-export function parseWorktreePorcelain(text: string): GitWorktree[] {
-  return text
-    .split(/\n\s*\n/)
-    .filter((block) => block.trim() !== '')
-    .map((block) => {
-      const worktree: GitWorktree = {
-        path: '',
-        head: '',
-        branch: null,
-        detached: false,
-        locked: false,
-        prunable: false,
-        bare: false,
-      };
+function emptyWorktree(): GitWorktree {
+  return {
+    path: '', head: '', branch: null,
+    detached: false, locked: false, prunable: false, bare: false,
+  };
+}
 
-      for (const line of block.split('\n')) {
-        const space = line.indexOf(' ');
-        const key = space === -1 ? line : line.slice(0, space);
-        const value = space === -1 ? '' : line.slice(space + 1);
-        switch (key) {
-          case 'worktree':
-            worktree.path = value;
-            break;
-          case 'HEAD':
-            worktree.head = value;
-            break;
-          case 'branch':
-            worktree.branch = value.replace(/^refs\/heads\//, '');
-            break;
-          case 'detached':
-            worktree.detached = true;
-            break;
-          case 'locked':
-            worktree.locked = true;
-            break;
-          case 'prunable':
-            worktree.prunable = true;
-            break;
-          case 'bare':
-            worktree.bare = true;
-            break;
-        }
-      }
-      return worktree;
-    });
+/** Parses `git worktree list --porcelain`, newline- or NUL-delimited (-z). */
+export function parseWorktreePorcelain(text: string): GitWorktree[] {
+  const records = text.includes('\0') ? text.split('\0') : text.split('\n');
+  const worktrees: GitWorktree[] = [];
+  let current = emptyWorktree();
+  let hasFields = false;
+  const finish = () => {
+    if (hasFields) worktrees.push(current);
+    current = emptyWorktree();
+    hasFields = false;
+  };
+
+  for (const line of records) {
+    if (line.trim() === '') {
+      finish();
+      continue;
+    }
+    const space = line.indexOf(' ');
+    const key = space === -1 ? line : line.slice(0, space);
+    const value = space === -1 ? '' : line.slice(space + 1);
+    switch (key) {
+      case 'worktree':
+        current.path = value;
+        break;
+      case 'HEAD':
+        current.head = value;
+        break;
+      case 'branch':
+        current.branch = value.replace(/^refs\/heads\//, '');
+        break;
+      case 'detached':
+        current.detached = true;
+        break;
+      case 'locked':
+        current.locked = true;
+        break;
+      case 'prunable':
+        current.prunable = true;
+        break;
+      case 'bare':
+        current.bare = true;
+        break;
+    }
+    hasFields = true;
+  }
+  finish();
+  return worktrees;
 }
 
 export function listGitWorktrees(repoDir: string): GitWorktree[] {
-  const output = execFileSync('git', ['worktree', 'list', '--porcelain'], {
+  const output = execFileSync('git', ['worktree', 'list', '--porcelain', '-z'], {
     cwd: repoDir,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
@@ -217,15 +228,13 @@ export function globalIgnoreCoverage(repoDir: string): {
       cwd: probe,
       stdio: 'ignore',
     });
-    try {
-      const match = execFileSync(
-        'git', ['check-ignore', '--no-index', '-v', '.worktrees/probe'],
-        { cwd: probe, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
-      );
-      return { globalFile, coversWorktrees: match.trim() !== '' };
-    } catch {
-      return { globalFile, coversWorktrees: false };
-    }
+    // A negated rule can still print a match: trust the exit status only.
+    return {
+      globalFile,
+      coversWorktrees: gitSucceeds(probe, [
+        'check-ignore', '--no-index', '--quiet', '.worktrees/probe',
+      ]),
+    };
   } finally {
     rmSync(probe, { recursive: true, force: true });
   }
@@ -249,6 +258,17 @@ function gitSucceeds(cwd: string, args: string[]): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/** A base must resolve to a commit, not merely to a tree or tag object. */
+function commitAt(cwd: string, ref: string): string | undefined {
+  try {
+    return execFileSync('git', ['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`], {
+      cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return undefined;
   }
 }
 
@@ -287,8 +307,8 @@ export function planWorktree(
     throw new ArtinareyError('INVALID_INPUT', `branch already exists: ${branch}`);
   }
   const resolvedBase = base ?? defaultBase(repoRoot);
-  if (resolvedBase === '' ||
-      !gitSucceeds(repoRoot, ['rev-parse', '--verify', resolvedBase])) {
+  const baseCommit = resolvedBase === '' ? undefined : commitAt(repoRoot, resolvedBase);
+  if (!baseCommit) {
     throw new ArtinareyError('INVALID_INPUT', `base ref does not exist: ${resolvedBase}`);
   }
 
@@ -317,6 +337,45 @@ function discardGitWorktree(repoRoot: string, path: string): void {
   }
 }
 
+/** Create exclusively: never follow a symlink or change an existing file's mode. */
+function writeGeneratedFile(path: string, content: string | Buffer): void {
+  const fd = openSync(path, 'wx', 0o600);
+  try {
+    writeSync(fd, typeof content === 'string' ? Buffer.from(content) : content);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** A failed `git worktree add` only owns artifacts git registered or an empty directory. */
+function rollbackFailedAdd(repoRoot: string, path: string): void {
+  if (listGitWorktrees(repoRoot).some((wt) => samePath(wt.path, path))) {
+    discardGitWorktree(repoRoot, path);
+    return;
+  }
+  if (existsSync(path)) {
+    try {
+      rmdirSync(path);
+    } catch {
+      // A populated target was created by someone else after preflight: leave it alone.
+    }
+  }
+}
+
+/** Remove only an unchanged, unused branch created by this invocation. */
+function discardCreatedBranch(repoRoot: string, branch: string, baseCommit?: string): void {
+  if (!baseCommit) return;
+  const ref = `refs/heads/${branch}`;
+  const current = commitAt(repoRoot, ref);
+  if (current !== baseCommit) return;
+  if (listGitWorktrees(repoRoot).some((wt) => wt.branch === branch)) return;
+  try {
+    execFileSync('git', ['update-ref', '-d', ref, current], { cwd: repoRoot, stdio: 'ignore' });
+  } catch {
+    // Best effort: a concurrent change must not turn rollback into a failure.
+  }
+}
+
 /** Apply a previously planned and confirmed worktree creation. */
 export function createWorktree(registry: Registry, storeDir: string, plan: WorktreePlan): Worktree {
   const project = registry.projects.list().find((p) => p.storeDir === storeDir);
@@ -327,13 +386,18 @@ export function createWorktree(registry: Registry, storeDir: string, plan: Workt
   ensureExcludeBlock(resolveRepo(repoRoot).commonDir);
 
   const id = newId();
+  const branchCreated = !gitSucceeds(repoRoot, [
+    'show-ref', '--verify', '--quiet', `refs/heads/${plan.branch}`,
+  ]);
+  const baseCommit = commitAt(repoRoot, plan.base);
   try {
     execFileSync('git', ['worktree', 'add', plan.path, '-b', plan.branch, plan.base], {
       cwd: repoRoot,
       stdio: 'ignore',
     });
   } catch (err) {
-    discardGitWorktree(repoRoot, plan.path);
+    rollbackFailedAdd(repoRoot, plan.path);
+    if (branchCreated) discardCreatedBranch(repoRoot, plan.branch, baseCommit);
     throw err;
   }
 
@@ -343,11 +407,11 @@ export function createWorktree(registry: Registry, storeDir: string, plan: Workt
     const marker = join(plan.path, '.artinarey.json');
     writeMarker(plan.path, project.id, id);
     createdFiles.push(marker);
-    writeFileSync(plan.envFile, `ARTINAREY_PORT_OFFSET=${plan.portOffset}\n`, { mode: 0o600 });
+    writeGeneratedFile(plan.envFile, `ARTINAREY_PORT_OFFSET=${plan.portOffset}\n`);
     createdFiles.push(plan.envFile);
     for (const file of plan.copy) {
       const target = join(plan.path, file);
-      writeFileSync(target, readFileSync(join(repoRoot, file)), { mode: 0o600 });
+      writeGeneratedFile(target, readFileSync(join(repoRoot, file)));
       createdFiles.push(target);
     }
     registry.worktrees.upsert({
@@ -365,6 +429,7 @@ export function createWorktree(registry: Registry, storeDir: string, plan: Workt
     for (const file of createdFiles) rmSync(file, { recursive: true, force: true });
     discardGitWorktree(repoRoot, plan.path);
     if (registered) registry.worktrees.delete(id);
+    if (branchCreated) discardCreatedBranch(repoRoot, plan.branch, baseCommit);
     throw err;
   }
 }

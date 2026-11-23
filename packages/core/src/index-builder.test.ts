@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import { newId } from './ids.ts';
 import { buildIndex, queryMail, type IndexedMail } from './index-builder.ts';
 import { sendMail } from './mail.ts';
@@ -66,6 +67,71 @@ test('a deleted mail file disappears after rebuild; the files remain the source 
   assert.equal(report.indexed, 2);
   assert.equal(report.skipped, 0);
   assert.deepEqual(queryMail(indexFile).map((m) => m.id), [ids[0], ids[2]].sort());
+});
+
+test('buildIndex stores frontmatter cc and queryMail matches cc recipients', async () => {
+  const store = tempDir('artinarey-index-store');
+  const indexFile = join(tempDir('artinarey-index-cache'), 'index.sqlite');
+  const record = await sendMail(store, {
+    from: 'dev-a', to: ['senior-dev'], cc: ['dev-b', 'senior-dev'],
+    subject: 'cc mail', kind: 'status', action: 'review', body: 'body',
+  }, {
+    knownPersonas: ['dev-a', 'senior-dev', 'dev-b'],
+    role: 'dev-a',
+    now: new Date('2026-11-23T10:15:00Z'),
+  });
+
+  buildIndex(indexFile, store);
+
+  const mails = queryMail(indexFile);
+  assert.equal(mails.length, 1);
+  assert.deepEqual(mails[0]?.cc, ['dev-b', 'senior-dev']);
+  assert.deepEqual(queryMail(indexFile, { recipient: 'dev-b' }).map((m) => m.id), [record.id]);
+  assert.deepEqual(queryMail(indexFile, { recipient: 'senior-dev' }).map((m) => m.id), [record.id]);
+});
+
+test('buildIndex migrates an existing index that has no cc_json column', async () => {
+  const store = tempDir('artinarey-index-store');
+  const indexFile = join(tempDir('artinarey-index-cache'), 'index.sqlite');
+  await sendMail(store, {
+    from: 'dev-a', to: ['senior-dev'], cc: ['dev-b', 'senior-dev'],
+    subject: 'legacy', kind: 'status', action: 'review', body: 'body',
+  }, {
+    knownPersonas: ['dev-a', 'senior-dev', 'dev-b'],
+    role: 'dev-a',
+    now: new Date('2026-11-23T10:15:00Z'),
+  });
+  const legacy = new Database(indexFile);
+  legacy.exec(`CREATE TABLE mail (
+    id TEXT PRIMARY KEY, thread TEXT NOT NULL, from_id TEXT NOT NULL,
+    to_json TEXT NOT NULL, subject TEXT NOT NULL, kind TEXT NOT NULL,
+    created_at TEXT NOT NULL, file TEXT NOT NULL
+  )`);
+  legacy.close();
+
+  buildIndex(indexFile, store);
+
+  const raw = new Database(indexFile, { readonly: true });
+  const columns = raw.pragma('table_info(mail)') as Array<{ name: string }>;
+  assert.equal(columns.some((c) => c.name === 'cc_json'), true);
+  raw.close();
+  assert.deepEqual(queryMail(indexFile)[0]?.cc, ['dev-b', 'senior-dev']);
+});
+
+test('a read failure mid-rebuild rolls back the whole index rebuild', async () => {
+  const store = tempDir('artinarey-index-store');
+  const ids = await seedThree(store);
+  const indexFile = join(tempDir('artinarey-index-cache'), 'index.sqlite');
+  buildIndex(indexFile, store);
+
+  // Turn the first mail file into a directory: it passes the file filter but fails
+  // on read before any replacement row is inserted.
+  const first = join(store, 'mail', '2026', '11', `${[...ids].sort()[0]}.md`);
+  unlinkSync(first);
+  mkdirSync(first);
+  assert.throws(() => buildIndex(indexFile, store));
+
+  assert.deepEqual(queryMail(indexFile).map((m) => m.id), [...ids].sort());
 });
 
 test('queryMail filters by recipient and thread', async () => {

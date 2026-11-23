@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { newId, openRegistry, sendMail, type XdgPaths } from '@artinarey/core';
 import { main } from './index.ts';
 
@@ -36,6 +38,20 @@ function tempEnv(): { env: NodeJS.ProcessEnv; paths: XdgPaths } {
     cacheRoot: join(cacheRoot, 'artinarey'),
   } };
 }
+
+test('the artinarey bin runs the CLI directly', () => {
+  const { env } = tempEnv();
+  const packageDir = join(dirname(fileURLToPath(import.meta.url)), '..');
+  const manifest = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8')) as {
+    bin: { artinarey: string };
+  };
+  assert.equal(manifest.bin.artinarey, 'bin/artinarey');
+  const result = spawnSync(join(packageDir, manifest.bin.artinarey), ['daemon', 'status'], {
+    env, encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, `${result.error?.message ?? ''}${result.stderr}`);
+  assert.match(result.stdout, /daemon not running/);
+});
 
 test('artinarey reindex builds a cache index from the registered store', async () => {
   const { env, paths } = tempEnv();
