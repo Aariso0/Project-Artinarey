@@ -11,11 +11,11 @@
 
 Legend: ⬜ not started · 🟨 in progress · ✅ done · 🟥 blocked
 
-**Overall:** `░░░░░░░░░░░░░░░░░░░░` 0 of 9 milestones done · **Slice 1 (M0–M6):** 0 of 7 done
+**Overall:** `█░░░░░░░░░░░░░░░░░` 1 of 9 milestones done · **Slice 1 (M0–M6):** 1 of 7 done
 
 | M | Goal | Estimate | Status | Part of |
 |---|---|---|---|---|
-| M0 | Spike: does the shim see the agent's folder? | 2 h | ⬜ | Slice 1 |
+| M0 | Spike: does the shim see the agent's folder? | 2 h | ✅ | Slice 1 |
 | M1 | Store, mail files, registry, daemon skeleton | 1–1.5 d | ⬜ | Slice 1 |
 | M2 | MCP shim, tools, identity by folder | 1 d | ⬜ | Slice 1 |
 | M3 | Worktree manager, home-worktree warnings, `run` | 1 d | ⬜ | Slice 1 |
@@ -58,9 +58,9 @@ Each row flips to ✅ verified, or 🟥 failed (then the fallback in the last co
 |---|---|---|
 | Shim `cwd` in main dir | ✅ `/mnt/shareddata/projects/Project-Artinarey` | `opencode run --standalone --auto`, tool returned cwd; MCP config was local and gitignored, with an explicit `artinarey_m0_whoami` allow rule (2026-11-23) |
 | Shim `cwd` in a worktree | ✅ `/mnt/shareddata/projects/Project-Artinarey-m0-wt` | Same tool call from the linked worktree; local `opencode.json` copied there; first `mcp list` was transiently empty, retry connected (2026-11-23) |
-| `info/exclude` covers marker in a worktree | | |
-| Shared hook fires from a worktree commit | | |
-| `opencode serve` session in a worktree loads MCP config | | |
+| `info/exclude` covers marker in a worktree | ✅ shared common file applies | `git check-ignore -v` in the worktree reported `.git/info/exclude:7:.artinarey.json`; `git status --short` stayed clean (2026-11-23) |
+| Shared hook fires from a worktree commit | ✅ worktree `pwd` in log | `core.hooksPath` set to an absolute path in common config; log line showed `/mnt/shareddata/projects/Project-Artinarey-m0-wt` (2026-11-23) |
+| `opencode serve` session in a worktree loads MCP config | ✅ cwd = worktree, canonical = main | `POST /api/session` with `location.directory` worked; `GET /api/location?location[directory]=…` returned `project.canonical = /mnt/shareddata/projects/Project-Artinarey` (2026-11-23) |
 
 ---
 
@@ -604,16 +604,16 @@ SQLite or the index on a network share. The store is plain files so it is safe o
 Tick boxes as tasks finish. Estimates are guesses. Slice 1 (M0–M6) ≈ 8–9 working days. Everything ≈ 3.5–4.5 weeks full-time; part-time, double it.
 
 ### M0 · Spike
-**Status:** ⬜ · **Estimate:** 2 h · **Depends on:** nothing · **Confirms:** U1, U8 in practice
+**Status:** ✅ · **Estimate:** 2 h · **Depends on:** nothing · **Confirms:** U1, U8 in practice
 
 Goal: confirm the working-directory identity (A1 c) with real tools before writing code. Documentation research already answered these questions; this is a hands-on check, not open research. One permanent item is included by request: Dependabot plus CI automatic checks (task 6); unlike the rest of M0, those files are kept.
 
-- [ ] 1. Write a tiny stdio MCP server (TypeScript) with one tool returning `process.cwd()`, `argv`, and the environment variable names
-- [ ] 2. Register it in OpenCode's project MCP config; call the tool in the main directory and again inside a git worktree; record both `cwd` values
-- [ ] 3. Create a worktree; run `git check-ignore -v .artinarey.json` with the entry only in `.git/info/exclude`; commit in the worktree and confirm a hook in the shared hooks directory fires
-- [ ] 4. Start `opencode serve`; create a session scoped to a worktree; confirm the shim's `cwd` is that worktree and that config comes from the canonical checkout
-- [ ] 5. Fill in the Spike results table
-- [ ] 6. Add Dependabot and CI automatic checks (`.github/dependabot.yml`, `.github/workflows/ci.yml`) — repository infrastructure, retained after the spike
+- [x] 1. Write a tiny stdio MCP server (TypeScript) with one tool returning `process.cwd()`, `argv`, and the environment variable names
+- [x] 2. Register it in OpenCode's project MCP config; call the tool in the main directory and again inside a git worktree; record both `cwd` values
+- [x] 3. Create a worktree; run `git check-ignore -v .artinarey.json` with the entry only in `.git/info/exclude`; commit in the worktree and confirm a hook in the shared hooks directory fires
+- [x] 4. Start `opencode serve`; create a session scoped to a worktree; confirm the shim's `cwd` is that worktree and that config comes from the canonical checkout
+- [x] 5. Fill in the Spike results table
+- [x] 6. Add Dependabot and CI automatic checks (`.github/dependabot.yml`, `.github/workflows/ci.yml`) — repository infrastructure, retained after the spike
 
 **Done when:** every check has a recorded result.
 **Exit rule:** if the shim's `cwd` is not the worktree, fall back to a static header or environment value supplied per session by the daemon (identity still tied to the directory record). Subagents and Codex are out of scope; both were settled in section 17.

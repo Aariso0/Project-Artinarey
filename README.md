@@ -233,11 +233,11 @@ Any tool you start by hand with `artinarey run` still gets mail and tasks, as lo
 
 ## Progress
 
-`░░░░░░░░░░░░░░░░░░░░` **0 of 9 milestones. Design settled, implementation unverified.** Nothing is built. The first step is a two-hour spike.
+`█░░░░░░░░░░░░░░░░░` **1 of 9 milestones. Design settled, implementation unverified.** The M0 spike passed on 2026-11-23; the throwaway shim was removed, so no product code has been written.
 
 | | Milestone | Status |
 |---|---|---|
-| M0 | Spike: can the MCP shim see the agent's folder? | — |
+| M0 | Spike: can the MCP shim see the agent's folder? | ✅ |
 | M1 | Store, mail files, daemon | — |
 | M2 | MCP shim and identity by folder | — |
 | M3 | Worktree manager and home-worktree warnings | — |
@@ -247,7 +247,7 @@ Any tool you start by hand with `artinarey run` still gets mail and tasks, as lo
 | M7 | Chat, dialogs, approvals, **Move** | — |
 | M8 | Model API adapter *(other vendors postponed)* | — |
 
-All 14 assumptions were checked and all 3 open decisions were closed on 2026-11-23. The evidence is in [`plan.md`](plan.md), section 17 — source of truth for task checklists and estimates.
+All 14 assumptions were checked and all 3 open decisions were closed on 2026-11-23. M0 then confirmed the worktree-identity and shared-git-metadata assumptions against real tools; results are in [`plan.md`](plan.md), section 0. Section 17 holds the research evidence — the source of truth for task checklists and estimates.
 
 ---
 

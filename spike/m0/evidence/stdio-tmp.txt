@@ -1,7 +1,0 @@
-tools: [ 'whoami' ]
-[
-  {
-    "type": "text",
-    "text": "{\n  \"cwd\": \"/tmp\",\n  \"argv\": [\n    \"/usr/bin/node\",\n    \"/mnt/shareddata/projects/Project-Artinarey/spike/m0/shim/src/index.ts\"\n  ],\n  \"envNames\": [\n    \"HOME\",\n    \"LOGNAME\",\n    \"PATH\",\n    \"SHELL\",\n    \"TERM\",\n    \"USER\"\n  ]\n}"
-  }
-]
