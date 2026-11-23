@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "m0 hook fired in $(pwd) at $(date -Iseconds)" >> /mnt/shareddata/projects/Project-Artinarey/spike/m0/evidence/hook.log

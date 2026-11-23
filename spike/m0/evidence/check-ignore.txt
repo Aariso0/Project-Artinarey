@@ -1,0 +1,1 @@
+/mnt/shareddata/projects/Project-Artinarey/.git/info/exclude:7:.artinarey.json	.artinarey.json
