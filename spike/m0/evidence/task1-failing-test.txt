@@ -1,0 +1,37 @@
+npm notice run shim@1.0.0 test
+npm notice run node --import tsx --test src/*.test.ts
+node:internal/modules/esm/resolve:241
+    throw new ERR_MODULE_NOT_FOUND(
+          ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/mnt/shareddata/projects/Project-Artinarey/spike/m0/shim/src/report.ts' imported from /mnt/shareddata/projects/Project-Artinarey/spike/m0/shim/src/report.test.ts
+    at finalizeResolution (node:internal/modules/esm/resolve:241:11)
+    at moduleResolve (node:internal/modules/esm/resolve:846:10)
+    at defaultResolve (node:internal/modules/esm/resolve:973:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:708:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:728:38)
+    at nextStep (node:internal/modules/customization_hooks:189:26)
+    at resolveBaseSync (file:///mnt/shareddata/projects/Project-Artinarey/spike/m0/shim/node_modules/tsx/dist/register-nyXW-TH3.mjs:2:11092)
+    at resolveDirectorySync (file:///mnt/shareddata/projects/Project-Artinarey/spike/m0/shim/node_modules/tsx/dist/register-nyXW-TH3.mjs:2:12398)
+    at resolveTsPathsSync (file:///mnt/shareddata/projects/Project-Artinarey/spike/m0/shim/node_modules/tsx/dist/register-nyXW-TH3.mjs:2:13605)
+    at resolve (file:///mnt/shareddata/projects/Project-Artinarey/spike/m0/shim/node_modules/tsx/dist/register-nyXW-TH3.mjs:2:16832) {
+  code: 'ERR_MODULE_NOT_FOUND',
+  url: 'file:///mnt/shareddata/projects/Project-Artinarey/spike/m0/shim/src/report.ts'
+}
+
+Node.js v26.13.1
+✖ src/report.test.ts (120.265801ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 127.372793
+
+✖ failing tests:
+
+test at src/report.test.ts:1:1
+✖ src/report.test.ts (120.265801ms)
+  'test failed'
