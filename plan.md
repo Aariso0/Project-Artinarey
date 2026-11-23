@@ -56,8 +56,8 @@ Each row flips to ✅ verified, or 🟥 failed (then the fallback in the last co
 
 | Check | OpenCode | Notes |
 |---|---|---|
-| Shim `cwd` in main dir | | |
-| Shim `cwd` in a worktree | | |
+| Shim `cwd` in main dir | ✅ `/mnt/shareddata/projects/Project-Artinarey` | `opencode run --standalone --auto`, tool returned cwd; MCP config was local and gitignored, with an explicit `artinarey_m0_whoami` allow rule (2026-11-23) |
+| Shim `cwd` in a worktree | ✅ `/mnt/shareddata/projects/Project-Artinarey-m0-wt` | Same tool call from the linked worktree; local `opencode.json` copied there; first `mcp list` was transiently empty, retry connected (2026-11-23) |
 | `info/exclude` covers marker in a worktree | | |
 | Shared hook fires from a worktree commit | | |
 | `opencode serve` session in a worktree loads MCP config | | |

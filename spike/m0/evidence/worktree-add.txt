@@ -1,2 +1,2 @@
 Preparing worktree (new branch 'spike/m0-wt')
-HEAD is now at 1dac32f spike(m0): register throwaway MCP shim
+HEAD is now at f3b9802 spike(m0): keep opencode.json local and preserve MCP evidence
