@@ -1,8 +1,12 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { atomicWrite, buildIndex, openRegistry, resolveXdgPaths } from '@artinarey/core';
+import {
+  atomicWrite, buildIndex, ensureExcludeBlock, findMarker, globalIgnoreCoverage,
+  listGitWorktrees, newId, openRegistry, projectStore, resolveRepo, resolveXdgPaths,
+  writeMarker,
+} from '@artinarey/core';
 import { callDaemon, daemonStatus, startDaemon, stopDaemon } from '@artinarey/daemon';
 
 const MCP_TOOLS = [
@@ -59,6 +63,51 @@ export async function main(
   cwd: string = process.cwd(),
 ): Promise<number> {
   const [command, ...args] = argv;
+
+  if (command === 'init') {
+    try {
+      const { root, commonDir } = resolveRepo(cwd);
+      ensureExcludeBlock(commonDir);
+      const coverage = globalIgnoreCoverage(root);
+      const paths = resolveXdgPaths(env);
+      const registry = openRegistry(paths.registryFile);
+      try {
+        let project = registry.projects.list().find((p) => p.repoCommonDir === commonDir);
+        if (!project) {
+          project = registry.projects.create({
+            name: basename(root),
+            repoCommonDir: commonDir,
+            storeDir: projectStore(paths.dataRoot, newId()),
+          });
+          mkdirSync(project.storeDir, { recursive: true });
+        }
+
+        const marker = findMarker(root);
+        const registered = registry.worktrees.list(project.id);
+        const fromMarker = marker?.dir === root && marker.marker.project_id === project.id
+          ? registered.find((wt) => wt.id === marker.marker.worktree_id && wt.path === root)
+          : undefined;
+        const worktree = fromMarker ?? registered.find((wt) => wt.path === root);
+        const worktreeId = worktree?.id ?? newId();
+        const branch = listGitWorktrees(root).find((wt) => wt.path === root)?.branch ?? null;
+        registry.worktrees.upsert({ id: worktreeId, projectId: project.id, path: root, branch });
+        writeMarker(root, project.id, worktreeId);
+
+        const detail = coverage.globalFile === null
+          ? 'no global excludes file'
+          : coverage.coversWorktrees
+            ? `covers .worktrees/ via ${coverage.globalFile}`
+            : `does not cover .worktrees/ (${coverage.globalFile})`;
+        console.log(`global ignore: ${detail}`);
+        return 0;
+      } finally {
+        registry.close();
+      }
+    } catch (err) {
+      console.error(`init failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
 
   if (command === 'connect') {
     if (args[0] !== 'opencode') {

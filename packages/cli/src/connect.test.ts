@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import {
-  createPersona, newId, openRegistry, resolveXdgPaths, writeMarker,
+  createPersona, findMarker, isUlid, newId, openRegistry, resolveXdgPaths, writeMarker,
 } from '@artinarey/core';
 import { createRpcServer } from '@artinarey/daemon';
 import { main } from './index.ts';
@@ -68,6 +69,66 @@ test('connect opencode writes an MCP entry and allow rules without clobbering co
     assert.ok(allowed.includes(`artinarey_${tool}`), `missing allow rule for ${tool}`);
   }
   assert.ok(allowed.includes('bash'), 'existing rules must survive');
+});
+
+test('artinarey init registers a project, writes the marker, and is idempotent', async () => {
+  const dir = root();
+  const repo = join(dir, 'repo');
+  mkdirSync(repo, { recursive: true });
+  execFileSync('git', ['init', '-q'], { cwd: repo });
+  const globalConfig = join(dir, 'global-gitconfig');
+  writeFileSync(globalConfig, '[user]\n\tname = Tester\n');
+  const env = { ...envFor(dir), GIT_CONFIG_GLOBAL: globalConfig };
+  const registry = openRegistry(resolveXdgPaths(env).registryFile);
+
+  let output = '';
+  const original = console.log;
+  console.log = (s: unknown) => { output += `${String(s)}\n`; };
+  let code: number;
+  try {
+    code = await main(['init'], env, repo);
+  } finally {
+    console.log = original;
+  }
+  assert.equal(code, 0, output);
+  assert.match(output, /global ignore/);
+
+  const commonDir = resolve(repo, execFileSync(
+    'git', ['rev-parse', '--git-common-dir'], { cwd: repo, encoding: 'utf8' },
+  ).trim());
+  const project = registry.projects.list().find((p) => p.repoCommonDir === commonDir);
+  assert.ok(project, 'project with repoCommonDir not registered');
+  const marker = findMarker(repo);
+  assert.ok(marker, 'marker not written');
+  assert.equal(marker.dir, repo);
+  assert.equal(marker.marker.project_id, project.id);
+  assert.ok(isUlid(marker.marker.project_id));
+  assert.ok(isUlid(marker.marker.worktree_id));
+
+  const worktrees = registry.worktrees.list(project.id);
+  assert.equal(worktrees.length, 1);
+  assert.equal(worktrees[0]?.id, marker.marker.worktree_id);
+  assert.equal(worktrees[0]?.path, repo);
+
+  const exclusion = readFileSync(join(commonDir, 'info', 'exclude'), 'utf8');
+  for (const pattern of ['.worktrees/', '.artinarey.json', '.env.artinarey']) {
+    assert.ok(exclusion.includes(pattern), `missing exclude pattern: ${pattern}`);
+  }
+
+  output = '';
+  console.log = (s: unknown) => { output += `${String(s)}\n`; };
+  let secondCode: number;
+  try {
+    secondCode = await main(['init'], env, repo);
+  } finally {
+    console.log = original;
+  }
+  assert.equal(secondCode, 0, output);
+  assert.match(output, /global ignore/);
+  assert.equal(registry.projects.list().length, 1);
+  assert.equal(registry.worktrees.list(project.id).length, 1);
+  assert.deepEqual(findMarker(repo)?.marker, marker.marker);
+  registry.close();
 });
 
 test('release <worktree> --force frees a binding through the daemon', async () => {
