@@ -11,12 +11,12 @@
 
 Legend: ⬜ not started · 🟨 in progress · ✅ done · 🟥 blocked
 
-**Overall:** `█░░░░░░░░░░░░░░░░░` 1 of 9 milestones done · **Slice 1 (M0–M6):** 1 of 7 done
+**Overall:** `██░░░░░░░░░░░░░░░░` 2 of 9 milestones done · **Slice 1 (M0–M6):** 2 of 7 done
 
 | M | Goal | Estimate | Status | Part of |
 |---|---|---|---|---|
 | M0 | Spike: does the shim see the agent's folder? | 2 h | ✅ | Slice 1 |
-| M1 | Store, mail files, registry, daemon skeleton | 1–1.5 d | ⬜ | Slice 1 |
+| M1 | Store, mail files, registry, daemon skeleton | 1–1.5 d | ✅ | Slice 1 |
 | M2 | MCP shim, tools, identity by folder | 1 d | ⬜ | Slice 1 |
 | M3 | Worktree manager, home-worktree warnings, `run` | 1 d | ⬜ | Slice 1 |
 | M4 | Leases, git hook, pre-merge check | 1 d | ⬜ | Slice 1 |
@@ -620,20 +620,20 @@ Goal: confirm the working-directory identity (A1 c) with real tools before writi
 **Notes / blockers:**
 
 ### M1 · Store, mail, registry, daemon skeleton
-**Status:** ⬜ · **Estimate:** 1–1.5 d · **Depends on:** M0 · **Checks:** U13
+**Status:** ✅ · **Estimate:** 1–1.5 d · **Depends on:** M0 · **Checks:** U13
 
-- [ ] pnpm monorepo scaffold (TypeScript config, lint, test runner)
-- [ ] `core`: ULID ids, XDG path helpers, config loader
-- [ ] Store writer: atomic write (temp, fsync, rename), mail mode 0444, append-only journals, torn-line recovery
-- [ ] Mail schema and validation (required fields, 8 KB cap, secret tripwire, recipient rules)
-- [ ] Registry (SQLite): projects, worktrees, personas, bindings, sessions, moves
-- [ ] Index builder and `artinarey reindex`
-- [ ] Daemon skeleton: unix socket API, start/stop/status, single-instance lock
-- [ ] Test: 50 parallel `send_mail` give unique ids and none lost
-- [ ] Test: `kill -9` mid-write recovers cleanly
+- [x] pnpm monorepo scaffold (TypeScript config, lint, test runner)
+- [x] `core`: ULID ids, XDG path helpers, config loader
+- [x] Store writer: atomic write (temp, fsync, rename), mail mode 0444, append-only journals, torn-line recovery
+- [x] Mail schema and validation (required fields, 8 KB cap, secret tripwire, recipient rules)
+- [x] Registry (SQLite): projects, worktrees, personas, bindings, sessions, moves
+- [x] Index builder and `artinarey reindex`
+- [x] Daemon skeleton: unix socket API, start/stop/status, single-instance lock
+- [x] Test: 50 parallel `send_mail` give unique ids and none lost
+- [x] Test: `kill -9` mid-write recovers cleanly
 
 **Done when:** the two tests above pass.
-**Notes / blockers:**
+**Notes / blockers:** 41 tests pass; `pnpm test`, `pnpm typecheck`, `pnpm lint`, `pnpm build` all green. `better-sqlite3@13.2.0` ships prebuilt binaries, so no native build step is needed in CI. Implementation plan: `docs/superpowers/plans/2026-11-23-m1-foundation.md`.
 
 ### M2 · MCP shim, tools, identity by folder
 **Status:** ⬜ · **Estimate:** 1 d · **Depends on:** M1 · **Checks:** U11, U14
@@ -810,3 +810,5 @@ Add one line per working session: date, what moved, what is next.
 |---|---|---|
 | 2026-11-23 | Design finished: 15 of 15 questions answered (C3 a). `README.md`, `plan.md`, `logo.py` and the logo files created. | Run M0, the spike |
 | 2026-11-23 | Grilled the plan end to end; verified all 14 assumptions and closed all 3 open questions against official docs. Rewrote containment, approvals, toggle, liveness, vendor order and the API adapter. Added GPL-3.0 `LICENSE`. | Rewrite `README.md`; then run M0 |
+| 2026-11-23 | M0 spike passed all five checks; worktree identity and shared git metadata confirmed with real tools. Added Dependabot and CI checks. | Start M1 |
+| 2026-11-23 | M1 foundation implemented: pnpm monorepo, core store/mail/registry/index, daemon socket API, CLI reindex and daemon commands. 41 tests pass including the 50-way concurrency and kill -9 recovery gates. | M2 MCP shim and identity by folder |

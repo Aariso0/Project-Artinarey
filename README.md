@@ -15,7 +15,7 @@
 
 </div>
 
-> **Design settled, implementation unverified.** Nothing is installable yet. The full design, the evidence behind every decision, and the progress tracker live in [`plan.md`](plan.md).
+> **Design settled. Foundation implemented and tested; end-to-end behavior unverified.** Nothing is installable yet. The full design, the evidence behind every decision, and the progress tracker live in [`plan.md`](plan.md).
 
 ---
 
@@ -233,12 +233,12 @@ Any tool you start by hand with `artinarey run` still gets mail and tasks, as lo
 
 ## Progress
 
-`█░░░░░░░░░░░░░░░░░` **1 of 9 milestones. Design settled, implementation unverified.** The M0 spike passed on 2026-11-23; the throwaway shim was removed, so no product code has been written.
+`██░░░░░░░░░░░░░░░░` **2 of 9 milestones. Design settled, M1 foundation implemented and tested; end-to-end behavior unverified.** The M0 spike passed on 2026-11-23, then M1 added the store, mail, registry and daemon; no shim, adapter or window exists yet.
 
 | | Milestone | Status |
 |---|---|---|
 | M0 | Spike: can the MCP shim see the agent's folder? | ✅ |
-| M1 | Store, mail files, daemon | — |
+| M1 | Store, mail files, daemon | ✅ |
 | M2 | MCP shim and identity by folder | — |
 | M3 | Worktree manager and home-worktree warnings | — |
 | M4 | Leases and pre-merge check | — |
