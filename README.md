@@ -15,7 +15,7 @@
 
 </div>
 
-> **Design settled. Foundation and MCP shim implemented and tested; two-agent mail exchange verified in OpenCode.** Nothing is installable yet. The full design, the evidence behind every decision, and the progress tracker live in [`plan.md`](plan.md).
+> **Design settled. Foundation, MCP shim and worktree manager implemented and tested; two-agent mail exchange verified in OpenCode and the worktree lifecycle smoke-tested.** Nothing is installable yet. The full design, the evidence behind every decision, and the progress tracker live in [`plan.md`](plan.md).
 
 ---
 

@@ -11,7 +11,7 @@
 
 Legend: ⬜ not started · 🟨 in progress · ✅ done · 🟥 blocked
 
-**Overall:** `██░░░░░░░░░░░░░░░░` 2 of 9 milestones done · **Slice 1 (M0–M6):** 2 of 7 done
+**Overall:** `████░░░░░░░░░░░░░░` 4 of 9 milestones done · **Slice 1 (M0–M6):** 4 of 7 done
 
 | M | Goal | Estimate | Status | Part of |
 |---|---|---|---|---|
@@ -814,3 +814,5 @@ Add one line per working session: date, what moved, what is next.
 | 2026-11-23 | Grilled the plan end to end; verified all 14 assumptions and closed all 3 open questions against official docs. Rewrote containment, approvals, toggle, liveness, vendor order and the API adapter. Added GPL-3.0 `LICENSE`. | Rewrite `README.md`; then run M0 |
 | 2026-11-23 | M0 spike passed all five checks; worktree identity and shared git metadata confirmed with real tools. Added Dependabot and CI checks. | Start M1 |
 | 2026-11-23 | M1 foundation implemented: pnpm monorepo, core store/mail/registry/index, daemon socket API, CLI reindex and daemon commands. 41 tests pass including the 50-way concurrency and kill -9 recovery gates. | M2 MCP shim and identity by folder |
+| 2026-11-24 | M2 MCP shim implemented: stdio MCP server, folder-based identity, tools 1–7 and 13, roster and release rules, `connect opencode`. 69 tests pass and all four gates are green; two real OpenCode sessions in separate directories exchanged mail both ways. | M3 worktree manager |
+| 2026-11-24 | M3 worktree manager implemented: porcelain parser and reconciliation, `init`, `worktree new/adopt/list/remove` with port offsets and binding locks, home-worktree warnings, `run <vendor>` and `persona rehome`. 116 tests pass and all four gates are green; six-command CLI smoke check passed in a fresh temp repo with isolated XDG roots. | M4 leases and enforcement |
