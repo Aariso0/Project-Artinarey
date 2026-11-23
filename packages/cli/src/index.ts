@@ -3,9 +3,9 @@ import { createRequire } from 'node:module';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
-  atomicWrite, buildIndex, ensureExcludeBlock, findMarker, globalIgnoreCoverage,
-  listGitWorktrees, newId, openRegistry, projectStore, reconcileWorktrees, resolveRepo,
-  resolveXdgPaths, writeMarker,
+  atomicWrite, buildIndex, createWorktree, ensureExcludeBlock, findMarker, globalIgnoreCoverage,
+  listGitWorktrees, newId, openRegistry, planWorktree, projectStore, reconcileWorktrees,
+  resolveRepo, resolveXdgPaths, writeMarker,
 } from '@artinarey/core';
 import { callDaemon, daemonStatus, startDaemon, stopDaemon } from '@artinarey/daemon';
 
@@ -109,9 +109,54 @@ export async function main(
     }
   }
 
+  if (command === 'worktree' && args[0] === 'new') {
+    const name = args[1];
+    const yes = args.includes('--yes');
+    const baseIndex = args.indexOf('--base');
+    const base = baseIndex === -1 ? undefined : args[baseIndex + 1];
+    if (!name || name.startsWith('--') ||
+        (baseIndex !== -1 && (!base || base.startsWith('--')))) {
+      console.error('usage: artinarey worktree new <name> [--base REF] [--yes]');
+      return 2;
+    }
+    try {
+      const { root } = resolveRepo(cwd);
+      const marker = findMarker(cwd);
+      if (!marker) {
+        console.error('no .artinarey.json found; run artinarey init');
+        return 1;
+      }
+      const registry = openRegistry(resolveXdgPaths(env).registryFile);
+      try {
+        const project = registry.projects.get(marker.marker.project_id);
+        if (!project) {
+          console.error(`unknown project: ${marker.marker.project_id}`);
+          return 1;
+        }
+        const plan = planWorktree(registry, project.id, root, name, base);
+        if (!yes) {
+          console.log('C4: Artinarey will create the following in the new worktree:');
+          console.log('  .artinarey.json');
+          console.log(`  .env.artinarey with ARTINAREY_PORT_OFFSET=${plan.portOffset}`);
+          for (const file of plan.copy) console.log(`  copy ${file} from ${root}`);
+          console.log('Re-run with --yes to confirm.');
+          return 2;
+        }
+        const worktree = createWorktree(registry, project.storeDir, plan);
+        console.log(`created ${worktree.path} on ${worktree.branch} (port offset ${worktree.portOffset})`);
+        return 0;
+      } finally {
+        registry.close();
+      }
+    } catch (err) {
+      console.error(`worktree new failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
   if (command === 'worktree') {
     if (args[0] !== 'list') {
-      console.error('usage: artinarey worktree list');
+      console.error('usage: artinarey worktree new <name> [--base REF] [--yes] | list');
       return 2;
     }
     try {

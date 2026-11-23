@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
@@ -27,6 +27,44 @@ function envFor(dir: string): NodeJS.ProcessEnv {
     XDG_RUNTIME_DIR: join(dir, 'runtime'),
     PATH: process.env.PATH ?? '',
   };
+}
+
+function gitSucceeds(args: string[], cwd: string): boolean {
+  try {
+    execFileSync('git', args, { cwd, stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function seededRepo(dir: string): {
+  repo: string; env: NodeJS.ProcessEnv; registry: ReturnType<typeof openRegistry>;
+  project: { id: string; storeDir: string };
+} {
+  const repo = join(dir, 'repo');
+  mkdirSync(repo, { recursive: true });
+  execFileSync('git', ['init', '-q'], { cwd: repo });
+  execFileSync('git', [
+    '-c', 'user.name=Tester', '-c', 'user.email=tester@example.com',
+    'commit', '--allow-empty', '-q', '-m', 'init',
+  ], { cwd: repo });
+  const env = envFor(dir);
+  const registry = openRegistry(resolveXdgPaths(env).registryFile);
+  const project = registry.projects.create({
+    name: 'Seed', repoCommonDir: join(repo, '.git'), storeDir: join(dir, 'data', 'store'),
+  });
+  const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'],
+    { cwd: repo, encoding: 'utf8' }).trim();
+  const rootId = newId();
+  registry.worktrees.upsert({
+    id: rootId, projectId: project.id, path: repo, branch, portOffset: 0,
+  });
+  writeMarker(repo, project.id, rootId);
+  for (const file of ['.env', '.env.local']) {
+    writeFileSync(join(repo, file), `${file}=root\n`);
+  }
+  return { repo, env, registry, project };
 }
 
 test('connect opencode writes an MCP entry and allow rules without clobbering config', async () => {
@@ -225,4 +263,81 @@ test('release <worktree> --force frees a binding through the daemon', async () =
     await server.close();
     registry.close();
   }
+});
+
+test('worktree new prints the C4 warning and changes nothing without --yes', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const target = join(repo, '.worktrees', 'preview');
+
+  let output = '';
+  let errors = '';
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (s: unknown) => { output += `${String(s)}\n`; };
+  console.error = (s: unknown) => { errors += `${String(s)}\n`; };
+  let code: number;
+  try {
+    code = await main(['worktree', 'new', 'preview'], env, repo);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+
+  assert.equal(code, 2, errors);
+  assert.match(output, /C4/);
+  assert.match(output, /ARTINAREY_PORT_OFFSET=10/);
+  assert.match(output, /\.env/);
+  assert.match(output, /\.env\.local/);
+  assert.match(output, /--yes/);
+  assert.equal(existsSync(target), false);
+  assert.equal(existsSync(join(target, '.artinarey.json')), false);
+  assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', 'refs/heads/artinarey/preview'], repo),
+    false);
+  assert.equal(registry.worktrees.list(project.id).length, 1);
+  registry.close();
+});
+
+test('worktree new --yes creates the worktree with marker, env files and offset', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const target = join(repo, '.worktrees', 'auth');
+
+  let output = '';
+  let errors = '';
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (s: unknown) => { output += `${String(s)}\n`; };
+  console.error = (s: unknown) => { errors += `${String(s)}\n`; };
+  let code: number;
+  try {
+    code = await main(['worktree', 'new', 'auth', '--yes'], env, repo);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+
+  assert.equal(code, 0, `${errors}${output}`);
+  assert.ok(existsSync(target));
+  assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', 'refs/heads/artinarey/auth'], repo),
+    true);
+  assert.match(output, /created/);
+
+  const marker = findMarker(target);
+  assert.equal(marker?.marker.project_id, project.id);
+  const row = registry.worktrees.list(project.id).find((wt) => wt.path === target);
+  assert.ok(row, 'new worktree not registered');
+  assert.equal(row.branch, 'artinarey/auth');
+  assert.equal(row.portOffset, 10);
+  assert.equal(marker?.marker.worktree_id, row.id);
+
+  const envFile = join(target, '.env.artinarey');
+  assert.equal(readFileSync(envFile, 'utf8'), 'ARTINAREY_PORT_OFFSET=10\n');
+  assert.equal(statSync(envFile).mode & 0o777, 0o600);
+  for (const file of ['.env', '.env.local']) {
+    const copied = join(target, file);
+    assert.equal(readFileSync(copied, 'utf8'), `${file}=root\n`);
+    assert.equal(statSync(copied).mode & 0o777, 0o600);
+  }
+  registry.close();
 });

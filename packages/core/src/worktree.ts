@@ -2,6 +2,9 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { ArtinareyError } from './errors.ts';
+import { writeMarker } from './identity.ts';
+import { newId } from './ids.ts';
 import type { Registry, Worktree } from './registry.ts';
 
 export type GitWorktree = {
@@ -225,5 +228,143 @@ export function globalIgnoreCoverage(repoDir: string): {
     }
   } finally {
     rmSync(probe, { recursive: true, force: true });
+  }
+}
+
+export type WorktreePlan = {
+  path: string;
+  branch: string;
+  base: string;
+  portOffset: number;
+  copy: string[];
+  envFile: string;
+};
+
+const ENV_FILES = ['.env', '.env.local'];
+
+/** Exit status only: git prints diagnostics to stderr for ref lookups. */
+function gitSucceeds(cwd: string, args: string[]): boolean {
+  try {
+    execFileSync('git', args, { cwd, stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function defaultBase(repoRoot: string): string {
+  try {
+    return execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Read-only preflight. Every rejection happens before a directory, branch, marker,
+ * env file or registry row can exist.
+ */
+export function planWorktree(
+  registry: Registry,
+  projectId: string,
+  repoRoot: string,
+  name: string,
+  base?: string,
+): WorktreePlan {
+  if (!name || name.includes('/')) {
+    throw new ArtinareyError('INVALID_INPUT', 'name must be a single path segment');
+  }
+  const branch = `artinarey/${name}`;
+  const path = join(repoRoot, '.worktrees', name);
+  if (existsSync(path)) {
+    throw new ArtinareyError('INVALID_INPUT', `target directory already exists: ${path}`);
+  }
+  if (gitSucceeds(repoRoot, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`])) {
+    throw new ArtinareyError('INVALID_INPUT', `branch already exists: ${branch}`);
+  }
+  const resolvedBase = base ?? defaultBase(repoRoot);
+  if (resolvedBase === '' ||
+      !gitSucceeds(repoRoot, ['rev-parse', '--verify', resolvedBase])) {
+    throw new ArtinareyError('INVALID_INPUT', `base ref does not exist: ${resolvedBase}`);
+  }
+
+  const existingCount = reconcileWorktrees(registry, projectId, listGitWorktrees(repoRoot)).length;
+  return {
+    path,
+    branch,
+    base: resolvedBase,
+    portOffset: existingCount * 10,
+    copy: ENV_FILES.filter((file) => existsSync(join(repoRoot, file))),
+    envFile: join(path, '.env.artinarey'),
+  };
+}
+
+/** Best-effort cleanup: prefer git's own removal, never `--force`. */
+function discardGitWorktree(repoRoot: string, path: string): void {
+  try {
+    execFileSync('git', ['worktree', 'remove', path], { cwd: repoRoot, stdio: 'ignore' });
+  } catch {
+    try {
+      execFileSync('git', ['worktree', 'prune'], { cwd: repoRoot, stdio: 'ignore' });
+    } catch {
+      // Nothing left to prune.
+    }
+    if (existsSync(path)) rmSync(path, { recursive: true, force: true });
+  }
+}
+
+/** Apply a previously planned and confirmed worktree creation. */
+export function createWorktree(registry: Registry, storeDir: string, plan: WorktreePlan): Worktree {
+  const project = registry.projects.list().find((p) => p.storeDir === storeDir);
+  if (!project) {
+    throw new ArtinareyError('NOT_FOUND', `unknown project store: ${storeDir}`);
+  }
+  const repoRoot = dirname(dirname(plan.path));
+  ensureExcludeBlock(resolveRepo(repoRoot).commonDir);
+
+  const id = newId();
+  try {
+    execFileSync('git', ['worktree', 'add', plan.path, '-b', plan.branch, plan.base], {
+      cwd: repoRoot,
+      stdio: 'ignore',
+    });
+  } catch (err) {
+    discardGitWorktree(repoRoot, plan.path);
+    throw err;
+  }
+
+  const createdFiles: string[] = [];
+  let registered = false;
+  try {
+    const marker = join(plan.path, '.artinarey.json');
+    writeMarker(plan.path, project.id, id);
+    createdFiles.push(marker);
+    writeFileSync(plan.envFile, `ARTINAREY_PORT_OFFSET=${plan.portOffset}\n`, { mode: 0o600 });
+    createdFiles.push(plan.envFile);
+    for (const file of plan.copy) {
+      const target = join(plan.path, file);
+      writeFileSync(target, readFileSync(join(repoRoot, file)), { mode: 0o600 });
+      createdFiles.push(target);
+    }
+    registry.worktrees.upsert({
+      id,
+      projectId: project.id,
+      path: plan.path,
+      branch: plan.branch,
+      portOffset: plan.portOffset,
+    });
+    registered = true;
+    const row = registry.worktrees.list(project.id).find((wt) => wt.id === id);
+    if (!row) throw new ArtinareyError('NOT_FOUND', `worktree not registered: ${id}`);
+    return row;
+  } catch (err) {
+    for (const file of createdFiles) rmSync(file, { recursive: true, force: true });
+    discardGitWorktree(repoRoot, plan.path);
+    if (registered) registry.worktrees.delete(id);
+    throw err;
   }
 }

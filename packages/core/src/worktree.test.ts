@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -35,6 +35,48 @@ function withGlobalConfig(file: string, run: () => void): void {
 
 function count(text: string, needle: string): number {
   return text.split(needle).length - 1;
+}
+
+function gitSucceeds(args: string[], cwd: string): boolean {
+  try {
+    execFileSync('git', args, { cwd, stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function commit(dir: string, message: string): void {
+  git(['-c', 'user.name=Tester', '-c', 'user.email=tester@example.com',
+    'commit', '--allow-empty', '-q', '-m', message], dir);
+}
+
+function newProjectRepo(): {
+  dir: string; repo: string; storeDir: string; registry: core.Registry; project: core.Project;
+} {
+  const dir = mkdtempSync(join(tmpdir(), 'artinarey-new-'));
+  const repo = join(dir, 'repo');
+  mkdirSync(repo);
+  git(['init', '-q'], repo);
+  commit(repo, 'init');
+  const storeDir = join(dir, 'store');
+  const registry = core.openRegistry(join(dir, 'registry.sqlite'));
+  const project = registry.projects.create({
+    name: 'New', repoCommonDir: join(repo, '.git'), storeDir,
+  });
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], repo);
+  registry.worktrees.upsert({
+    id: core.newId(), projectId: project.id, path: repo, branch, portOffset: 0,
+  });
+  return { dir, repo, storeDir, registry, project };
+}
+
+function expectInvalidInput(run: () => unknown, label: string): void {
+  assert.throws(run, (err: unknown) => {
+    assert.ok(err instanceof core.ArtinareyError, `${label}: expected ArtinareyError`);
+    assert.equal(err.code, 'INVALID_INPUT');
+    return true;
+  }, label);
 }
 
 test('parses a normal worktree block', () => {
@@ -286,5 +328,111 @@ test('reconcileWorktrees matches by path then branch, then reports missing and u
   } finally {
     registry.close();
     rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('planWorktree rejects bad input before creating any artifact', () => {
+  const { dir, repo, registry, project } = newProjectRepo();
+  try {
+    mkdirSync(join(repo, '.worktrees', 'taken'), { recursive: true });
+    git(['branch', 'artinarey/existing'], repo);
+
+    expectInvalidInput(() => core.planWorktree(registry, project.id, repo, 'bad/name'),
+      'name containing a slash');
+    expectInvalidInput(() => core.planWorktree(registry, project.id, repo, 'taken'),
+      'existing target directory');
+    expectInvalidInput(() => core.planWorktree(registry, project.id, repo, 'existing'),
+      'existing branch');
+    expectInvalidInput(() => core.planWorktree(registry, project.id, repo, 'fresh', 'no/such/base'),
+      'missing base ref');
+
+    assert.equal(existsSync(join(repo, '.worktrees', 'fresh')), false);
+    assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', 'refs/heads/artinarey/fresh'], repo),
+      false);
+    assert.equal(registry.worktrees.list(project.id).length, 1);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('planWorktree builds a plan from existing worktrees and real env files', () => {
+  const { dir, repo, registry, project } = newProjectRepo();
+  try {
+    for (const file of ['.env', '.env.local', '.env.artinarey']) {
+      writeFileSync(join(repo, file), `${file}=kept\n`);
+    }
+    git(['worktree', 'add', '-q', '-b', 'artinarey/extra', join(dir, 'extra')], repo);
+
+    const plan = core.planWorktree(registry, project.id, repo, 'fresh');
+
+    assert.equal(plan.path, join(repo, '.worktrees', 'fresh'));
+    assert.equal(plan.branch, 'artinarey/fresh');
+    assert.equal(plan.base, git(['rev-parse', '--abbrev-ref', 'HEAD'], repo));
+    assert.equal(plan.portOffset, 20);
+    assert.deepEqual(plan.copy, ['.env', '.env.local']);
+    assert.equal(plan.envFile, join(plan.path, '.env.artinarey'));
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('createWorktree adds the git worktree, writes marker and env, and registers a row', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    for (const file of ['.env', '.env.local']) {
+      writeFileSync(join(repo, file), `${file}=copied\n`);
+    }
+    const plan = core.planWorktree(registry, project.id, repo, 'auth');
+
+    const worktree = core.createWorktree(registry, storeDir, plan);
+
+    assert.equal(worktree.projectId, project.id);
+    assert.equal(worktree.path, plan.path);
+    assert.equal(worktree.branch, plan.branch);
+    assert.equal(worktree.portOffset, plan.portOffset);
+    assert.equal(listGitWorktrees(repo).some((wt) => wt.path === plan.path), true);
+    assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', `refs/heads/${plan.branch}`], repo),
+      true);
+
+    const marker = core.findMarker(plan.path);
+    assert.equal(marker?.marker.project_id, project.id);
+    assert.equal(marker?.marker.worktree_id, worktree.id);
+
+    assert.equal(readFileSync(plan.envFile, 'utf8'), 'ARTINAREY_PORT_OFFSET=10\n');
+    assert.equal(statSync(plan.envFile).mode & 0o777, 0o600);
+    for (const file of plan.copy) {
+      const copied = join(plan.path, file);
+      assert.equal(readFileSync(copied, 'utf8'), readFileSync(join(repo, file), 'utf8'));
+      assert.equal(statSync(copied).mode & 0o777, 0o600);
+    }
+
+    const row = registry.worktrees.list(project.id).find((wt) => wt.id === worktree.id);
+    assert.deepEqual(row, worktree);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('createWorktree rolls back a failed write without registering the worktree', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    mkdirSync(join(repo, '.env.artinarey'));
+    writeFileSync(join(repo, '.env.artinarey', 'keep'), 'tracked\n');
+    git(['add', '.'], repo);
+    commit(repo, 'add blocker');
+    const plan = core.planWorktree(registry, project.id, repo, 'blocked');
+
+    assert.throws(() => core.createWorktree(registry, storeDir, plan));
+
+    assert.equal(existsSync(plan.path), false);
+    assert.equal(listGitWorktrees(repo).some((wt) => wt.path === plan.path), false);
+    assert.equal(registry.worktrees.list(project.id).length, 1);
+    assert.equal(existsSync(join(plan.path, '.artinarey.json')), false);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
