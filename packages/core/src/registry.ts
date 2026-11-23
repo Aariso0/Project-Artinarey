@@ -19,6 +19,7 @@ export type Worktree = {
   path: string;
   branch: string | null;
   createdAt: string;
+  portOffset: number;
 };
 
 export type Persona = {
@@ -51,7 +52,8 @@ export type MoveEvent = {
 type ProjectInput = Pick<Project, 'name' | 'repoCommonDir' | 'storeDir'>;
 type PersonaInput = Pick<Persona, 'projectId' | 'role' | 'name'> &
   Partial<Pick<Persona, 'vendor' | 'lastVendorSessionId'>>;
-type WorktreeInput = Pick<Worktree, 'id' | 'projectId' | 'path' | 'branch'>;
+type WorktreeInput = Pick<Worktree, 'id' | 'projectId' | 'path' | 'branch'> &
+  Partial<Pick<Worktree, 'portOffset'>>;
 type SessionInput = Omit<SessionEvent, 'id' | 'endedAt'> & Partial<Pick<SessionEvent, 'endedAt'>>;
 type MoveInput = Omit<MoveEvent, 'id'>;
 
@@ -70,6 +72,7 @@ const SCHEMA = `
     path TEXT NOT NULL,
     branch TEXT,
     created_at TEXT NOT NULL,
+    port_offset INTEGER NOT NULL DEFAULT 0,
     UNIQUE(project_id, path)
   );
   CREATE TABLE IF NOT EXISTS personas (
@@ -110,6 +113,7 @@ type ProjectRow = {
 };
 type WorktreeRow = {
   id: string; project_id: string; path: string; branch: string | null; created_at: string;
+  port_offset: number;
 };
 type PersonaRow = {
   id: string; project_id: string; role: string; name: string;
@@ -132,7 +136,7 @@ function toProject(r: ProjectRow): Project {
 function toWorktree(r: WorktreeRow): Worktree {
   return {
     id: r.id, projectId: r.project_id, path: r.path,
-    branch: r.branch, createdAt: r.created_at,
+    branch: r.branch, createdAt: r.created_at, portOffset: r.port_offset,
   };
 }
 function toPersona(r: PersonaRow): Persona {
@@ -163,6 +167,7 @@ export type Registry = {
   worktrees: {
     upsert(input: WorktreeInput): void;
     list(projectId: string): Worktree[];
+    delete(id: string): void;
   };
   personas: {
     create(input: PersonaInput): Persona;
@@ -191,6 +196,10 @@ export function openRegistry(file: string): Registry {
   const db = new Database(file);
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
+  const columns = db.pragma('table_info(worktrees)') as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === 'port_offset')) {
+    db.exec('ALTER TABLE worktrees ADD COLUMN port_offset INTEGER NOT NULL DEFAULT 0');
+  }
 
   return {
     projects: {
@@ -211,14 +220,19 @@ export function openRegistry(file: string): Registry {
     },
     worktrees: {
       upsert(input) {
-        db.prepare(`INSERT INTO worktrees (id, project_id, path, branch, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET path = excluded.path, branch = excluded.branch`)
-          .run(input.id, input.projectId, input.path, input.branch, new Date().toISOString());
+        db.prepare(`INSERT INTO worktrees (id, project_id, path, branch, created_at, port_offset)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET path = excluded.path, branch = excluded.branch,
+                      port_offset = excluded.port_offset`)
+          .run(input.id, input.projectId, input.path, input.branch, new Date().toISOString(),
+            input.portOffset ?? 0);
       },
       list(projectId) {
         return (db.prepare('SELECT * FROM worktrees WHERE project_id = ? ORDER BY id')
           .all(projectId) as WorktreeRow[]).map(toWorktree);
+      },
+      delete(id) {
+        db.prepare('DELETE FROM worktrees WHERE id = ?').run(id);
       },
     },
     personas: {

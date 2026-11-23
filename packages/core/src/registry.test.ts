@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import { ArtinareyError } from './errors.ts';
 import { isUlid, newId } from './ids.ts';
 import { openRegistry } from './registry.ts';
@@ -9,6 +10,35 @@ import { openRegistry } from './registry.ts';
 function openTempRegistry() {
   const file = join(tmpdir(), `artinarey-registry-${newId()}.sqlite`);
   return openRegistry(file);
+}
+
+/** Writes a database with the worktrees schema as it was before port offsets. */
+function createLegacyRegistry(file: string) {
+  const projectId = newId();
+  const worktreeId = newId();
+  const db = new Database(file);
+  db.exec(`
+    CREATE TABLE projects (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, repo_common_dir TEXT NOT NULL,
+      store_dir TEXT NOT NULL, created_at TEXT NOT NULL, schema_version INTEGER NOT NULL
+    );
+    CREATE TABLE worktrees (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id),
+      path TEXT NOT NULL,
+      branch TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(project_id, path)
+    );
+  `);
+  db.prepare(`INSERT INTO projects (id, name, repo_common_dir, store_dir, created_at, schema_version)
+              VALUES (?, ?, ?, ?, ?, 1)`)
+    .run(projectId, 'Legacy', '/legacy/.git', '/legacy/store', '2026-11-01T00:00:00Z');
+  db.prepare(`INSERT INTO worktrees (id, project_id, path, branch, created_at)
+              VALUES (?, ?, ?, ?, ?)`)
+    .run(worktreeId, projectId, '/legacy/wt', 'main', '2026-11-01T00:00:00Z');
+  db.close();
+  return { projectId, worktreeId };
 }
 
 test('projects: create assigns an id, get and list round-trip', () => {
@@ -116,4 +146,57 @@ test('registry data survives close and reopen', () => {
   const second = openRegistry(file);
   assert.equal(second.projects.get(project.id)?.name, 'Persistent');
   second.close();
+});
+
+test('worktrees: legacy databases gain port_offset and existing rows read 0', () => {
+  const file = join(tmpdir(), `artinarey-registry-${newId()}.sqlite`);
+  const { projectId, worktreeId } = createLegacyRegistry(file);
+
+  const db = openRegistry(file);
+  assert.deepEqual(db.worktrees.list(projectId), [{
+    id: worktreeId, projectId, path: '/legacy/wt', branch: 'main',
+    createdAt: '2026-11-01T00:00:00Z', portOffset: 0,
+  }]);
+  db.close();
+
+  // Reopening a migrated database is a no-op.
+  const reopened = openRegistry(file);
+  assert.equal(reopened.worktrees.list(projectId)[0]?.portOffset, 0);
+  reopened.close();
+
+  const raw = new Database(file, { readonly: true });
+  const columns = raw.pragma('table_info(worktrees)') as Array<{
+    name: string; type: string; notnull: number; dflt_value: string | null;
+  }>;
+  const column = columns.find((c) => c.name === 'port_offset');
+  assert.ok(column, 'port_offset column exists');
+  assert.equal(column.type, 'INTEGER');
+  assert.equal(column.notnull, 1);
+  assert.equal(column.dflt_value, '0');
+  raw.close();
+});
+
+test('worktrees: portOffset defaults to 0 and round-trips through upsert', () => {
+  const db = openTempRegistry();
+  const project = db.projects.create({ name: 'Alpha', repoCommonDir: '/r/a/.git', storeDir: '/d/a' });
+  const id = newId();
+  db.worktrees.upsert({ id, projectId: project.id, path: '/w/a', branch: 'main' });
+  assert.equal(db.worktrees.list(project.id)[0]?.portOffset, 0);
+
+  db.worktrees.upsert({ id, projectId: project.id, path: '/w/a', branch: 'main', portOffset: 30 });
+  assert.equal(db.worktrees.list(project.id)[0]?.portOffset, 30);
+  db.close();
+});
+
+test('worktrees: delete removes only the requested row', () => {
+  const db = openTempRegistry();
+  const project = db.projects.create({ name: 'Alpha', repoCommonDir: '/r/a/.git', storeDir: '/d/a' });
+  const a = newId();
+  const b = newId();
+  db.worktrees.upsert({ id: a, projectId: project.id, path: '/w/a', branch: 'a' });
+  db.worktrees.upsert({ id: b, projectId: project.id, path: '/w/b', branch: 'b' });
+
+  db.worktrees.delete(a);
+  assert.deepEqual(db.worktrees.list(project.id).map((wt) => wt.id), [b]);
+  db.close();
 });
