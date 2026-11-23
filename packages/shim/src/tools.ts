@@ -16,7 +16,7 @@ const mailKinds = [
   'task', 'question', 'status', 'decision', 'blocker', 'receipt', 'note',
 ] as const;
 
-function toMcp(reply: ShimReply) {
+export function toMcp(reply: ShimReply) {
   return {
     content: [{ type: 'text' as const, text: reply.text }],
     isError: reply.isError,

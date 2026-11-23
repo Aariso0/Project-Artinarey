@@ -1,5 +1,6 @@
-import { chmodSync, existsSync, unlinkSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
+import { dirname } from 'node:path';
 import { dispatchTool, isToolMethod, releaseConnection, type RpcContext } from './tools.ts';
 
 export type RpcRequest = { id: string; method: string; params?: unknown };
@@ -67,6 +68,7 @@ export function createRpcServer(
   const rpcServer: RpcServer = {
     socketPath,
     async start() {
+      mkdirSync(dirname(socketPath), { recursive: true });
       if (existsSync(socketPath)) unlinkSync(socketPath);
       server = createServer((socket) => {
         sockets.add(socket);
