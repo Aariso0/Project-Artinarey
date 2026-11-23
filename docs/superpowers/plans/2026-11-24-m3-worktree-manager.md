@@ -92,6 +92,8 @@ Run `pnpm test`, then commit `feat(cli): init registers a project and writes the
 
 **Files:**
 - Modify: `packages/core/src/worktree.ts`, `packages/core/src/worktree.test.ts`
+- Modify: `packages/core/src/identity.ts`, `packages/core/src/identity.test.ts`
+- Modify: `packages/daemon/src/tools.test.ts`
 - Modify: `packages/cli/src/index.ts`, `packages/cli/src/connect.test.ts`
 
 **Interfaces:**
