@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { ArtinareyError } from './errors.ts';
-import { writeMarker } from './identity.ts';
+import { auditWorktreeRemoval, MARKER_FILE, writeMarker } from './identity.ts';
 import { newId } from './ids.ts';
 import type { Registry, Worktree } from './registry.ts';
 
@@ -366,5 +366,108 @@ export function createWorktree(registry: Registry, storeDir: string, plan: Workt
     discardGitWorktree(repoRoot, plan.path);
     if (registered) registry.worktrees.delete(id);
     throw err;
+  }
+}
+
+/** Real paths, falling back to lexical ones for directories git can no longer see. */
+function samePath(a: string, b: string): boolean {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return resolve(a) === resolve(b);
+  }
+}
+
+/** Adopt an already-created git worktree that belongs to this project's repository. */
+export function adoptWorktree(
+  registry: Registry,
+  storeDir: string,
+  projectId: string,
+  path: string,
+): Worktree {
+  const project = registry.projects.get(projectId);
+  if (!project) throw new ArtinareyError('NOT_FOUND', `unknown project: ${projectId}`);
+  const target = resolve(path);
+  if (registry.worktrees.list(projectId).some((row) => samePath(row.path, target))) {
+    throw new ArtinareyError('INVALID_INPUT', `worktree already registered: ${target}`);
+  }
+  if (!gitSucceeds(target, ['rev-parse', '--is-inside-work-tree'])) {
+    throw new ArtinareyError('INVALID_INPUT', `not a git worktree: ${target}`);
+  }
+
+  let commonDir: string;
+  let gitWorktree: GitWorktree | undefined;
+  try {
+    commonDir = resolveRepo(target).commonDir;
+    gitWorktree = listGitWorktrees(target).find((row) => samePath(row.path, target));
+  } catch {
+    throw new ArtinareyError('INVALID_INPUT', `not a git worktree: ${target}`);
+  }
+  if (!samePath(commonDir, project.repoCommonDir) || !gitWorktree) {
+    throw new ArtinareyError('INVALID_INPUT', `worktree belongs to another repository: ${target}`);
+  }
+
+  ensureExcludeBlock(project.repoCommonDir);
+  const id = newId();
+  try {
+    writeMarker(target, projectId, id);
+    registry.worktrees.upsert({
+      id, projectId, path: target, branch: gitWorktree.branch, portOffset: 0,
+    });
+  } catch (err) {
+    rmSync(join(target, MARKER_FILE), { force: true });
+    throw err;
+  }
+  const row = registry.worktrees.list(projectId).find((wt) => wt.id === id);
+  if (!row) throw new ArtinareyError('NOT_FOUND', `worktree not registered: ${id}`);
+  return row;
+}
+
+/**
+ * Remove a managed worktree without ever forcing git or deleting a branch. Session
+ * history goes with the worktree so the foreign-key-constrained row can be deleted.
+ */
+export function removeWorktree(registry: Registry, projectId: string, id: string): void {
+  const worktree = registry.worktrees.list(projectId).find((row) => row.id === id);
+  if (!worktree) throw new ArtinareyError('NOT_FOUND', `unknown worktree: ${id}`);
+  if (registry.bindings.forWorktree(id)) {
+    throw new ArtinareyError('INVALID_INPUT', `worktree is bound to a persona: ${id}`);
+  }
+
+  const project = registry.projects.get(projectId);
+  const sessionsRemoved = registry.sessions.list(projectId)
+    .filter((session) => session.worktreeId === id).length;
+  // Git refuses an unclean worktree without --force; drop only artinarey's own files.
+  for (const file of [MARKER_FILE, '.env.artinarey', ...ENV_FILES]) {
+    rmSync(join(worktree.path, file), { recursive: true, force: true });
+  }
+  execFileSync('git', ['worktree', 'remove', worktree.path], {
+    cwd: worktree.path, stdio: 'ignore',
+  });
+  registry.sessions.deleteForWorktree(id);
+  registry.worktrees.delete(id);
+  if (project) auditWorktreeRemoval(project.storeDir, id, sessionsRemoved);
+}
+
+/** Lock/unlock are best-effort: plain temp directories are not git worktrees. */
+export function lockGitWorktree(markerDir: string, reason: string): boolean {
+  try {
+    execFileSync('git', ['worktree', 'lock', '--reason', reason, markerDir], {
+      cwd: markerDir, stdio: 'ignore',
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function unlockGitWorktree(markerDir: string): boolean {
+  try {
+    execFileSync('git', ['worktree', 'unlock', markerDir], {
+      cwd: markerDir, stdio: 'ignore',
+    });
+    return true;
+  } catch {
+    return false;
   }
 }

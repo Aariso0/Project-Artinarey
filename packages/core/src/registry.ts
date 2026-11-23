@@ -182,6 +182,7 @@ export type Registry = {
   sessions: {
     append(event: SessionInput): void;
     list(projectId: string): SessionEvent[];
+    deleteForWorktree(worktreeId: string): void;
   };
   moves: {
     append(event: MoveInput): void;
@@ -285,6 +286,9 @@ export function openRegistry(file: string): Registry {
       list(projectId) {
         return (db.prepare('SELECT * FROM sessions WHERE project_id = ? ORDER BY id')
           .all(projectId) as SessionRow[]).map(toSession);
+      },
+      deleteForWorktree(worktreeId) {
+        db.prepare('DELETE FROM sessions WHERE worktree_id = ?').run(worktreeId);
       },
     },
     moves: {

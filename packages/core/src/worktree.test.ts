@@ -436,3 +436,175 @@ test('createWorktree rolls back a failed write without registering the worktree'
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('adoptWorktree registers an unmanaged git worktree with its porcelain branch and marker', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    const external = join(dir, 'vendor-wt');
+    git(['worktree', 'add', '-q', '-b', 'artinarey/adopted', external], repo);
+
+    const adopted = core.adoptWorktree(registry, storeDir, project.id, external);
+
+    assert.equal(adopted.projectId, project.id);
+    assert.equal(adopted.path, external);
+    assert.equal(adopted.branch, 'artinarey/adopted');
+    assert.equal(adopted.portOffset, 0);
+    const marker = core.findMarker(external);
+    assert.equal(marker?.marker.project_id, project.id);
+    assert.equal(marker?.marker.worktree_id, adopted.id);
+    assert.equal(registry.worktrees.list(project.id).length, 2);
+
+    expectInvalidInput(
+      () => core.adoptWorktree(registry, storeDir, project.id, external),
+      'already registered worktree',
+    );
+    assert.equal(registry.worktrees.list(project.id).length, 2);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('adoptWorktree refuses a plain directory and a worktree of another repository', () => {
+  const { dir, storeDir, registry, project } = newProjectRepo();
+  try {
+    const plain = join(dir, 'plain');
+    mkdirSync(plain);
+    expectInvalidInput(
+      () => core.adoptWorktree(registry, storeDir, project.id, plain),
+      'plain directory',
+    );
+
+    const otherRepo = join(dir, 'other');
+    mkdirSync(otherRepo);
+    git(['init', '-q'], otherRepo);
+    commit(otherRepo, 'init');
+    const foreign = join(dir, 'foreign-wt');
+    git(['worktree', 'add', '-q', '-b', 'other/branch', foreign], otherRepo);
+    expectInvalidInput(
+      () => core.adoptWorktree(registry, storeDir, project.id, foreign),
+      'worktree of another repository',
+    );
+    assert.equal(registry.worktrees.list(project.id).length, 1);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('removeWorktree refuses a bound worktree without touching the branch or binding', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    const target = join(dir, 'bound');
+    git(['worktree', 'add', '-q', '-b', 'artinarey/bound', target], repo);
+    const worktree = core.adoptWorktree(registry, storeDir, project.id, target);
+    const persona = core.createPersona(registry, storeDir, project.id, 'dev-bound', 'Bound');
+    registry.bindings.bind(persona, worktree.id);
+
+    expectInvalidInput(
+      () => core.removeWorktree(registry, project.id, worktree.id),
+      'bound worktree',
+    );
+
+    assert.equal(existsSync(target), true);
+    assert.equal(gitSucceeds(
+      ['show-ref', '--verify', '--quiet', 'refs/heads/artinarey/bound'], repo,
+    ), true);
+    assert.equal(registry.bindings.forWorktree(worktree.id)?.id, persona);
+    assert.equal(registry.worktrees.list(project.id).some((row) => row.id === worktree.id), true);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('removeWorktree after release drops git worktree, sessions and only its registry row, keeping the branch', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    const target = join(repo, '.worktrees', 'gone');
+    git(['worktree', 'add', '-q', '-b', 'artinarey/gone', target], repo);
+    const worktree = core.adoptWorktree(registry, storeDir, project.id, target);
+    const rootId = registry.worktrees.list(project.id).find((row) => row.path === repo)?.id;
+    assert.ok(rootId);
+
+    writeFileSync(join(target, '.env.artinarey'), 'ARTINAREY_PORT_OFFSET=10\n');
+    writeFileSync(join(target, '.env'), 'SECRET=copied\n');
+    const persona = core.createPersona(registry, storeDir, project.id, 'dev-gone', 'Gone');
+    registry.bindings.bind(persona, worktree.id);
+    for (const minute of ['01', '02']) {
+      registry.sessions.append({
+        projectId: project.id, worktreeId: worktree.id, personaId: persona,
+        vendor: 'opencode', startedAt: `2026-11-24T10:${minute}:00Z`,
+      });
+    }
+    registry.sessions.append({
+      projectId: project.id, worktreeId: rootId, personaId: persona,
+      vendor: 'opencode', startedAt: '2026-11-24T11:00:00Z',
+    });
+
+    assert.equal(core.lockGitWorktree(target, 'dev-gone'), true);
+    core.releasePersona(registry, storeDir, persona);
+    assert.equal(listGitWorktrees(repo).find((row) => row.path === target)?.locked, false);
+
+    core.removeWorktree(registry, project.id, worktree.id);
+
+    assert.equal(existsSync(target), false);
+    assert.equal(listGitWorktrees(repo).some((row) => row.path === target), false);
+    assert.equal(gitSucceeds(
+      ['show-ref', '--verify', '--quiet', 'refs/heads/artinarey/gone'], repo,
+    ), true);
+    assert.deepEqual(registry.worktrees.list(project.id).map((row) => row.id), [rootId]);
+    assert.deepEqual(registry.sessions.list(project.id).map((s) => s.worktreeId), [rootId]);
+    const events = readFileSync(join(storeDir, 'events', 'audit.jsonl'), 'utf8')
+      .trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+    const removal = events.find((event) => event.type === 'worktree_removed');
+    assert.equal(removal?.worktree_id, worktree.id);
+    assert.equal(removal?.sessions_removed, 2);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('lockGitWorktree and unlockGitWorktree toggle a real worktree and return false in a plain dir', () => {
+  const { dir, repo, registry } = newProjectRepo();
+  try {
+    const plain = join(dir, 'plain');
+    mkdirSync(plain);
+    assert.equal(core.lockGitWorktree(plain, 'dev-plain'), false);
+    assert.equal(core.unlockGitWorktree(plain), false);
+
+    const target = join(dir, 'lockable');
+    git(['worktree', 'add', '-q', '-b', 'artinarey/lockable', target], repo);
+    assert.equal(core.lockGitWorktree(target, 'dev-lockable'), true);
+    assert.equal(listGitWorktrees(repo).find((row) => row.path === target)?.locked, true);
+    assert.equal(core.unlockGitWorktree(target), true);
+    assert.equal(listGitWorktrees(repo).find((row) => row.path === target)?.locked, false);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('claimPersona locks the bound git worktree and force release unlocks it', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    const target = join(dir, 'locked');
+    git(['worktree', 'add', '-q', '-b', 'artinarey/locked', target], repo);
+    const worktree = core.adoptWorktree(registry, storeDir, project.id, target);
+    const identity = core.resolveIdentity(registry, target);
+    assert.equal(identity.ok, true);
+    if (!identity.ok) return;
+
+    const persona = core.createPersona(registry, storeDir, project.id, 'dev-locked', 'Locked');
+    const claimed = core.claimPersona(registry, storeDir, identity.identity, { personaId: persona });
+    assert.equal(claimed.ok, true);
+    assert.equal(listGitWorktrees(repo).find((row) => row.path === target)?.locked, true);
+
+    assert.equal(core.releaseWorktreeForce(registry, storeDir, worktree.id), true);
+    assert.equal(listGitWorktrees(repo).find((row) => row.path === target)?.locked, false);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

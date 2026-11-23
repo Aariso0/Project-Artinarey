@@ -4,7 +4,7 @@ import type { ArtinareyErrorCode } from './errors.ts';
 import { readPersona, writePersona } from './persona-store.ts';
 import { appendJournal } from './store.ts';
 import type { Registry } from './registry.ts';
-import { listGitWorktrees } from './worktree.ts';
+import { listGitWorktrees, lockGitWorktree, unlockGitWorktree } from './worktree.ts';
 
 export type Marker = {
   schema: 1;
@@ -82,6 +82,25 @@ function audit(storeDir: string, event: Record<string, unknown>): void {
     ...event,
     created_at: new Date().toISOString(),
   });
+}
+
+/** Removal audit, including the session history discarded with the worktree. */
+export function auditWorktreeRemoval(
+  storeDir: string, worktreeId: string, sessionsRemoved: number,
+): void {
+  audit(storeDir, {
+    type: 'worktree_removed', worktree_id: worktreeId, sessions_removed: sessionsRemoved,
+  });
+}
+
+/** Bindings have no by-persona lookup, so find the path through registered worktrees. */
+function boundWorktreePath(registry: Registry, personaId: string): string | undefined {
+  for (const project of registry.projects.list()) {
+    for (const worktree of registry.worktrees.list(project.id)) {
+      if (registry.bindings.forWorktree(worktree.id)?.id === personaId) return worktree.path;
+    }
+  }
+  return undefined;
 }
 
 function sameDirectory(a: string, b: string): boolean {
@@ -247,6 +266,7 @@ export function claimPersona(
   }
 
   registry.bindings.bind(personaId, identity.worktreeId);
+  lockGitWorktree(identity.markerDir, persona.role);
   const nextHome = options.rehome || !home ? identity.worktreeId : home;
   writePersona(storeDir, personaId, { ...personaState, home_worktree_id: nextHome, state: 'active' });
   audit(storeDir, { type: 'persona_claimed', persona_id: personaId,
@@ -261,17 +281,24 @@ export function claimPersona(
   };
 }
 
-export function releasePersona(
-  registry: Registry,
-  storeDir: string,
-  personaId: string,
-): void {
+/** Binding, persona file and audit line; the caller owns the git unlock. */
+function releasePersonaCore(registry: Registry, storeDir: string, personaId: string): void {
   registry.bindings.release(personaId);
   const state = readPersona(storeDir, personaId);
   if (state.state !== 'new' || state.role) {
     writePersona(storeDir, personaId, { ...state, state: 'idle' });
   }
   audit(storeDir, { type: 'persona_released', persona_id: personaId });
+}
+
+export function releasePersona(
+  registry: Registry,
+  storeDir: string,
+  personaId: string,
+): void {
+  const boundPath = boundWorktreePath(registry, personaId);
+  releasePersonaCore(registry, storeDir, personaId);
+  if (boundPath) unlockGitWorktree(boundPath);
 }
 
 /** User-initiated override via `artinarey release --force`. Returns false if nothing was bound. */
@@ -282,9 +309,13 @@ export function releaseWorktreeForce(
 ): boolean {
   const bound = registry.bindings.forWorktree(worktreeId);
   if (!bound) return false;
-  releasePersona(registry, storeDir, bound.id);
+  const boundPath = registry.projects.list()
+    .flatMap((project) => registry.worktrees.list(project.id))
+    .find((worktree) => worktree.id === worktreeId)?.path;
+  releasePersonaCore(registry, storeDir, bound.id);
   audit(storeDir, {
     type: 'forced_release', persona_id: bound.id, worktree_id: worktreeId,
   });
+  if (boundPath) unlockGitWorktree(boundPath);
   return true;
 }

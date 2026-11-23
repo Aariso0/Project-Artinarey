@@ -5,7 +5,8 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
-  createPersona, findMarker, isUlid, newId, openRegistry, resolveXdgPaths, writeMarker,
+  createPersona, findMarker, isUlid, newId, openRegistry, releasePersona,
+  resolveXdgPaths, writeMarker,
 } from '@artinarey/core';
 import { createRpcServer } from '@artinarey/daemon';
 import { main } from './index.ts';
@@ -339,5 +340,87 @@ test('worktree new --yes creates the worktree with marker, env files and offset'
     assert.equal(readFileSync(copied, 'utf8'), `${file}=root\n`);
     assert.equal(statSync(copied).mode & 0o777, 0o600);
   }
+  registry.close();
+});
+
+test('worktree adopt <path> registers the git worktree and writes its marker', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const external = join(dir, 'vendor-wt');
+  execFileSync('git', ['worktree', 'add', '-q', '-b', 'artinarey/vendor', external], { cwd: repo });
+
+  let output = '';
+  let errors = '';
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (s: unknown) => { output += `${String(s)}\n`; };
+  console.error = (s: unknown) => { errors += `${String(s)}\n`; };
+  let code: number;
+  try {
+    code = await main(['worktree', 'adopt', external], env, repo);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+
+  assert.equal(code, 0, errors);
+  assert.match(output, /adopted/);
+  const row = registry.worktrees.list(project.id).find((wt) => wt.path === external);
+  assert.ok(row, 'adopted worktree not registered');
+  assert.equal(row.branch, 'artinarey/vendor');
+  assert.equal(row.portOffset, 0);
+  assert.equal(findMarker(external)?.marker.project_id, project.id);
+  assert.equal(findMarker(external)?.marker.worktree_id, row.id);
+  registry.close();
+});
+
+test('worktree remove <name> refuses a bound worktree, then removes it after release', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const target = join(repo, '.worktrees', 'gone');
+  execFileSync('git', ['worktree', 'add', '-q', '-b', 'artinarey/gone', target], { cwd: repo });
+  assert.equal(await main(['worktree', 'adopt', target], env, repo), 0);
+  const row = registry.worktrees.list(project.id).find((wt) => wt.path === target);
+  assert.ok(row, 'adopted worktree not registered');
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-gone', 'Gone');
+  registry.bindings.bind(persona, row.id);
+
+  let output = '';
+  let errors = '';
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (s: unknown) => { output += `${String(s)}\n`; };
+  console.error = (s: unknown) => { errors += `${String(s)}\n`; };
+  let refused: number;
+  try {
+    refused = await main(['worktree', 'remove', 'gone'], env, repo);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+  assert.equal(refused, 1);
+  assert.match(errors, /bound/);
+  assert.equal(existsSync(target), true);
+  assert.equal(registry.worktrees.list(project.id).some((wt) => wt.id === row.id), true);
+  assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', 'refs/heads/artinarey/gone'], repo), true);
+
+  releasePersona(registry, project.storeDir, persona);
+  output = '';
+  errors = '';
+  console.log = (s: unknown) => { output += `${String(s)}\n`; };
+  console.error = (s: unknown) => { errors += `${String(s)}\n`; };
+  let removed: number;
+  try {
+    removed = await main(['worktree', 'remove', 'gone'], env, repo);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+
+  assert.equal(removed, 0, `${errors}${output}`);
+  assert.match(output, /removed/);
+  assert.equal(existsSync(target), false);
+  assert.equal(registry.worktrees.list(project.id).some((wt) => wt.id === row.id), false);
+  assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', 'refs/heads/artinarey/gone'], repo), true);
   registry.close();
 });

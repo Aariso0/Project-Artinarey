@@ -3,9 +3,9 @@ import { createRequire } from 'node:module';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
-  atomicWrite, buildIndex, createWorktree, ensureExcludeBlock, findMarker, globalIgnoreCoverage,
-  listGitWorktrees, newId, openRegistry, planWorktree, projectStore, reconcileWorktrees,
-  resolveRepo, resolveXdgPaths, writeMarker,
+  adoptWorktree, atomicWrite, buildIndex, createWorktree, ensureExcludeBlock, findMarker,
+  globalIgnoreCoverage, listGitWorktrees, newId, openRegistry, planWorktree, projectStore,
+  reconcileWorktrees, removeWorktree, resolveRepo, resolveXdgPaths, writeMarker,
 } from '@artinarey/core';
 import { callDaemon, daemonStatus, startDaemon, stopDaemon } from '@artinarey/daemon';
 
@@ -154,9 +154,79 @@ export async function main(
     }
   }
 
+  if (command === 'worktree' && args[0] === 'adopt') {
+    const target = args[1];
+    if (!target || target.startsWith('--')) {
+      console.error('usage: artinarey worktree adopt <path>');
+      return 2;
+    }
+    try {
+      const marker = findMarker(cwd);
+      if (!marker) {
+        console.error('no .artinarey.json found; run artinarey init');
+        return 1;
+      }
+      const registry = openRegistry(resolveXdgPaths(env).registryFile);
+      try {
+        const project = registry.projects.get(marker.marker.project_id);
+        if (!project) {
+          console.error(`unknown project: ${marker.marker.project_id}`);
+          return 1;
+        }
+        const worktree = adoptWorktree(registry, project.storeDir, project.id, resolve(cwd, target));
+        console.log(`adopted ${worktree.path} on ${worktree.branch ?? 'detached'} (${worktree.id})`);
+        return 0;
+      } finally {
+        registry.close();
+      }
+    } catch (err) {
+      console.error(`worktree adopt failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
+  if (command === 'worktree' && args[0] === 'remove') {
+    const name = args[1];
+    if (!name || name.startsWith('--')) {
+      console.error('usage: artinarey worktree remove <name>');
+      return 2;
+    }
+    try {
+      const marker = findMarker(cwd);
+      if (!marker) {
+        console.error('no .artinarey.json found; run artinarey init');
+        return 1;
+      }
+      const registry = openRegistry(resolveXdgPaths(env).registryFile);
+      try {
+        const project = registry.projects.get(marker.marker.project_id);
+        if (!project) {
+          console.error(`unknown project: ${marker.marker.project_id}`);
+          return 1;
+        }
+        const rows = registry.worktrees.list(project.id);
+        const row = rows.find((wt) => wt.id === name)
+          ?? rows.find((wt) => basename(wt.path) === name)
+          ?? rows.find((wt) => wt.branch === name || wt.branch === `artinarey/${name}`);
+        if (!row) {
+          console.error(`unknown worktree: ${name}`);
+          return 1;
+        }
+        removeWorktree(registry, project.id, row.id);
+        console.log(`removed ${row.path}`);
+        return 0;
+      } finally {
+        registry.close();
+      }
+    } catch (err) {
+      console.error(`worktree remove failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
   if (command === 'worktree') {
     if (args[0] !== 'list') {
-      console.error('usage: artinarey worktree new <name> [--base REF] [--yes] | list');
+      console.error('usage: artinarey worktree new <name> [--base REF] [--yes] | adopt <path> | remove <name> | list');
       return 2;
     }
     try {

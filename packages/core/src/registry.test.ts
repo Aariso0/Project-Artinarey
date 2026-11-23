@@ -200,3 +200,26 @@ test('worktrees: delete removes only the requested row', () => {
   assert.deepEqual(db.worktrees.list(project.id).map((wt) => wt.id), [b]);
   db.close();
 });
+
+test('sessions: deleteForWorktree removes only that worktree\'s session history', () => {
+  const db = openTempRegistry();
+  const project = db.projects.create({ name: 'Alpha', repoCommonDir: '/r/a/.git', storeDir: '/d/a' });
+  const persona = db.personas.create({ projectId: project.id, role: 'dev-a', name: 'A' });
+  const kept = newId();
+  const removed = newId();
+  db.worktrees.upsert({ id: kept, projectId: project.id, path: '/w/kept', branch: 'kept' });
+  db.worktrees.upsert({ id: removed, projectId: project.id, path: '/w/removed', branch: 'removed' });
+
+  for (const [worktreeId, minute] of [[removed, '01'], [removed, '02'], [kept, '03']] as const) {
+    db.sessions.append({
+      projectId: project.id, worktreeId, personaId: persona.id,
+      vendor: 'opencode', startedAt: `2026-11-24T10:${minute}:00Z`,
+    });
+  }
+
+  db.sessions.deleteForWorktree(removed);
+
+  assert.deepEqual(db.sessions.list(project.id).map((s) => s.worktreeId), [kept]);
+  assert.deepEqual(db.worktrees.list(project.id).map((wt) => wt.id), [kept, removed]);
+  db.close();
+});
