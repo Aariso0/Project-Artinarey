@@ -6,3 +6,5 @@ export * from './store.ts';
 export * from './mail.ts';
 export * from './registry.ts';
 export * from './index-builder.ts';
+export * from './identity.ts';
+export * from './persona-store.ts';
