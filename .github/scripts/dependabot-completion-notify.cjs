@@ -220,10 +220,117 @@ function buildComment(input = {}) {
   return lines.join('\n');
 }
 
+async function main({ github, context, core } = {}) {
+  const run = context?.payload?.workflow_run;
+  const repo = context?.repo ?? {};
+  const info = (message) => core?.info?.(message);
+  const skip = (reason) => {
+    info(`Skipping Dependabot notification: ${reason}`);
+  };
+
+  if (!run) {
+    skip('workflow_run payload is missing');
+    return;
+  }
+  if (run.conclusion !== 'success') {
+    skip(`CI conclusion is ${run.conclusion ?? 'unknown'}`);
+    return;
+  }
+  if (run.event !== 'pull_request') {
+    skip(`CI event is ${run.event ?? 'unknown'}`);
+    return;
+  }
+  if (run.head_repository?.id != null && run.head_repository.id !== context?.payload?.repository?.id) {
+    skip('CI run came from another repository');
+    return;
+  }
+
+  let candidate = (Array.isArray(run.pull_requests) ? run.pull_requests : [])
+    .find((pull) => pull?.head?.sha === run.head_sha && pull?.base?.ref === 'main');
+  if (!candidate && run.head_branch) {
+    const branchPulls = await github.paginate(github.rest.pulls.list, {
+      owner: repo.owner,
+      repo: repo.repo,
+      head: `${repo.owner}:${run.head_branch}`,
+      state: 'open',
+    });
+    candidate = branchPulls.find((pull) => pull?.head?.sha === run.head_sha && pull?.base?.ref === 'main');
+  }
+  if (!candidate) {
+    skip('no open PR matches the CI head SHA and main base');
+    return;
+  }
+
+  const { data: pr } = await github.rest.pulls.get({
+    owner: repo.owner,
+    repo: repo.repo,
+    pull_number: candidate.number,
+  });
+  if (pr.user?.login !== 'dependabot[bot]') {
+    skip('PR author is not dependabot[bot]');
+    return;
+  }
+  if (pr.base?.ref !== 'main') {
+    skip(`PR base is ${pr.base?.ref ?? 'unknown'}`);
+    return;
+  }
+  if (pr.state !== 'open') {
+    skip(`PR state is ${pr.state ?? 'unknown'}`);
+    return;
+  }
+  if (pr.head?.sha !== run.head_sha) {
+    skip('PR head SHA changed after CI started');
+    return;
+  }
+
+  const comments = await github.paginate(github.rest.issues.listComments, {
+    owner: repo.owner,
+    repo: repo.repo,
+    issue_number: pr.number,
+  });
+  if (hasNotificationMarker(comments, run.head_sha)) {
+    skip(`comment for head SHA ${run.head_sha} already exists`);
+    return;
+  }
+
+  const files = await github.paginate(github.rest.pulls.listFiles, {
+    owner: repo.owner,
+    repo: repo.repo,
+    pull_number: pr.number,
+    per_page: 100,
+  });
+  const checks = run.check_suite_id == null
+    ? []
+    : await github.paginate(github.rest.checks.listForSuite, {
+      owner: repo.owner,
+      repo: repo.repo,
+      check_suite_id: run.check_suite_id,
+      per_page: 100,
+    });
+
+  const body = buildComment({
+    pr,
+    updates: parseDependencyUpdates({ title: pr.title, body: pr.body ?? '' }),
+    files,
+    checks,
+    run,
+    description: pr.body ?? '',
+  });
+
+  await github.rest.issues.createComment({
+    owner: repo.owner,
+    repo: repo.repo,
+    issue_number: pr.number,
+    body,
+  });
+  info(`Posted Dependabot completion notification on PR #${pr.number} for ${run.head_sha}`);
+}
+
 module.exports = {
   notificationMarker,
   hasNotificationMarker,
   classifyUpdate,
   parseDependencyUpdates,
   buildComment,
+  main,
 };

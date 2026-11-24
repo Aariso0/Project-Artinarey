@@ -226,7 +226,10 @@ function harness(overrides = {}) {
   };
   const calls = { comments: 0, bodies: [], infos: [] };
   const github = {
-    paginate: async (fn, params) => fn(params),
+    paginate: async (fn, params) => {
+      const result = await fn(params);
+      return Array.isArray(result) ? result : result.data;
+    },
     rest: {
       pulls: {
         get: async () => ({ data: pr }),
