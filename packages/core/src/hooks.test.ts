@@ -62,7 +62,7 @@ test('branchChangedFiles rejects the checked-out branch as a merge target', () =
   }
 });
 
-test('changedFiles parses name-status fields, including old paths and exact names', () => {
+test('changedFiles parses name-status fields, including rename paths and exact names', () => {
   const repo = tempRepo();
   addFile(repo, 'src/keep.ts', 'keep\n');
   addFile(repo, 'src/delete.ts', 'delete\n');
@@ -85,12 +85,47 @@ test('changedFiles parses name-status fields, including old paths and exact name
   for (const path of [
     'src/keep.ts', 'src/delete.ts',
     'src/rename.ts', 'src/renamed.ts',
-    'src/copy.ts', 'src/copied.ts',
+    'src/copied.ts',
     'src/type-change',
     'src/ ü n i .ts ', 'src/ ü n i renamed .ts ',
   ]) {
     assert.ok(paths.includes(path), `missing ${JSON.stringify(path)} in ${JSON.stringify(paths)}`);
   }
+  assert.ok(!paths.includes('src/copy.ts'), `unexpected copy source in ${JSON.stringify(paths)}`);
+});
+
+test('changedFiles reports only the destination for a copy with an unchanged source', () => {
+  const repo = tempRepo();
+  addFile(repo, 'templates/base.ts');
+  commit(repo, 'fixture');
+  mkdirSync(join(repo, 'src'), { recursive: true });
+  copyFileSync(join(repo, 'templates/base.ts'), join(repo, 'src/new.ts'));
+  git(repo, ['add', '-A']);
+
+  assert.deepEqual(changedFiles(repo, true), ['src/new.ts']);
+});
+
+test('changedFiles still reports a modified copy source as its own change', () => {
+  const repo = tempRepo();
+  const body = 'shared content line\n'.repeat(12);
+  addFile(repo, 'templates/base.ts', body);
+  commit(repo, 'fixture');
+  mkdirSync(join(repo, 'src'), { recursive: true });
+  copyFileSync(join(repo, 'templates/base.ts'), join(repo, 'src/new.ts'));
+  writeFileSync(join(repo, 'templates/base.ts'), `${body}extra line\n`);
+  git(repo, ['add', '-A']);
+
+  assert.deepEqual(changedFiles(repo, true), ['src/new.ts', 'templates/base.ts']);
+});
+
+test('changedFiles reports both paths for a rename', () => {
+  const repo = tempRepo();
+  addFile(repo, 'src/old.ts');
+  commit(repo, 'fixture');
+  git(repo, ['mv', 'src/old.ts', 'src/new.ts']);
+  git(repo, ['add', '-A']);
+
+  assert.deepEqual(changedFiles(repo, true), ['src/old.ts', 'src/new.ts']);
 });
 
 test('changedFiles returns working-tree changes against HEAD', () => {

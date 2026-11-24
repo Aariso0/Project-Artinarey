@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import {
-  App, loadScopedSnapshots, mailRecipientOptions, scopedMailQuery, type Snapshots,
+  App, AppView, initialScopeState, loadScopedSnapshots, mailRecipientOptions, scopeReducer,
+  scopedMailQuery, type ScopeState, type Snapshots,
 } from './App.tsx';
 import { createApi, type DaemonError, type GuiApi, type InvokeFn } from './api.ts';
 
@@ -296,6 +297,101 @@ test('mail recipients are derived from persona roles with an unfiltered option',
   assert.deepEqual(scopedMailQuery('project-1', 'dev0'), {
     projectId: 'project-1', recipient: 'dev0',
   });
+});
+
+const twoProjectSnapshots: Snapshots = {
+  ...snapshots,
+  projects: [
+    ...snapshots.projects,
+    { ...snapshots.projects[0], id: 'project-2', name: 'Beta' },
+  ],
+};
+
+/** React marks the selected option rather than emitting a value on <select>. */
+function selectedValue(html: string, id: string): string | undefined {
+  const start = html.indexOf(`<select id="${id}"`);
+  if (start < 0) return undefined;
+  const select = html.slice(start, html.indexOf('</select>', start));
+  return select.match(/<option value="([^"]*)" selected="">/)?.[1];
+}
+
+function renderScope(state: ScopeState): string {
+  return renderToStaticMarkup(createElement(AppView, {
+    snapshots: twoProjectSnapshots,
+    loadedScope: state.loaded,
+    error: null,
+    loading: false,
+    scopeLoading: false,
+    onChooseProject: () => {},
+    onChooseRecipient: () => {},
+  }));
+}
+
+test('a failed project switch keeps the loaded project on the selects and scope labels', () => {
+  const requested = scopeReducer(initialScopeState('project-1'), {
+    type: 'chooseProject', projectId: 'project-2',
+  });
+  assert.deepEqual(requested.loaded, { projectId: 'project-1', recipient: 'all' });
+  assert.deepEqual(requested.request, { projectId: 'project-2', recipient: 'all' });
+
+  const failed = scopeReducer(requested, { type: 'requestFailed' });
+  assert.deepEqual(failed.loaded, { projectId: 'project-1', recipient: 'all' });
+  assert.equal(failed.request, null);
+
+  for (const state of [requested, failed]) {
+    const html = renderScope(state);
+    assert.equal(selectedValue(html, 'project-select'), 'project-1');
+    assert.equal(selectedValue(html, 'recipient-select'), 'all');
+    assert.equal(html.match(/Scoped to Artinarey/g)?.length, 3);
+    assert.doesNotMatch(html, /Scoped to Beta/);
+  }
+});
+
+test('a failed recipient change keeps the previously loaded recipient on the filter', () => {
+  const loaded: ScopeState = {
+    loaded: { projectId: 'project-1', recipient: 'dev0' },
+    request: null,
+  };
+  const requested = scopeReducer(loaded, { type: 'chooseRecipient', recipient: 'dev1' });
+  assert.deepEqual(requested.loaded, loaded.loaded);
+  assert.deepEqual(requested.request, { projectId: 'project-1', recipient: 'dev1' });
+
+  const afterFailedProject = scopeReducer(
+    scopeReducer(loaded, { type: 'chooseProject', projectId: 'project-2' }),
+    { type: 'chooseRecipient', recipient: 'dev1' },
+  );
+  assert.deepEqual(afterFailedProject.request, { projectId: 'project-1', recipient: 'dev1' });
+
+  const failed = scopeReducer(requested, { type: 'requestFailed' });
+  assert.deepEqual(failed.loaded, loaded.loaded);
+  const html = renderScope(failed);
+  assert.equal(selectedValue(html, 'recipient-select'), 'dev0');
+  assert.equal(selectedValue(html, 'project-select'), 'project-1');
+  assert.ok(html.includes('>dev1<'), 'the rejected recipient is still an option, but not selected');
+});
+
+test('successful reloads update the displayed project and recipient scope', () => {
+  const projectRequested = scopeReducer(initialScopeState('project-1'), {
+    type: 'chooseProject', projectId: 'project-2',
+  });
+  const projectLoaded = scopeReducer(projectRequested, {
+    type: 'loadSucceeded', scope: { projectId: 'project-2', recipient: 'all' },
+  });
+  assert.deepEqual(projectLoaded.loaded, { projectId: 'project-2', recipient: 'all' });
+  let html = renderScope(projectLoaded);
+  assert.equal(selectedValue(html, 'project-select'), 'project-2');
+  assert.equal(html.match(/Scoped to Beta/g)?.length, 3);
+  assert.doesNotMatch(html, /Scoped to Artinarey/);
+
+  const recipientRequested = scopeReducer(projectLoaded, {
+    type: 'chooseRecipient', recipient: 'dev1',
+  });
+  const recipientLoaded = scopeReducer(recipientRequested, {
+    type: 'loadSucceeded', scope: { projectId: 'project-2', recipient: 'dev1' },
+  });
+  html = renderScope(recipientLoaded);
+  assert.equal(selectedValue(html, 'project-select'), 'project-2');
+  assert.equal(selectedValue(html, 'recipient-select'), 'dev1');
 });
 
 test('createApi normalizes a rejected native error object', async () => {

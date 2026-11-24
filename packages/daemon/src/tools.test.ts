@@ -1337,3 +1337,101 @@ test('task_update from done reclaims the lease before reactivating', async (t) =
       && line.includes(`"taskId":"${taskId}"`));
   assert.equal(claims.length, 2, 'reactivation must reclaim the shared lease');
 });
+
+test('assign_task rejects invalid scope entries before persisting a task or claim', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev', 'Dev');
+  const lead = createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, lead);
+
+  const leaseFile = join(s.project.storeDir, 'events', 'leases.jsonl');
+  const claimEvents = (): string[] => existsSync(leaseFile)
+    ? readFileSync(leaseFile, 'utf8').split('\n')
+      .filter((line) => line.includes('"type":"shared_claim"'))
+    : [];
+
+  for (const [index, scope] of [[''], ['../x'], ['/abs'], ['package.json', '../x']].entries()) {
+    const rejected = await client.call('assign_task', {
+      persona_id: dev, title: `invalid ${index}`, scope, body: 'do it',
+    });
+    assert.equal(rejected.ok, false, JSON.stringify(rejected));
+    if (!rejected.ok) {
+      assert.equal(rejected.error.code, 'INVALID_INPUT');
+      assert.match(rejected.error.message, /repo-relative/);
+    }
+    assert.equal(readTasks(s.project.storeDir).length, 0,
+      `scope ${JSON.stringify(scope)} must not persist a task`);
+    assert.equal(claimEvents().length, 0,
+      `scope ${JSON.stringify(scope)} must not leave a shared claim`);
+  }
+
+  const valid = await client.call('assign_task', {
+    persona_id: dev, title: 'valid after rejections', scope: ['src/a.ts'], body: 'do it',
+  });
+  assert.equal(valid.ok, true, JSON.stringify(valid));
+  assert.equal(readTasks(s.project.storeDir).length, 1);
+});
+
+test('assign_task normalizes scopes for assignment, claim and recovery', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev', 'Dev');
+  const lead = createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, lead);
+
+  const args = { persona_id: dev, title: 'normalized', scope: ['./src//a.ts', './package.json'] };
+  const failed = await client.call('assign_task', { ...args, body: 'API_KEY=do-not-send' });
+  assert.equal(failed.ok, false, JSON.stringify(failed));
+  if (failed.ok) return;
+  assert.equal(failed.error.code, 'MAIL_REJECTED');
+  const taskId = (failed.error as { taskId?: string }).taskId;
+  assert.ok(taskId, 'the committed task id must be returned');
+
+  const tasks = readTasks(s.project.storeDir);
+  assert.equal(tasks.length, 1);
+  assert.deepEqual(tasks[0]!.scope, ['src/a.ts', 'package.json'], 'committed scope must be normalized');
+  const leaseFile = join(s.project.storeDir, 'events', 'leases.jsonl');
+  const claimEvents = (): string[] => existsSync(leaseFile)
+    ? readFileSync(leaseFile, 'utf8').split('\n')
+      .filter((line) => line.includes('"type":"shared_claim"'))
+    : [];
+  assert.equal(claimEvents().length, 1, 'the shared file must be claimed once');
+  assert.match(claimEvents()[0]!, /"files":\["package.json"\]/);
+
+  const invalidRecovery = await client.call('assign_task', {
+    ...args, scope: ['src/a.ts', '../x'], body: 'do it', task_id: taskId,
+  });
+  assert.equal(invalidRecovery.ok, false);
+  if (!invalidRecovery.ok) assert.equal(invalidRecovery.error.code, 'INVALID_INPUT');
+  const mismatch = await client.call('assign_task', {
+    ...args, scope: ['src/a.ts'], body: 'do it', task_id: taskId,
+  });
+  assert.equal(mismatch.ok, false);
+  if (!mismatch.ok) assert.equal(mismatch.error.code, 'INVALID_INPUT');
+  assert.equal(readTasks(s.project.storeDir).length, 1, 'rejected recovery must not recreate a task');
+  assert.equal(claimEvents().length, 1, 'rejected recovery must not add a claim');
+
+  const recovered = await client.call('assign_task', {
+    ...args, scope: ['src/a.ts', 'package.json/'], body: 'do it', task_id: taskId,
+  });
+  assert.equal(recovered.ok, true, JSON.stringify(recovered));
+  assert.equal(readTasks(s.project.storeDir).length, 1, 'recovery must reuse the committed task');
+  assert.equal(claimEvents().length, 1, 'recovery must not reclaim an already held file');
+
+  reindex(s);
+  const mails = queryMail(join(s.paths.cacheRoot, s.project.id, 'index.sqlite'))
+    .filter((mail) => mail.kind === 'task' && mail.subject === 'Task: normalized');
+  assert.equal(mails.length, 1, 'recovery must send exactly one notification');
+  assert.match(readFileSync(mails[0]!.file, 'utf8'), new RegExp(`in_reply_to: ${taskId}`));
+});

@@ -289,6 +289,41 @@ test('a synchronous spawn throw is a typed launch failure', async () => {
   }
 });
 
+test('a state write failure kills the spawned child and surfaces STORE_OFFLINE', async () => {
+  const s = setup();
+  try {
+    const { fetchImpl } = fakeFetch(() => ({ ok: true, status: 200, body: {} }));
+    const { spawnImpl } = fakeSpawn(process.pid);
+    let unrefCalls = 0;
+    const trackedSpawn: SpawnFn = (command, args, options) => {
+      const child = spawnImpl(command, args, options);
+      return { ...child, unref() { unrefCalls++; return child; } };
+    };
+    const killed: number[] = [];
+    const original = process.kill;
+    (process as { kill: typeof process.kill }).kill = ((pid: number, signal?: number) => {
+      if (signal === undefined) killed.push(pid);
+      return true;
+    }) as typeof process.kill;
+    try {
+      const serve = new OpencodeAdapter({
+        stateFile: s.stateFile, logDir: s.logDir, fetchImpl, spawnImpl: trackedSpawn,
+        writeStateImpl: () => { throw new Error('state write failed'); },
+        pickPort: async () => 45686, password: () => 'pw', readyTimeoutMs: 100,
+      });
+      await assert.rejects(serve.ensureServe(), (err: unknown) => err instanceof ArtinareyError
+        && err.code === 'STORE_OFFLINE' && /state write failed/.test(err.message));
+    } finally {
+      (process as { kill: typeof process.kill }).kill = original;
+    }
+    assert.deepEqual(killed, [process.pid]);
+    assert.equal(unrefCalls, 0);
+    assert.equal(readServeState(s.stateFile), undefined);
+  } finally {
+    rmSync(s.root, { recursive: true, force: true });
+  }
+});
+
 test('concurrent ensureServe calls share one start and the guard clears', async () => {
   const s = setup();
   try {

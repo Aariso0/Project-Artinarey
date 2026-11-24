@@ -12,6 +12,7 @@ import {
   DEFAULT_PERSONA,
   fail,
   newId,
+  normalizePath,
   ok,
   queryMail,
   readPersona,
@@ -597,13 +598,22 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
     const assignee = str(params.persona_id);
     const title = str(params.title);
     const body = str(params.body);
-    const scope = Array.isArray(params.scope)
+    const scopeInput = Array.isArray(params.scope)
       ? params.scope.filter((v): v is string => typeof v === 'string') : [];
-    if (!assignee || !title || !body || scope.length === 0) {
+    if (!assignee || !title || !body || scopeInput.length === 0) {
       return toolFail(id, 'INVALID_INPUT', 'assign_task needs persona_id, title, scope[] and body');
     }
     const persona = ctx.registry.personas.list(identity.projectId).find((p) => p.id === assignee);
     if (!persona) return toolFail(id, 'NOT_FOUND', `unknown persona: ${assignee}`);
+    // Validate every entry up front: an empty store has no scope comparisons, so
+    // an unnormalised scope could otherwise be persisted before claimShared rejects it.
+    let scope: string[];
+    try {
+      scope = scopeInput.map(normalizePath);
+    } catch (err) {
+      const e = err as { code?: ArtinareyErrorCode; message?: string };
+      return toolFail(id, e.code ?? 'INVALID_INPUT', e.message ?? 'invalid scope path');
+    }
     const recoveryId = str(params.task_id);
     let taskId = recoveryId;
     if (recoveryId) {
@@ -613,8 +623,15 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
       if (committed.assignee !== persona.role) {
         return toolFail(id, 'FORBIDDEN_ROLE', 'the committed task belongs to another persona');
       }
-      if (committed.scope.length !== scope.length
-          || scope.some((path) => !committed.scope.includes(path))) {
+      let committedScope: string[];
+      try {
+        committedScope = committed.scope.map(normalizePath);
+      } catch (err) {
+        const e = err as { code?: ArtinareyErrorCode; message?: string };
+        return toolFail(id, e.code ?? 'INVALID_INPUT', e.message ?? 'invalid committed scope');
+      }
+      if (committedScope.length !== scope.length
+          || scope.some((path) => !committedScope.includes(path))) {
         return toolFail(id, 'INVALID_INPUT', 'scope must match the committed task');
       }
     } else {

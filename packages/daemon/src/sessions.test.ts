@@ -64,6 +64,34 @@ function gateServe(adapter: FakeAdapter): () => void {
   return release;
 }
 
+/** Hold launches after the registry row is appended but before the vendor is ready. */
+function gateCreateSession(adapter: FakeAdapter): () => void {
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  adapter.createSession = async () => {
+    await pending;
+    const id = `vendor-${adapter.sessions.length + 1}`;
+    adapter.sessions.push(id);
+    return id;
+  };
+  return release;
+}
+
+/** Hold launches at sendPrompt so stopSession can settle the persisted row. */
+function gatePrompt(adapter: FakeAdapter): () => void {
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  adapter.sendPrompt = async () => { await pending; };
+  return release;
+}
+
+async function waitFor(condition: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20 && !condition(); attempt++) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.ok(condition(), 'condition was not met');
+}
+
 function fakeTimers(): TimerApi & { handles: unknown[]; cleared: unknown[] } {
   const handles: unknown[] = [];
   const cleared: unknown[] = [];
@@ -537,6 +565,29 @@ test('concurrent requests count persona and cap reservations before the first aw
   }
 });
 
+test('concurrent launches are counted once after their registry rows exist', async () => {
+  const s = setup(5);
+  try {
+    const release = gateCreateSession(s.adapter);
+    const launches = [0, 1].map((i) => s.supervisor.requestSession(s.caller, {
+      persona_id: s.devs[i]!, task_id: `T-${i}`,
+    }));
+    await waitFor(() => s.registry.sessions.list(s.project.id).length === 2);
+    assert.equal(s.supervisor.liveCount(s.project.id), 2, 'each launch counts once');
+
+    const third = s.supervisor.requestSession(s.caller, {
+      persona_id: s.devs[2]!, task_id: 'T-2',
+    });
+    release();
+    const thirdResult = await third;
+    assert.equal(thirdResult.ok, true, thirdResult.ok ? '' : thirdResult.message);
+    for (const launch of launches) assert.equal((await launch).ok, true);
+    assert.equal(s.supervisor.liveCount(s.project.id), 3);
+  } finally {
+    cleanup(s);
+  }
+});
+
 test('an approved cap spawn reserves capacity before its first await', async () => {
   const s = setup(6);
   try {
@@ -588,7 +639,7 @@ test('a sendPrompt rejection interrupts the vendor session and ends both records
   }
 });
 
-test('an unconfirmed vendor cleanup keeps the session visible and its capacity held', async () => {
+test('an unconfirmed vendor cleanup keeps the session visible and its persona held', async () => {
   const s = setup();
   try {
     s.adapter.failPrompt = true;
@@ -601,7 +652,7 @@ test('an unconfirmed vendor cleanup keeps the session visible and its capacity h
     assert.equal(registrySession.endedAt, null);
     const running = s.supervisor.sessions(s.project.id);
     assert.equal(running[0]?.status, 'running');
-    assert.equal(s.supervisor.liveCount(s.project.id), 2, 'registry row plus retained reservation');
+    assert.equal(s.supervisor.liveCount(s.project.id), 1, 'the registry row alone counts the launch');
 
     s.adapter.failInterrupt = false;
     assert.equal(await s.supervisor.stopSession(running[0]!.id), true);
@@ -626,6 +677,30 @@ test('stopSession never reports success when the vendor interrupt fails', async 
     s.adapter.failInterrupt = false;
     assert.equal(await s.supervisor.stopSession(spawned.session.id), true);
     assert.equal(s.supervisor.sessions(s.project.id)[0]?.status, 'stopped');
+  } finally {
+    cleanup(s);
+  }
+});
+
+test('a stop during sendPrompt does not bind the vendor or report a running spawn', async () => {
+  const s = setup();
+  try {
+    const release = gatePrompt(s.adapter);
+    const launch = s.supervisor.requestSession(s.caller, {
+      persona_id: s.devs[0]!, task_id: 'T-0',
+    });
+    await waitFor(() => s.registry.sessions.list(s.project.id).length === 1);
+    const id = s.registry.sessions.list(s.project.id)[0]!.id;
+    assert.equal(await s.supervisor.stopSession(id), true);
+    release();
+
+    const result = await launch;
+    assert.equal(result.ok, true, result.ok ? '' : result.message);
+    if (!result.ok) return;
+    assert.equal(result.session.id, id);
+    assert.equal(result.session.status, 'stopped');
+    assert.equal(s.registry.personas.get(s.devs[0]!)?.lastVendorSessionId, null);
+    assert.equal(s.supervisor.liveCount(s.project.id), 0);
   } finally {
     cleanup(s);
   }

@@ -117,8 +117,8 @@ export class SessionSupervisor {
   /** In-flight launches reserve capacity and persona ownership before any await. */
   private readonly reservedByProject = new Map<string, number>();
   private readonly reservedPersonas = new Set<string>();
-  /** Reservations kept after an unconfirmed vendor cleanup stay owned by the session. */
-  private readonly heldBySession = new Map<string, { projectId: string; personaId: string }>();
+  /** Persona reservations kept after an unconfirmed vendor cleanup stay owned by the session. */
+  private readonly heldBySession = new Map<string, string>();
 
   constructor(options: SupervisorOptions) {
     this.registry = options.registry;
@@ -145,10 +145,13 @@ export class SessionSupervisor {
     this.reservedPersonas.add(personaId);
   }
 
-  private releaseReservation(projectId: string, personaId: string): void {
+  private dropCapacity(projectId: string): void {
     const remaining = (this.reservedByProject.get(projectId) ?? 0) - 1;
     if (remaining > 0) this.reservedByProject.set(projectId, remaining);
     else this.reservedByProject.delete(projectId);
+  }
+
+  private dropPersona(personaId: string): void {
     this.reservedPersonas.delete(personaId);
   }
 
@@ -420,11 +423,17 @@ export class SessionSupervisor {
     const previousState = readPersona(storeDir, persona.id);
     const originalWorktree = this.boundWorktree(persona.id);
     this.reserve(caller.projectId, persona.id);
-    let reservationHeld = true;
-    const release = () => {
-      if (!reservationHeld) return;
-      reservationHeld = false;
-      this.releaseReservation(caller.projectId, persona.id);
+    let capacityHeld = true;
+    let personaHeld = true;
+    const releaseCapacity = () => {
+      if (!capacityHeld) return;
+      capacityHeld = false;
+      this.dropCapacity(caller.projectId);
+    };
+    const releasePersona = () => {
+      if (!personaHeld) return;
+      personaHeld = false;
+      this.dropPersona(persona.id);
     };
     const rollbackClaim = () => {
       try {
@@ -443,12 +452,14 @@ export class SessionSupervisor {
       });
     } catch (err) {
       rollbackClaim();
-      release();
+      releaseCapacity();
+      releasePersona();
       return fail('STORE_OFFLINE', `spawn failed: ${(err as Error).message ?? String(err)}`);
     }
     if (!claim.ok) {
       rollbackClaim();
-      release();
+      releaseCapacity();
+      releasePersona();
       return fail(claim.code, claim.message);
     }
 
@@ -466,6 +477,9 @@ export class SessionSupervisor {
         startedAt: new Date().toISOString(),
         createdBinding: !bound,
       });
+      // The appended registry row counts the launch from here; only the persona
+      // claim stays reserved until the launch settles.
+      releaseCapacity();
       const logFile = join(this.paths.cacheRoot, 'logs', `${sessionId}.log`);
       summary = {
         id: sessionId,
@@ -494,11 +508,26 @@ export class SessionSupervisor {
       });
       appendFileSync(logFile, `> first prompt (session ${vendorSessionId})\n${prompt}\n`);
       await this.adapter.sendPrompt(serve, vendorSessionId, prompt, `${sessionId}-first`);
+      const persisted = this.sessions(caller.projectId).find((s) => s.id === sessionId);
+      if (!persisted || persisted.status !== 'running') {
+        releasePersona();
+        const settled = persisted ?? {
+          ...summary, status: 'stopped' as const, endedAt: new Date().toISOString(),
+        };
+        // Only the success shape carries a session summary, so report the
+        // persisted state there instead of inventing a spawn failure.
+        return {
+          ok: true,
+          session: settled,
+          vendorSessionId,
+          message: `Session ${sessionId} is ${settled.status} after the prompt; vendor session ${vendorSessionId} was not bound.`,
+        };
+      }
       this.registry.personas.setVendor(persona.id, summary.vendor, vendorSessionId);
-      release();
+      releasePersona();
       return {
         ok: true,
-        session: summary,
+        session: persisted,
         vendorSessionId,
         message: `Started ${persona.role} in ${worktree.path} (session ${vendorSessionId}).`,
       };
@@ -521,7 +550,8 @@ export class SessionSupervisor {
           }
         } catch { /* best effort */ }
         rollbackClaim();
-        release();
+        releaseCapacity();
+        releasePersona();
       } else {
         try {
           if (summary && !summaryAppended) {
@@ -529,9 +559,7 @@ export class SessionSupervisor {
             summaryAppended = true;
           }
         } catch { /* registry row already keeps the launch visible */ }
-        if (sessionId) {
-          this.heldBySession.set(sessionId, { projectId: caller.projectId, personaId: persona.id });
-        }
+        if (sessionId) this.heldBySession.set(sessionId, persona.id);
       }
       return fail('STORE_OFFLINE', `spawn failed: ${(err as Error).message ?? String(err)}`);
     }
@@ -553,7 +581,7 @@ export class SessionSupervisor {
     this.registry.sessions.end(id, new Date().toISOString());
     const held = this.heldBySession.get(id);
     if (held) {
-      this.releaseReservation(held.projectId, held.personaId);
+      this.dropPersona(held);
       this.heldBySession.delete(id);
     }
     return true;

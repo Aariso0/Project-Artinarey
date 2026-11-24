@@ -47,6 +47,7 @@ export type OpencodeAdapterOptions = {
   env?: NodeJS.ProcessEnv;
   fetchImpl?: FetchFn;
   spawnImpl?: SpawnFn;
+  writeStateImpl?: (file: string, state: ServeState) => void;
   pickPort?: () => Promise<number>;
   password?: () => string;
   readyTimeoutMs?: number;
@@ -95,6 +96,7 @@ export class OpencodeAdapter {
   private readonly env: NodeJS.ProcessEnv;
   private readonly fetchImpl: FetchFn;
   private readonly spawnImpl: SpawnFn;
+  private readonly writeStateImpl: (file: string, state: ServeState) => void;
   private readonly pickPort: () => Promise<number>;
   private readonly password: () => string;
   private readonly readyTimeoutMs: number;
@@ -107,6 +109,7 @@ export class OpencodeAdapter {
     this.env = options.env ?? process.env;
     this.fetchImpl = options.fetchImpl ?? (fetch as FetchFn);
     this.spawnImpl = options.spawnImpl ?? (spawn as unknown as SpawnFn);
+    this.writeStateImpl = options.writeStateImpl ?? writeServeState;
     this.pickPort = options.pickPort ?? freePort;
     this.password = options.password ?? (() => randomBytes(24).toString('hex'));
     this.readyTimeoutMs = options.readyTimeoutMs ?? 5000;
@@ -207,7 +210,12 @@ export class OpencodeAdapter {
       if (!ready) {
         throw this.launchFailure('opencode serve did not become ready', child.pid);
       }
-      writeServeState(this.stateFile, state);
+      try {
+        this.writeStateImpl(this.stateFile, state);
+      } catch (err) {
+        throw this.launchFailure(
+          `opencode serve state could not be persisted: ${errorMessage(err)}`, child.pid);
+      }
       child.unref?.();
       return state;
     } finally {

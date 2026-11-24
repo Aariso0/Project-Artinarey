@@ -52,7 +52,7 @@ function gitLines(cwd: string, args: string[]): string[] {
   return gitRaw(cwd, args).split('\n').map((line) => line.trim()).filter(Boolean);
 }
 
-/** Paths from `--name-status -z`; R/C records carry the old path before the new one. */
+/** Paths from `--name-status -z`; R records need both paths, C records only the destination. */
 function gitPaths(cwd: string, args: string[]): string[] {
   const raw = gitRaw(cwd, args);
   const paths: string[] = [];
@@ -68,7 +68,8 @@ function gitPaths(cwd: string, args: string[]): string[] {
       i = firstEnd + 1;
       const newEnd = raw.indexOf('\0', i);
       if (newEnd === -1) break;
-      paths.push(oldPath, raw.slice(i, newEnd));
+      if (kind === 'R') paths.push(oldPath);
+      paths.push(raw.slice(i, newEnd));
       i = newEnd + 1;
     } else {
       paths.push(raw.slice(i, firstEnd));

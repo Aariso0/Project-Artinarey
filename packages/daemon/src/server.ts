@@ -195,6 +195,7 @@ export function createRpcServer(
   const sockets = new Set<Socket>();
   const contexts = new Set<RpcContext>();
   const closed = new Set<Promise<void>>();
+  const dispatches = new Set<Promise<void>>();
 
   const rpcServer: RpcServer = {
     socketPath,
@@ -245,7 +246,7 @@ export function createRpcServer(
 
         socket.on('data', (chunk: string) => {
           buffer += chunk;
-          queued = queued.then(async () => {
+          const pending = queued.then(async () => {
             let end: number;
             while (!socket.destroyed && (end = buffer.indexOf('\n')) >= 0) {
               const line = buffer.slice(0, end);
@@ -292,6 +293,12 @@ export function createRpcServer(
           }).catch((err) => {
             console.error(`request failed: ${(err as Error).message ?? String(err)}`);
           });
+          queued = pending;
+          dispatches.add(pending);
+          void pending.then(
+            () => { dispatches.delete(pending); },
+            () => { dispatches.delete(pending); },
+          );
         });
       });
 
@@ -320,6 +327,8 @@ export function createRpcServer(
           // Every close handler must release its binding before the registry closes.
           await Promise.allSettled([...closed]);
           closed.clear();
+          // In-flight dispatch must settle before the registry closes.
+          await Promise.allSettled([...dispatches]);
           try {
             if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
             if (existsSync(socketPath)) unlinkSync(socketPath);
