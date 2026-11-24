@@ -144,10 +144,11 @@ function sha256(file: string): string {
 }
 
 type MoveManifest = { schema: number; files: Record<string, string> };
+const MANIFEST_FILE = 'manifest.json';
 
 /** The manifest is written into the verified copy before it becomes the live store. */
 function readManifest(storeDir: string): MoveManifest | undefined {
-  const file = join(storeDir, 'manifest.json');
+  const file = join(storeDir, MANIFEST_FILE);
   if (!existsSync(file)) return undefined;
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf8')) as Partial<MoveManifest>;
@@ -169,6 +170,7 @@ function syncLateWrites(source: string, final: string): void {
   if (!manifest) return;
   for (const file of filesUnder(source)) {
     const relative = file.slice(source.length + 1);
+    if (relative === MANIFEST_FILE) continue;
     const expected = manifest.files[relative];
     const actual = sha256(file);
     if (expected === actual) continue;
@@ -178,7 +180,7 @@ function syncLateWrites(source: string, final: string): void {
     writeFileSync(destination, readFileSync(file));
     manifest.files[relative] = actual;
   }
-  atomicWrite(join(final, 'manifest.json'), `${JSON.stringify({
+  atomicWrite(join(final, MANIFEST_FILE), `${JSON.stringify({
     schema: 1, files: manifest.files,
   })}\n`);
 }
@@ -257,12 +259,13 @@ async function copyAndVerify(ctx: RpcContext, status: MoveStatus): Promise<MoveS
   for (const file of sourceFiles) {
     const relative = file.slice(status.source.length + 1);
     const copied = join(paths.incoming, relative);
-    if (!existsSync(copied) || sha256(file) !== sha256(copied)) {
+    const hash = sha256(file);
+    if (!existsSync(copied) || hash !== sha256(copied)) {
       throw moveError('STORE_OFFLINE', `copy verification failed for ${relative}`);
     }
-    manifest[relative] = sha256(file);
+    if (relative !== MANIFEST_FILE) manifest[relative] = hash;
   }
-  atomicWrite(join(paths.incoming, 'manifest.json'), `${JSON.stringify({
+  atomicWrite(join(paths.incoming, MANIFEST_FILE), `${JSON.stringify({
     schema: 1, files: manifest,
   })}\n`);
   return writeMove(ctx, { ...current, verified: true, fileCount: sourceFiles.length });
@@ -404,12 +407,12 @@ export function undoMove(ctx: RpcContext, projectId: string): MoveStatus {
   const originals = new Set(
     filesUnder(status.source)
       .map((file) => file.slice(status.source.length + 1))
-      .filter((relative) => relative !== 'manifest.json'),
+      .filter((relative) => relative !== MANIFEST_FILE),
   );
   const moved = new Set(
     filesUnder(paths.final)
       .map((file) => file.slice(paths.final.length + 1))
-      .filter((relative) => relative !== 'manifest.json'),
+      .filter((relative) => relative !== MANIFEST_FILE),
   );
   if (moved.size !== originals.size
       || [...moved].some((relative) => !originals.has(relative))) {
@@ -419,7 +422,7 @@ export function undoMove(ctx: RpcContext, projectId: string): MoveStatus {
   }
   for (const file of filesUnder(paths.final)) {
     const relative = file.slice(paths.final.length + 1);
-    if (relative === 'manifest.json') continue;
+    if (relative === MANIFEST_FILE) continue;
     if (sha256(file) !== sha256(join(status.source, relative))) {
       throw moveError(
         'MOVE_CHANGED', 'the moved store changed after the switch; copy new mail back before undoing',
@@ -452,7 +455,8 @@ export function deleteOldStore(ctx: RpcContext, projectId: string): { deleted: b
   if (!manifest) {
     throw moveError('MOVE_CHANGED', 'the moved store has no copy manifest; refusing to delete the old store');
   }
-  const expected = Object.keys(manifest.files).sort();
+  // Older moves could record the source store's manifest as a payload file.
+  const expected = Object.keys(manifest.files).filter((relative) => relative !== MANIFEST_FILE).sort();
   // The old store matching the manifest is not enough: the live destination
   // must still hold every file the move verified, with the same bytes.
   const destinationFiles = new Set(
@@ -466,7 +470,10 @@ export function deleteOldStore(ctx: RpcContext, projectId: string): { deleted: b
       );
     }
   }
-  const actual = filesUnder(source).map((file) => file.slice(source.length + 1)).sort();
+  const actual = filesUnder(source)
+    .map((file) => file.slice(source.length + 1))
+    .filter((relative) => relative !== MANIFEST_FILE)
+    .sort();
   if (actual.length !== expected.length
       || actual.some((relative, i) => relative !== expected[i]
         || sha256(join(source, relative)) !== manifest.files[relative])) {

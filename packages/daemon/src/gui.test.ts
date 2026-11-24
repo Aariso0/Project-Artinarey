@@ -629,6 +629,30 @@ test('delete-old is an explicit second confirmation after a completed move', asy
   assert.equal(secondDelete.ok, false);
 });
 
+test('moving an already moved store excludes only the root manifest from the inventory', async (t) => {
+  const s = setupAcceptance(t);
+  const firstTarget = join(s.root, 'first-target');
+  const secondTarget = join(s.root, 'second-target');
+  mkdirSync(firstTarget);
+  mkdirSync(secondTarget);
+  mkdirSync(join(s.project.storeDir, 'nested'));
+  writeFileSync(join(s.project.storeDir, 'nested', 'manifest.json'), 'payload\n');
+
+  const first = await startMove(ctx(s), s.project.id, firstTarget);
+  assert.equal(first.phase, 'done', first.error ?? '');
+  const second = await startMove(ctx(s), s.project.id, secondTarget);
+  assert.equal(second.phase, 'done', second.error ?? '');
+  const manifest = JSON.parse(readFileSync(join(moveFinalPath(second), 'manifest.json'), 'utf8'));
+  assert.equal(Object.hasOwn(manifest.files, 'manifest.json'), false);
+  assert.equal(manifest.files['nested/manifest.json'],
+    createHash('sha256').update('payload\n').digest('hex'));
+
+  const deleted = await handleGuiRequest(
+    { id: '1', method: 'gui.moveDeleteOld', params: { projectId: s.project.id } }, ctx(s));
+  assert.deepEqual(deleted.ok ? deleted.result : deleted.error, { deleted: true });
+  assert.equal(existsSync(moveFinalPath(first)), false);
+});
+
 test('delete-old refuses when the moved store lost a manifest file', async (t) => {
   const s = setupAcceptance(t);
   const target = join(s.root, 'missing-final-file-target');

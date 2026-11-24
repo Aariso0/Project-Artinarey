@@ -468,7 +468,7 @@ test('a refresh started in one scope does not write snapshots or errors after th
 
 test('a refresh completing during a pending scope load does not drop that successful load', async () => {
   const guard = createScopeGuard();
-  const scopeLoad = guard.next();
+  const scopeResult = deferred<Snapshots>();
   const scope = liveScope('project-1');
   const refreshResult = deferred<Snapshots>();
   const written: Snapshots[] = [];
@@ -479,13 +479,21 @@ test('a refresh completing during a pending scope load does not drop that succes
     () => {},
   );
 
+  const load = guard.loadRequested(
+    guard.next(), () => true, () => scopeResult.promise,
+    async () => snapshots.worktrees.map((worktree) => ({ ...worktree, autoApprove: true })),
+    (next) => { written.push(next); },
+  );
+  guard.worktreesChanged();
   refresh();
   refreshResult.resolve({ ...snapshots, tasks: [] });
   await flush();
   assert.equal(written.length, 1, 'the refresh applies when the loaded scope is unchanged');
 
   const scopeSnapshots: Snapshots = { ...snapshots, storage: null };
-  assert.ok(guard.apply(scopeLoad, true, scopeSnapshots, (next) => { written.push(next); }),
-    'the pending scope load is still current after the refresh');
-  assert.equal(written[1], scopeSnapshots, 'the successful scope load is applied, not discarded');
+  scopeResult.resolve(scopeSnapshots);
+  await load;
+  assert.equal(written.length, 2, 'the requested scope still publishes');
+  assert.equal(written[1].storage, null, 'the requested scope keeps its own snapshot');
+  assert.equal(written[1].worktrees[0].autoApprove, true, 'stale settings are replaced before publication');
 });

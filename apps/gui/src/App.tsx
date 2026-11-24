@@ -109,13 +109,30 @@ type LiveScope = { scope: Scope; version: number };
 /** Only the newest scope load may publish snapshots; refresh never claims this guard. */
 export function createScopeGuard() {
   let seq = 0;
+  let worktreeVersion = 0;
   return {
     next: () => ++seq,
     isCurrent: (claimed: number) => claimed === seq,
-    apply(claimed: number, active: boolean, next: Snapshots, setSnapshots: (value: Snapshots) => void) {
-      if (!active || claimed !== seq) return false;
-      setSnapshots(next);
-      return true;
+    worktreesChanged: () => { worktreeVersion++; },
+    async loadRequested(
+      claimed: number,
+      isActive: () => boolean,
+      load: () => Promise<Snapshots>,
+      readWorktrees: () => Promise<GuiWorktree[]>,
+      publish: (next: Snapshots) => void,
+    ) {
+      let version = worktreeVersion;
+      let next = await load();
+      while (isActive() && claimed === seq) {
+        if (version === worktreeVersion) {
+          publish(next);
+          return;
+        }
+        // The scope is still requested, but a successful action may have
+        // changed its worktrees while the snapshot was being loaded.
+        version = worktreeVersion;
+        next = { ...next, worktrees: await readWorktrees() };
+      }
     },
   };
 }
@@ -465,13 +482,11 @@ export function App({ api, initial, initialError }: AppProps) {
     [api],
   );
 
-  useEffect(() => {
-    const current = liveScope.current.scope;
-    if (current.projectId !== scopeState.loaded.projectId
-      || current.recipient !== scopeState.loaded.recipient) {
-      liveScope.current = { scope: scopeState.loaded, version: liveScope.current.version + 1 };
-    }
-  }, [scopeState.loaded]);
+  const publishScope = useCallback((scope: Scope, next: Snapshots) => {
+    liveScope.current = { scope, version: liveScope.current.version + 1 };
+    setSnapshots(next);
+    dispatchScope({ type: 'loadSucceeded', scope });
+  }, []);
 
   useEffect(() => {
     if (initial || initialError) return;
@@ -483,8 +498,8 @@ export function App({ api, initial, initialError }: AppProps) {
         const projectId = projects[0]?.id ?? '';
         if (!active || !scopeGuard.current.isCurrent(seq)) return;
         const next = await loadAll(projectId, ALL_RECIPIENTS);
-        if (!scopeGuard.current.apply(seq, active, next, setSnapshots)) return;
-        dispatchScope({ type: 'loadSucceeded', scope: { projectId, recipient: ALL_RECIPIENTS } });
+        if (!active || !scopeGuard.current.isCurrent(seq)) return;
+        publishScope({ projectId, recipient: ALL_RECIPIENTS }, next);
       } catch (err) {
         if (active) setError(typedError(err));
       } finally {
@@ -492,33 +507,40 @@ export function App({ api, initial, initialError }: AppProps) {
       }
     })();
     return () => { active = false; };
-  }, [api, initial, initialError, loadAll]);
+  }, [api, initial, initialError, loadAll, publishScope]);
 
   useEffect(() => {
     if (!scopeRequest) return;
     let active = true;
     const seq = scopeGuard.current.next();
     setScopeLoading(true);
-    void (async () => {
-      try {
-        const next = await loadAll(scopeRequest.projectId, scopeRequest.recipient);
-        if (!scopeGuard.current.apply(seq, active, next, setSnapshots)) return;
+    void scopeGuard.current.loadRequested(
+      seq,
+      () => active,
+      () => loadAll(scopeRequest.projectId, scopeRequest.recipient),
+      () => api.worktrees(scopeRequest.projectId),
+      (next) => {
+        setScopeLoading(false);
         setError(null);
-        dispatchScope({ type: 'loadSucceeded', scope: scopeRequest });
-      } catch (err) {
-        if (active) {
-          setError(typedError(err));
-          dispatchScope({ type: 'requestFailed' });
-        }
-      } finally {
-        if (active) setScopeLoading(false);
-      }
-    })();
+        publishScope(scopeRequest, next);
+      },
+    ).catch((err) => {
+      if (!active || !scopeGuard.current.isCurrent(seq)) return;
+      setScopeLoading(false);
+      setError(typedError(err));
+      dispatchScope({ type: 'requestFailed' });
+    });
     return () => { active = false; };
-  }, [api, scopeRequest, loadAll]);
+  }, [api, scopeRequest, loadAll, publishScope]);
 
   const refresh = useMemo(
-    () => refreshLoadedScope(loadAll, liveScope, setSnapshots, setError),
+    () => {
+      const refreshLoaded = refreshLoadedScope(loadAll, liveScope, setSnapshots, setError);
+      return () => {
+        scopeGuard.current.worktreesChanged();
+        refreshLoaded();
+      };
+    },
     [loadAll],
   );
 
