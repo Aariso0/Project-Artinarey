@@ -1,0 +1,16 @@
+{
+  "name": "@artinarey/cli",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "bin": {
+    "artinarey": "bin/artinarey"
+  },
+  "dependencies": {
+    "@artinarey/core": "workspace:*",
+    "@artinarey/daemon": "workspace:*"
+  },
+  "devDependencies": {
+    "better-sqlite3": "13.2.0"
+  }
+}

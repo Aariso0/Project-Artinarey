@@ -1,0 +1,20 @@
+{
+  "name": "artinarey",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --import tsx --test 'packages/*/src/*.test.ts'",
+    "typecheck": "tsc --noEmit -p tsconfig.json --pretty false",
+    "lint": "eslint packages",
+    "build": "tsc --noEmit -p tsconfig.json --pretty false"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.6.6",
+    "eslint": "^10.15.0",
+    "tsx": "^4.23.15",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.74.0"
+  },
+  "packageManager": "pnpm@10.34.9"
+}

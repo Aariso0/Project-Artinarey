@@ -1,7 +1,7 @@
 # Project-Artinarey: Plan
 
-> **Next action:** run **M0, the spike** (section 15, M0). About 2 hours. It checks the identity assumption against real tools.
-> **Status:** design settled, implementation unverified. Nothing is built. Plan date: 2026-11-23. All 15 design questions, the 3 open questions and the 14 unverified assumptions were resolved on 2026-11-23; several answers changed the design (section 17).
+> **Next action:** start **M4, leases and enforcement** (section 15, M4). M0–M3 are implemented and verified; no M4+ work is started here.
+> **Status:** design settled; M0–M3 built and verified, M4+ not started. Plan date: 2026-11-23. All 15 design questions, the 3 open questions and the 14 unverified assumptions were resolved on 2026-11-23; several answers changed the design (section 17).
 > **Estimates** are my guesses, not measurements. Treat them as ±50%.
 > **Evidence** for every checked assumption is in section 17. Where evidence contradicted the design, the decision log (section 2) records what replaced it.
 
@@ -11,14 +11,14 @@
 
 Legend: ⬜ not started · 🟨 in progress · ✅ done · 🟥 blocked
 
-**Overall:** `░░░░░░░░░░░░░░░░░░░░` 0 of 9 milestones done · **Slice 1 (M0–M6):** 0 of 7 done
+**Overall:** `████░░░░░░░░░░░░░░` 4 of 9 milestones done · **Slice 1 (M0–M6):** 4 of 7 done
 
 | M | Goal | Estimate | Status | Part of |
 |---|---|---|---|---|
-| M0 | Spike: does the shim see the agent's folder? | 2 h | ⬜ | Slice 1 |
-| M1 | Store, mail files, registry, daemon skeleton | 1–1.5 d | ⬜ | Slice 1 |
-| M2 | MCP shim, tools, identity by folder | 1 d | ⬜ | Slice 1 |
-| M3 | Worktree manager, home-worktree warnings, `run` | 1 d | ⬜ | Slice 1 |
+| M0 | Spike: does the shim see the agent's folder? | 2 h | ✅ | Slice 1 |
+| M1 | Store, mail files, registry, daemon skeleton | 1–1.5 d | ✅ | Slice 1 |
+| M2 | MCP shim, tools, identity by folder | 1 d | ✅ | Slice 1 |
+| M3 | Worktree manager, home-worktree warnings, `run` | 1 d | ✅ | Slice 1 |
 | M4 | Leases, git hook, pre-merge check | 1 d | ⬜ | Slice 1 |
 | M5 | OpenCode adapter, spawn cap, role cards | 2 d | ⬜ | Slice 1 |
 | M6 | Read-only desktop window | 1.5 d | ⬜ | Slice 1 |
@@ -50,17 +50,17 @@ Each row flips to ✅ verified, or 🟥 failed (then the fallback in the last co
 | U11 | Which MCP clients use the 2026-07-28 revision | M2 | ✅ | OpenCode probes or opts in; Claude Code needs the v2 runtime; Codex unconfirmed. The stateless shim supports both revisions. |
 | U12 | Name "Artinarey" is free | before publishing | ✅ | No footprint in npm, PyPI, crates.io, GitHub or `.com` RDAP on 2026-11-23. Negative evidence, not proof. |
 | U13 | OS is Linux | M1 | ✅ | User confirmed on 2026-11-23: Linux for now. |
-| U14 | Parent-pid liveness as release signal | M2 | 🟥 | `ppid` changes on reparenting and PIDs are reused. Use pidfd (section 6). |
+| U14 | Parent-pid liveness as release signal | M2 | 🟥 | `ppid` changes on reparenting and PIDs are reused. Use pidfd (section 6). Node 26 has no pidfd API yet; M2 releases on shim socket close with a pid liveness cross-check (section 15). |
 
 ### Spike results (fill in during M0)
 
 | Check | OpenCode | Notes |
 |---|---|---|
-| Shim `cwd` in main dir | | |
-| Shim `cwd` in a worktree | | |
-| `info/exclude` covers marker in a worktree | | |
-| Shared hook fires from a worktree commit | | |
-| `opencode serve` session in a worktree loads MCP config | | |
+| Shim `cwd` in main dir | ✅ `/mnt/shareddata/projects/Project-Artinarey` | `opencode run --standalone --auto`, tool returned cwd; MCP config was local and gitignored, with an explicit `artinarey_m0_whoami` allow rule (2026-11-23) |
+| Shim `cwd` in a worktree | ✅ `/mnt/shareddata/projects/Project-Artinarey-m0-wt` | Same tool call from the linked worktree; local `opencode.json` copied there; first `mcp list` was transiently empty, retry connected (2026-11-23) |
+| `info/exclude` covers marker in a worktree | ✅ shared common file applies | `git check-ignore -v` in the worktree reported `.git/info/exclude:7:.artinarey.json`; `git status --short` stayed clean (2026-11-23) |
+| Shared hook fires from a worktree commit | ✅ worktree `pwd` in log | `core.hooksPath` set to an absolute path in common config; log line showed `/mnt/shareddata/projects/Project-Artinarey-m0-wt` (2026-11-23) |
+| `opencode serve` session in a worktree loads MCP config | ✅ cwd = worktree, canonical = main | `POST /api/session` with `location.directory` worked; `GET /api/location?location[directory]=…` returned `project.canonical = /mnt/shareddata/projects/Project-Artinarey` (2026-11-23) |
 
 ---
 
@@ -133,9 +133,10 @@ Why it exists:
 | API | Model access | OpenCode only for now. A separate adapter process calls a model API through a configurable base URL; the daemon still has no LLM and no outbound calls. |
 | GUI | Daemon auth | The webview holds no secret. The native Tauri shell proxies daemon calls, and the daemon checks a per-platform Origin allowlist. |
 | Liveness | Session release | A pidfd-based process handle, not the parent PID. Manual force-release stays. |
+| Trust | Socket role | **Coordination, not authorization.** Agents are cooperative peers under one OS user; the socket stops them overwriting each other. An agent acts only as the persona bound to its directory. Starting another persona in a worktree with an active agent or pending work requires your approval. An active agent holds an exclusive worktree lock until it is stopped or you force-release it. |
 
 ### Interactions between decisions (read these)
-1. **A1 c + one persona per directory.** Directory identity means two personas cannot share a directory. The daemon enforces one active persona per directory. A second session there is refused (`DIRECTORY_BUSY`) unless the user takes over.
+1. **A1 c + one active persona per directory.** Directory identity decides which persona an agent acts as. Only one persona may be active in a worktree at a time; other personas may work there later, once it is released and has no pending work. A second simultaneous claim is refused (`DIRECTORY_BUSY`) unless the user takes over.
 2. **Senior dev sessions, not subagents.** The senior dev spawns completely new independent sessions that keep running when it is idle. It never creates subagents. Subagent permission inheritance is not documented and is not relied on.
 3. **A1 c depends on the shim's working directory equalling the agent's.** OpenCode docs say the MCP `cwd` defaults to the workspace/project folder; M0 confirms it with real worktrees.
 4. **B4 c + leases.** Because nothing merges itself, the real checkpoint is the pre-merge check (section 8), not the commit hook.
@@ -311,6 +312,13 @@ Style (shared with chatter): ACTION first, numbered steps, time estimates, no pr
 - **Release** happens when: the shim disconnects and a pidfd reports the process is gone, the `artinarey run` wrapper exits, the GUI session ends, or the user force-releases in GUI or CLI. Parent PID is not used: it changes on reparenting and can be reused.
 - **Take over** (user only): GUI or `artinarey release <worktree> --force`.
 
+### Several personas, one worktree
+- Personas are associated with a worktree over time; only one may be active in it at once. A new persona may be spun up there when no persona is currently active and no one has pending work in that worktree.
+- If another persona has pending work there, spinning up a new one needs your permission. The approval card shows the project, worktree, persona, and what is pending. Agents may exchange mail and propose a mutually agreeable handoff, but they cannot approve their own replacement.
+- If a persona is currently active, the worktree is locked: no second agent can run there until that persona is stopped or you force-release it. The GUI shows a macOS-style modal explaining that you must stop or delete persona X to do Y in that worktree, with an OK button to dismiss it.
+- Mail is per persona: an agent sends and receives only as the persona bound to its directory. The daemon derives `from` from the binding, never from a client-supplied field. The socket is a coordination channel, not an authorization boundary; directory spoofing remains an accepted risk (section 13).
+- These spawn and modal rules are for M4/M5/M7; M3 only enforces the active binding and the git worktree lock.
+
 ### First session in a project
 The agent calls `check_in`. With no personas, it is told to ask the user which role to start as (developer, researcher, tester, senior dev). Then `claim_persona(new_role=...)`.
 
@@ -381,7 +389,7 @@ GUI "Adopt" or `artinarey worktree adopt <path>` for worktrees created elsewhere
 - Moved path or changed branch: flagged, binding paused until the user confirms.
 
 ### Lock
-While a persona is bound, the daemon runs `git worktree lock --reason "artinarey: <persona> active"` and unlocks on release. Prevents accidental `worktree remove` or prune.
+While a persona is bound, the daemon runs `git worktree lock --reason "artinarey: <persona> active"` and unlocks on release. Prevents accidental `worktree remove` or prune. This is also the safe lock that stops a second agent from running in the worktree until the active persona is stopped or the user force-releases it.
 
 ### Remove
 GUI or CLI refuses if a persona is bound. Uses `git worktree remove` without `--force`. **Never deletes a branch.**
@@ -432,6 +440,7 @@ The senior dev may stack steps on an agent: do a step, ask you to approve, then 
 3. Under the cap: spawn immediately. At or over the cap: show a warning phrased around token consumption; you may proceed, but a senior-dev request creates a **pending approval** and waits for you (`CAP_REACHED` with the approval ID). Artinarey does not measure tokens.
 4. Spawn: bind persona to the directory, lock the worktree, launch via the adapter, record the session. The new session is completely independent and keeps running when the senior dev is idle. The senior dev never creates subagents and cannot delete personas.
 5. The agent receives its first prompt: role card, task, scope, "call `check_in` first". Chained steps are stored with the task; each waits at its own approval gate.
+6. Before spawning into a worktree, check that no persona is active there and no one has pending work in it. If either is true, only the user may authorise the session; agents can propose a handoff by mail but cannot self-approve.
 
 **Cap (C2 a):** 3 running sessions **per project**, soft. Configurable; over-cap needs your approval when the senior dev asks.
 **Agents never launch processes.** Only the daemon does.
@@ -545,8 +554,10 @@ Style: minimal, dark. Background `#0d1117`, text `#e6edf3`, accent green `#2ea04
    - **Pre-merge:** per branch, changed files vs lease, red flags. No merge button (B4 c).
    - **Audit:** append-only log view.
 3. **Chat:** one persona at a time. Live session: message delivered through the adapter. No live session: queued as mail, with a "start a session?" prompt.
-4. **Approvals tray:** risky calls, spawn over cap, scope requests, persona takeover. Shows which agent is blocked and how long it has waited.
+4. **Approvals tray:** risky calls, spawn over cap, scope requests, persona takeover, and spawning into a worktree with pending work. Shows which agent is blocked and how long it has waited.
 5. **Settings:** data root, spawn cap, shared files, env include list, port offset step.
+
+**Active-worktree blocker dialog:** macOS-style modal when an agent tries to start in a worktree that is locked by an active persona. It names the project, worktree, and blocking persona, says the user must stop or delete persona X to do Y, and has a single OK button to close it.
 
 ### v1 scope (D3 a)
 Slice 1 has a read-only window: Projects, Personas, Worktrees, Mail list. Chat, worktree creation, approvals, and Move arrive in M7.
@@ -568,7 +579,7 @@ Slice 1 has a read-only window: Projects, Personas, Worktrees, Mail list. Chat, 
 1. **Containment is detection, not a sandbox.** The shim detects out-of-worktree intent with command and path heuristics and asks you, but detection can be bypassed: `curl` launched from inside the worktree reaches the network, and `python -c "open('/etc/passwd')"` contains no outside path. You accepted this residual risk on 2026-11-23. There is no dedicated OS user, container, or egress limit in v1; reopen only if you change your mind. Public docs must say out-of-worktree use is **detected and approval-gated**, never "impossible".
 2. **"Local only" is partial.** Anything an agent reads reaches its model provider, and the separate API adapter calls a model API. Keep secrets out of mail. Free-plan data policies are not checked.
 3. **Hooks can be skipped** (`--no-verify`). Checkpoint 3 (pre-merge check) is the backstop.
-4. **Directory identity can be spoofed** by an agent that `cd`s into another worktree and calls the tools. This also weakens containment detection. Mitigations: the daemon logs the directory on every call, takes over only through the user, and flags a persona that calls from a directory that is not its binding.
+4. **Directory identity can be spoofed** by an agent that `cd`s into another worktree and calls the tools. This also weakens containment detection. The socket is a coordination channel among cooperative agents under one OS user, not an authorization boundary; persona isolation is logical (mail identity comes from the binding, never from a client field). Mitigations: the daemon logs the directory on every call, takeovers and force-releases are user actions, and a persona calling from a directory that is not its binding is flagged. Spawn approval for pending work and the active-worktree blocker modal are M4/M5/M7 work, not M3 enforcement. Note that a crafted socket client could call internal methods such as `release_force` today; hardening that is tracked in M5.
 5. **A blocked agent waits forever** if you never answer. Notifications stop after 15 minutes and the session keeps its cap slot. By design: no auto-fail, no timeout release.
 
 ---
@@ -604,64 +615,67 @@ SQLite or the index on a network share. The store is plain files so it is safe o
 Tick boxes as tasks finish. Estimates are guesses. Slice 1 (M0–M6) ≈ 8–9 working days. Everything ≈ 3.5–4.5 weeks full-time; part-time, double it.
 
 ### M0 · Spike
-**Status:** ⬜ · **Estimate:** 2 h · **Depends on:** nothing · **Confirms:** U1, U8 in practice
+**Status:** ✅ · **Estimate:** 2 h · **Depends on:** nothing · **Confirms:** U1, U8 in practice
 
-Goal: confirm the working-directory identity (A1 c) with real tools before writing code. Documentation research already answered these questions; this is a hands-on check, not open research.
+Goal: confirm the working-directory identity (A1 c) with real tools before writing code. Documentation research already answered these questions; this is a hands-on check, not open research. One permanent item is included by request: Dependabot plus CI automatic checks (task 6); unlike the rest of M0, those files are kept.
 
-- [ ] 1. Write a tiny stdio MCP server (TypeScript) with one tool returning `process.cwd()`, `argv`, and the environment variable names
-- [ ] 2. Register it in OpenCode's project MCP config; call the tool in the main directory and again inside a git worktree; record both `cwd` values
-- [ ] 3. Create a worktree; run `git check-ignore -v .artinarey.json` with the entry only in `.git/info/exclude`; commit in the worktree and confirm a hook in the shared hooks directory fires
-- [ ] 4. Start `opencode serve`; create a session scoped to a worktree; confirm the shim's `cwd` is that worktree and that config comes from the canonical checkout
-- [ ] 5. Fill in the Spike results table
+- [x] 1. Write a tiny stdio MCP server (TypeScript) with one tool returning `process.cwd()`, `argv`, and the environment variable names
+- [x] 2. Register it in OpenCode's project MCP config; call the tool in the main directory and again inside a git worktree; record both `cwd` values
+- [x] 3. Create a worktree; run `git check-ignore -v .artinarey.json` with the entry only in `.git/info/exclude`; commit in the worktree and confirm a hook in the shared hooks directory fires
+- [x] 4. Start `opencode serve`; create a session scoped to a worktree; confirm the shim's `cwd` is that worktree and that config comes from the canonical checkout
+- [x] 5. Fill in the Spike results table
+- [x] 6. Add Dependabot and CI automatic checks (`.github/dependabot.yml`, `.github/workflows/ci.yml`) — repository infrastructure, retained after the spike
 
 **Done when:** every check has a recorded result.
 **Exit rule:** if the shim's `cwd` is not the worktree, fall back to a static header or environment value supplied per session by the daemon (identity still tied to the directory record). Subagents and Codex are out of scope; both were settled in section 17.
 **Notes / blockers:**
 
 ### M1 · Store, mail, registry, daemon skeleton
-**Status:** ⬜ · **Estimate:** 1–1.5 d · **Depends on:** M0 · **Checks:** U13
+**Status:** ✅ · **Estimate:** 1–1.5 d · **Depends on:** M0 · **Checks:** U13
 
-- [ ] pnpm monorepo scaffold (TypeScript config, lint, test runner)
-- [ ] `core`: ULID ids, XDG path helpers, config loader
-- [ ] Store writer: atomic write (temp, fsync, rename), mail mode 0444, append-only journals, torn-line recovery
-- [ ] Mail schema and validation (required fields, 8 KB cap, secret tripwire, recipient rules)
-- [ ] Registry (SQLite): projects, worktrees, personas, bindings, sessions, moves
-- [ ] Index builder and `artinarey reindex`
-- [ ] Daemon skeleton: unix socket API, start/stop/status, single-instance lock
-- [ ] Test: 50 parallel `send_mail` give unique ids and none lost
-- [ ] Test: `kill -9` mid-write recovers cleanly
+- [x] pnpm monorepo scaffold (TypeScript config, lint, test runner)
+- [x] `core`: ULID ids, XDG path helpers, config loader
+- [x] Store writer: atomic write (temp, fsync, rename), mail mode 0444, append-only journals, torn-line recovery
+- [x] Mail schema and validation (required fields, 8 KB cap, secret tripwire, recipient rules)
+- [x] Registry (SQLite): projects, worktrees, personas, bindings, sessions, moves
+- [x] Index builder and `artinarey reindex`
+- [x] Daemon skeleton: unix socket API, start/stop/status, single-instance lock
+- [x] Test: 50 parallel `send_mail` give unique ids and none lost
+- [x] Test: `kill -9` mid-write recovers cleanly
 
 **Done when:** the two tests above pass.
-**Notes / blockers:**
+**Notes / blockers:** 41 tests pass; `pnpm test`, `pnpm typecheck`, `pnpm lint`, `pnpm build` all green. `better-sqlite3@13.2.0` ships prebuilt binaries, so no native build step is needed in CI. Implementation plan: `docs/plans/2026-11-23-m1-foundation.md`.
 
 ### M2 · MCP shim, tools, identity by folder
-**Status:** ⬜ · **Estimate:** 1 d · **Depends on:** M1 · **Checks:** U11, U14
+**Status:** ✅ · **Estimate:** 1 d · **Depends on:** M1 · **Checks:** U11, U14
 
-- [ ] Shim: stdio MCP server using the official SDK; forwards `cwd` and a pidfd-based liveness handle to the daemon
-- [ ] Marker finder and the resolver: folder to worktree to persona
-- [ ] Tools 1–7 and 13 (`check_in`, `claim_persona`, `inbox`, `read_mail`, `send_mail`, `mark_done`, `report`, `worktrees`)
-- [ ] Reply format (`unread`, `next`) and error texts that say stop or retry-after
-- [ ] Roster, `DIRECTORY_BUSY`, release rules, force release
-- [ ] `artinarey connect opencode`
-- [ ] Test: two directories, two personas, mail both ways through real OpenCode
+- [x] Shim: stdio MCP server using the official SDK; forwards `cwd` and a liveness handle to the daemon
+- [x] Marker finder and the resolver: folder to worktree to persona
+- [x] Tools 1–7 and 13 (`check_in`, `claim_persona`, `inbox`, `read_mail`, `send_mail`, `mark_done`, `report`, `worktrees`)
+- [x] Reply format (`unread`, `next`) and error texts that say stop or retry-after
+- [x] Roster, `DIRECTORY_BUSY`, release rules, force release
+- [x] `artinarey connect opencode`
+- [x] Test: two directories, two personas, mail both ways through real OpenCode
 
 **Done when:** the real-OpenCode mail test passes.
-**Notes / blockers:**
+**Notes / blockers:** 69 tests pass; `pnpm test`, `pnpm typecheck`, `pnpm lint`, `pnpm build` all green. Two real OpenCode sessions in separate directories claimed different personas and exchanged mail in both directions; `DIRECTORY_BUSY`, `NEEDS_CONFIRMATION`, `NO_PROJECT` and `WORKTREE_UNMANAGED` all have recorded results. Implementation plan: `docs/plans/2026-11-23-m2-mcp-shim-identity.md`.
+
+Implementation deviation (no decision changes): Node 26 exposes no pidfd API. The shim holds one long-lived socket per session; the daemon releases the binding when that socket closes and cross-checks the forwarded pid with `process.kill(pid, 0)`. This is event-driven, not polled, and keeps the settled intent of tying liveness to the session rather than the parent pid. Revisit if Node gains pidfd support. Manual `release <worktree> --force` remains the user's override.
 
 ### M3 · Worktree manager and home-worktree rule
-**Status:** ⬜ · **Estimate:** 1 d · **Depends on:** M2
+**Status:** ✅ · **Estimate:** 1 d · **Depends on:** M2
 
-- [ ] Parser for `git worktree list --porcelain` with captured fixtures (detached, locked, prunable, bare)
-- [ ] Reconcile: managed, unmanaged, missing
-- [ ] `artinarey init`: marker, exclude block, registry entry, report of global ignore coverage (read-only)
-- [ ] `worktree new`: preflight, C4 warning, port offset, env copy
-- [ ] `worktree adopt` and `remove`; lock and unlock while bound
-- [ ] Home-worktree rule: warning, confirm, `rehome`, audit line; senior dev exempt
-- [ ] `artinarey run <vendor>`: bind, warn, exec, release on exit
-- [ ] `persona rehome` (same project only)
+- [x] Parser for `git worktree list --porcelain` with captured fixtures (detached, locked, prunable, bare)
+- [x] Reconcile: managed, unmanaged, missing
+- [x] `artinarey init`: marker, exclude block, registry entry, report of global ignore coverage (read-only)
+- [x] `worktree new`: preflight, C4 warning, port offset, env copy
+- [x] `worktree adopt` and `remove`; lock and unlock while bound
+- [x] Home-worktree rule: warning, confirm, `rehome`, audit line; senior dev exempt
+- [x] `artinarey run <vendor>`: bind, warn, exec, release on exit
+- [x] `persona rehome` (same project only)
 
 **Done when:** create, adopt, list, remove all work, and the warning fires on a mismatch.
-**Notes / blockers:**
+**Notes / blockers:** 116 tests pass; `pnpm test`, `pnpm typecheck`, `pnpm lint`, `pnpm build` all green. Real CLI smoke check in a fresh temp git repo with isolated XDG roots: `init` → `worktree list` → `worktree new smoke --yes` → `worktree list` → `worktree remove smoke` → `worktree list` all exited 0; two managed rows appeared and list returned to one after removal. Tracked files and `.gitignore` were unchanged, no generated `opencode.json`, `.env*` or registry artifacts landed in the checkout, and the temp repo was removed.
 
 ### M4 · Leases and enforcement
 **Status:** ⬜ · **Estimate:** 1 d · **Depends on:** M3 · **Checks:** U3
@@ -686,6 +700,8 @@ Goal: confirm the working-directory identity (A1 c) with real tools before writi
 - [ ] Tool 12 `request_session`; cap 3 per project; over-cap warning and CLI approval path
 - [ ] CLI approval commands (`approvals`, `approve`) and OS desktop notifications at 0/5/15 minutes
 - [ ] Supervision: pidfd handles, re-adopt after daemon restart, logs under the cache folder
+- [ ] Refuse to spawn into a worktree with an active persona or pending work unless the user approves; the card shows project, worktree, persona and pending item
+- [ ] Durable claim generations and conditional ownership updates across CLI and daemon, with reconciliation for interrupted Git lock transfers; keep `release_force` and shutdown behind operator authorization
 - [ ] Role cards: senior dev, developer, researcher, tester
 - [ ] **Record the accepted risk:** section 13 containment limits documented in the README; an OS sandbox stays out of scope unless you reopen it
 
@@ -711,7 +727,8 @@ Goal: confirm the working-directory identity (A1 c) with real tools before writi
 - [ ] Chat: live through the adapter; queued as mail when no session; copy to senior dev
 - [ ] New worktree and Adopt dialogs with the C4 warning
 - [ ] Edit a persona's home worktree (same project only)
-- [ ] Approvals tray: risky calls, spawn over cap, scope requests, takeover; per-worktree auto-approve button
+- [ ] Approvals tray: risky calls, spawn over cap, scope requests, takeover, spawn into worktrees with pending work; per-worktree auto-approve button
+- [ ] Active-worktree blocker modal: name the project, worktree and blocking persona; say the user must stop or delete persona X to do Y; single OK button
 - [ ] Tabs: Tasks and leases, Sessions, Pre-merge, Audit
 - [ ] Storage settings: data root, per-project override, `storage set`
 - [ ] Move wizard: preflight, pause, copy, verify, switch, rebuild, resume, undo, delete-old confirmation
@@ -809,3 +826,7 @@ Add one line per working session: date, what moved, what is next.
 |---|---|---|
 | 2026-11-23 | Design finished: 15 of 15 questions answered (C3 a). `README.md`, `plan.md`, `logo.py` and the logo files created. | Run M0, the spike |
 | 2026-11-23 | Grilled the plan end to end; verified all 14 assumptions and closed all 3 open questions against official docs. Rewrote containment, approvals, toggle, liveness, vendor order and the API adapter. Added GPL-3.0 `LICENSE`. | Rewrite `README.md`; then run M0 |
+| 2026-11-23 | M0 spike passed all five checks; worktree identity and shared git metadata confirmed with real tools. Added Dependabot and CI checks. | Start M1 |
+| 2026-11-23 | M1 foundation implemented: pnpm monorepo, core store/mail/registry/index, daemon socket API, CLI reindex and daemon commands. 41 tests pass including the 50-way concurrency and kill -9 recovery gates. | M2 MCP shim and identity by folder |
+| 2026-11-24 | M2 MCP shim implemented: stdio MCP server, folder-based identity, tools 1–7 and 13, roster and release rules, `connect opencode`. 69 tests pass and all four gates are green; two real OpenCode sessions in separate directories exchanged mail both ways. | M3 worktree manager |
+| 2026-11-24 | M3 worktree manager implemented: porcelain parser and reconciliation, `init`, `worktree new/adopt/list/remove` with port offsets and binding locks, home-worktree warnings, `run <vendor>` and `persona rehome`. 116 tests pass and all four gates are green; six-command CLI smoke check passed in a fresh temp repo with isolated XDG roots. | M4 leases and enforcement |

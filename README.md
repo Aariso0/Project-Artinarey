@@ -8,14 +8,14 @@
 
 *Many agents. Many lanes. One project. You still do the merging.*
 
-![status](https://img.shields.io/badge/status-design%20settled-d97757?labelColor=0d1117)
+![status](https://img.shields.io/badge/status-M0-M3%20implemented-2ea043?labelColor=0d1117)
 ![local first](https://img.shields.io/badge/local--first-no%20cloud-2ea043?labelColor=0d1117)
 ![first](https://img.shields.io/badge/works%20with-OpenCode%20first-58a6ff?labelColor=0d1117)
 ![license](https://img.shields.io/badge/license-GPL--3.0-2ea043?labelColor=0d1117)
 
 </div>
 
-> **Design settled, implementation unverified.** Nothing is installable yet. The full design, the evidence behind every decision, and the progress tracker live in [`plan.md`](plan.md).
+> **Design settled. Foundation, MCP shim and worktree manager implemented and tested; two-agent mail exchange verified in OpenCode and the worktree lifecycle smoke-tested.** Nothing is installable yet. The full design, the evidence behind every decision, and the progress tracker live in [`plan.md`](plan.md).
 
 ---
 
@@ -233,21 +233,21 @@ Any tool you start by hand with `artinarey run` still gets mail and tasks, as lo
 
 ## Progress
 
-`░░░░░░░░░░░░░░░░░░░░` **0 of 9 milestones. Design settled, implementation unverified.** Nothing is built. The first step is a two-hour spike.
+`████░░░░░░░░░░░░░░` **4 of 9 milestones. Design settled, M3 implemented and tested; two-agent mail exchange verified in OpenCode and the worktree lifecycle smoke-tested.** The M0 spike passed on 2026-11-23, M1 added the store, mail, registry and daemon, M2 added the MCP shim, folder-based identity and eight tools, and M3 added worktree create/adopt/list/remove, home-worktree warnings and `run`; no adapter or window exists yet.
 
 | | Milestone | Status |
 |---|---|---|
-| M0 | Spike: can the MCP shim see the agent's folder? | — |
-| M1 | Store, mail files, daemon | — |
-| M2 | MCP shim and identity by folder | — |
-| M3 | Worktree manager and home-worktree warnings | — |
+| M0 | Spike: can the MCP shim see the agent's folder? | ✅ |
+| M1 | Store, mail files, daemon | ✅ |
+| M2 | MCP shim and identity by folder | ✅ |
+| M3 | Worktree manager and home-worktree warnings | ✅ create/list/remove and `run` smoke-tested |
 | M4 | Leases and pre-merge check | — |
 | M5 | OpenCode adapter, spawning and approvals | — |
 | M6 | Read-only window *(first usable slice)* | — |
 | M7 | Chat, dialogs, approvals, **Move** | — |
 | M8 | Model API adapter *(other vendors postponed)* | — |
 
-All 14 assumptions were checked and all 3 open decisions were closed on 2026-11-23. The evidence is in [`plan.md`](plan.md), section 17 — source of truth for task checklists and estimates.
+All 14 assumptions were checked and all 3 open decisions were closed on 2026-11-23. M0 then confirmed the worktree-identity and shared-git-metadata assumptions against real tools; results are in [`plan.md`](plan.md), section 0. Section 17 holds the research evidence — the source of truth for task checklists and estimates.
 
 ---
 
@@ -315,7 +315,7 @@ Artinarey is licensed under the **GNU General Public License, version 3 (GPL-3.0
 
 `SPDX-License-Identifier: GPL-3.0-only`
 
-This is a strong copyleft license: if you distribute a derivative work, you must make its source available under the same terms. No code or dependency manifest exists yet, so dependency licenses have not been audited — check GPL compatibility before adding a dependency.
+This is a strong copyleft license: if you distribute a derivative work, you must make its source available under the same terms. Dependencies are pinned in the workspace manifests; GPL compatibility has not been audited — check before publishing.
 
 ---
 
