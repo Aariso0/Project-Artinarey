@@ -1,0 +1,198 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  prepare:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      should_release: ${{ steps.version.outputs.should_release }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.34.9
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run version:check
+      - name: Decide whether to release
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(node .github/scripts/app-version.cjs read)"
+          TAG="$(node .github/scripts/app-version.cjs tag)"
+          tag_response="$(gh api --silent --include "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" 2>&1 || true)"
+          status_line="$(printf '%s\n' "$tag_response" | grep -m1 -E '^HTTP/[0-9.]+ [0-9]{3}' || true)"
+          case "$status_line" in
+            *" 200"*)
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *" 404"*)
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              printf '%s\n' "$tag_response" >&2
+              exit 1
+              ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  bundles:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+          - os: windows-latest
+            platform: windows
+    env:
+      CARGO_INCREMENTAL: 0
+      RUST_VERSION: stable
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.34.9
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: pnpm
+      - name: Install Tauri system dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo --version
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build:gui
+      - name: Build Linux bundles
+        if: matrix.platform == 'linux'
+        working-directory: apps/gui
+        run: pnpm exec tauri build --bundles deb rpm appimage --ci
+      - name: Build macOS bundles
+        if: matrix.platform == 'macos'
+        working-directory: apps/gui
+        run: pnpm exec tauri build --bundles app dmg --no-sign --ci
+      - name: Build Windows bundles
+        if: matrix.platform == 'windows'
+        working-directory: apps/gui
+        run: pnpm exec tauri build --bundles msi nsis --no-sign --ci
+      - name: Stage Linux bundles
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find apps/gui/src-tauri/target/release/bundle -type f \
+            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) \
+            -exec cp {} release-assets/ +
+      - name: Stage macOS bundles
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          assets_dir="$PWD/release-assets"
+          bundle_dir="apps/gui/src-tauri/target/release/bundle"
+          find "$bundle_dir" -type f -name '*.dmg' -exec cp {} release-assets/ +
+          while IFS= read -r -d '' app; do
+            name="$(basename "$app")"
+            parent="$(dirname "$app")"
+            (cd "$parent" && zip -qr "$assets_dir/${name}.app.zip" "$name")
+          done < <(find "$bundle_dir" -type d -name '*.app' -print0)
+      - name: Stage Windows bundles
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find apps/gui/src-tauri/target/release/bundle -type f \
+            \( -name '*.msi' -o \( -path '*/nsis/*' -name '*.exe' \) \) \
+            -exec cp {} release-assets/ +
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundles-${{ matrix.platform }}
+          path: release-assets/
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, bundles]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      COMMIT: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bundles-*
+          path: bundles
+          merge-multiple: true
+      - name: Create GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' assets < <(find bundles -type f -print0)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets found under bundles/" >&2
+            exit 1
+          fi
+          gh release create "$TAG" "${assets[@]}" \
+            --target "$COMMIT" \
+            --title "Artinarey $VERSION" \
+            --generate-notes

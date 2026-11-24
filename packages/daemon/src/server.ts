@@ -58,6 +58,48 @@ export function isSupervisorMethod(method: string): boolean {
   return SUPERVISOR_METHODS.has(method);
 }
 
+const MODEL_METHODS = new Set(['model_status', 'model_prompt']);
+
+export function isModelMethod(method: string): boolean {
+  return MODEL_METHODS.has(method);
+}
+
+/** Operator-only M8 controls; the key never crosses this boundary. */
+export async function handleModelRequest(
+  request: RpcRequest,
+  ctx?: RpcContext,
+): Promise<RpcResponse> {
+  const model = ctx?.model;
+  if (!model) {
+    return {
+      id: request.id, ok: false,
+      error: { code: 'ADAPTER_OFFLINE', message: 'model adapter is unavailable' },
+    };
+  }
+  const params = request.params && typeof request.params === 'object'
+    ? request.params as Record<string, unknown> : {};
+  try {
+    if (request.method === 'model_status') {
+      return { id: request.id, ok: true, result: model.status() };
+    }
+    const prompt = typeof params.prompt === 'string' ? params.prompt.trim() : '';
+    if (!prompt) throw new Error('model_prompt needs a prompt');
+    const result = await model.prompt({
+      prompt,
+      system: typeof params.system === 'string' ? params.system : undefined,
+    });
+    return { id: request.id, ok: true, result };
+  } catch (err) {
+    return {
+      id: request.id, ok: false,
+      error: {
+        code: (err as { code?: string }).code ?? 'ADAPTER_OFFLINE',
+        message: (err as Error).message ?? 'model adapter failed',
+      },
+    };
+  }
+}
+
 function str(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
@@ -168,6 +210,7 @@ async function dispatchRequest(
     };
   }
   if (isControl(request.method)) return handleRequest(request);
+  if (isModelMethod(request.method)) return handleModelRequest(request, ctx ?? shared);
   if (isSupervisorMethod(request.method)) return handleSupervisorRequest(request, ctx ?? shared);
   if (!ctx) {
     if (!isToolMethod(request.method)) return handleRequest(request);

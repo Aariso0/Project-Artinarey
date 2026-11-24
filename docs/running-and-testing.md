@@ -1,6 +1,6 @@
 # Running and testing Artinarey
 
-This document covers the local developer workflow for the daemon and the M6 read-only desktop window.
+This document covers the local developer workflow for the daemon and the M7/M8 desktop window.
 
 ## Prerequisites
 
@@ -95,10 +95,13 @@ Run these from the repository root before committing:
 pnpm run typecheck
 pnpm test
 pnpm run lint
+pnpm run test:ci
 pnpm build
 pnpm run test:gui
 pnpm run build:gui
 cargo build --manifest-path apps/gui/src-tauri/Cargo.toml
+pnpm run audit
+pnpm run version:check
 ```
 
 `test:gui` runs the Rust proxy tests. `build:gui` builds only the frontend bundle; it does not build the native app.

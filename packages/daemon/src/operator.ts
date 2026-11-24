@@ -6,6 +6,7 @@ import type { XdgPaths } from '@artinarey/core';
 /** Daemon-wide actions that must never be reachable from a raw agent socket. */
 export const OPERATOR_METHODS = new Set([
   'shutdown', 'approve', 'auto_approve', 'stop_session', 'release_force',
+  'model_status', 'model_prompt',
 ]);
 
 export function isOperatorMethod(method: string): boolean {

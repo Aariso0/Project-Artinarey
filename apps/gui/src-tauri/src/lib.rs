@@ -14,8 +14,15 @@ use std::time::Duration;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const HEADER_BUDGET: usize = 16 * 1024;
 const IO_TIMEOUT_SECS: u64 = 5;
-const ALLOWED_GUI_METHODS: [&str; 4] = [
+/// Every method the webview can reach. The daemon re-checks the `gui.` prefix
+/// and its own method table; native code is the only place that adds a method.
+const ALLOWED_GUI_METHODS: [&str; 24] = [
     "gui.projects", "gui.personas", "gui.worktrees", "gui.mail",
+    "gui.tasks", "gui.leases", "gui.sessions", "gui.preMerge", "gui.audit",
+    "gui.approvals", "gui.approve", "gui.autoApprove", "gui.stopSession",
+    "gui.createWorktree", "gui.adoptWorktree", "gui.setHomeWorktree", "gui.chat",
+    "gui.storage", "gui.setStorage", "gui.movePreflight", "gui.moveStart",
+    "gui.moveStatus", "gui.moveUndo", "gui.moveDeleteOld",
 ];
 
 /// The only error shape crossing the native boundary: `{ code, message }`.
@@ -294,8 +301,8 @@ pub fn read_port(dir: &Path) -> Result<u16, GuiError> {
         .ok_or_else(|| GuiError::new("DAEMON_UNREACHABLE", "daemon port is invalid"))
 }
 
-/// Only these four read-only methods may cross the native boundary; a future
-/// `gui.*` method is rejected until it is deliberately added here.
+/// Only these deliberately listed `gui.*` methods may cross the native
+/// boundary; a future method is rejected until it is added here.
 pub fn validate_gui_method(method: &str) -> Result<(), GuiError> {
     if ALLOWED_GUI_METHODS.contains(&method) {
         Ok(())

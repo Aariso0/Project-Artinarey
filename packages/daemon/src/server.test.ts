@@ -174,6 +174,7 @@ test('a connection cleanup failure does not hang server.close', async () => {
 test('a dispatch exception replies with the parsed request id, not invalid', async () => {
   const path = socketPath();
   const registry = {
+    projects: { get() { return { storeDir: '/tmp' }; } },
     personas: { list() { throw new Error('dispatch boom'); } },
   } as unknown as Registry;
   const server = createRpcServer(path, undefined, {

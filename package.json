@@ -1,5 +1,6 @@
 {
   "name": "artinarey",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,7 +9,10 @@
     "lint": "eslint packages apps/gui/src",
     "build": "tsc --noEmit -p tsconfig.json --pretty false",
     "build:gui": "pnpm --filter artinarey-gui exec vite build",
-    "test:gui": "cargo test --manifest-path apps/gui/src-tauri/Cargo.toml"
+    "test:gui": "cargo test --manifest-path apps/gui/src-tauri/Cargo.toml",
+    "audit": "pnpm audit --audit-level=high",
+    "test:ci": "node --import tsx --test 'packages/*/src/*.test.ts' 'apps/gui/src/*.test.ts' && node --test .github/scripts/*.test.cjs",
+    "version:check": "node .github/scripts/app-version.cjs agree"
   },
   "devDependencies": {
     "@tauri-apps/cli": "2.12.6",

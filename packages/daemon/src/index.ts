@@ -7,6 +7,7 @@ import {
 } from '@artinarey/core';
 import { startGuiHttpServer, type GuiHttpServer } from './http.ts';
 import { acquireLock } from './lock.ts';
+import { ModelAdapterClient } from './model-client.ts';
 import { isOperatorMethod, loadOrCreateOperatorToken } from './operator.ts';
 import { OpencodeAdapter } from './opencode.ts';
 import { createRpcServer, type RpcResponse, type RpcServer } from './server.ts';
@@ -21,12 +22,30 @@ export * from './gui.ts';
 export * from './http.ts';
 export * from './opencode.ts';
 export * from './sessions.ts';
+export * from './model-client.ts';
 
 export function daemonPaths(paths: XdgPaths): { socketPath: string; lockFile: string } {
   return {
     socketPath: paths.socketPath,
     lockFile: join(dirname(paths.socketPath), 'daemon.pid'),
   };
+}
+
+/** Lock and registry cleanup must wait until the adapter has released its socket. */
+export async function shutdownModelAdapter(
+  model: { stop(): Promise<void> } | undefined,
+  cleanup: () => void,
+): Promise<void> {
+  try {
+    await model?.stop();
+  } catch (err) {
+    console.error(`Model adapter shutdown failed: ${(err as Error).message ?? String(err)}`);
+  }
+  try {
+    cleanup();
+  } catch (err) {
+    console.error(`Daemon cleanup failed: ${(err as Error).message ?? String(err)}`);
+  }
 }
 
 export async function startDaemon(paths: XdgPaths): Promise<{ socketPath: string }> {
@@ -36,6 +55,7 @@ export async function startDaemon(paths: XdgPaths): Promise<{ socketPath: string
   let registry: Registry | undefined;
   let server: RpcServer | undefined;
   let gui: GuiHttpServer | undefined;
+  let model: ModelAdapterClient | undefined;
   let cleaned = false;
   const cleanup = () => {
     if (cleaned) return;
@@ -61,7 +81,8 @@ export async function startDaemon(paths: XdgPaths): Promise<{ socketPath: string
       spawnCap: loadConfig(join(paths.configDir, 'config.json')).spawnCap,
     });
     supervisor.adopt();
-    const ctx: RpcContext = { registry: opened, paths, supervisor };
+    model = new ModelAdapterClient({ socketPath: join(paths.configDir, 'model-adapter.sock') });
+    const ctx: RpcContext = { registry: opened, paths, supervisor, model };
     const operatorToken = loadOrCreateOperatorToken(paths);
     server = createRpcServer(socketPath, () => {
       const guiClose = gui?.close();
@@ -70,12 +91,14 @@ export async function startDaemon(paths: XdgPaths): Promise<{ socketPath: string
           console.error(`GUI server shutdown failed: ${(err as Error).message ?? String(err)}`);
         });
       }
-      cleanup();
+      void shutdownModelAdapter(model, cleanup);
     }, ctx, undefined, operatorToken);
     await server.start();
     gui = await startGuiHttpServer(paths, ctx);
+    await model!.start();
     return { socketPath };
   } catch (err) {
+    await model?.stop();
     await gui?.close();
     if (server) await server.close();
     cleanup();

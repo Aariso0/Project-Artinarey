@@ -1,5 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { isAbsolute, resolve } from 'node:path';
 import { ArtinareyError } from './errors.ts';
+import { atomicWrite } from './store.ts';
 
 export type Config = {
   /** Empty means "use the XDG data root". */
@@ -32,16 +34,33 @@ export function loadConfig(file: string): Config {
   if (raw.dataRoot !== undefined && typeof raw.dataRoot !== 'string') {
     throw new ArtinareyError('INVALID_INPUT', 'dataRoot must be a string');
   }
-  if (raw.spawnCap !== undefined && (!Number.isInteger(raw.spawnCap) || (raw.spawnCap as number) < 1)) {
+  if (raw.spawnCap !== undefined
+      && (typeof raw.spawnCap !== 'number' || !Number.isInteger(raw.spawnCap) || raw.spawnCap < 1)) {
     throw new ArtinareyError('INVALID_INPUT', 'spawnCap must be a positive integer');
   }
-  if (raw.ui !== undefined && (typeof raw.ui !== 'object' || raw.ui === null || Array.isArray(raw.ui))) {
+  if (raw.ui !== undefined
+      && (typeof raw.ui !== 'object' || raw.ui === null || Array.isArray(raw.ui))) {
     throw new ArtinareyError('INVALID_INPUT', 'ui must be an object');
   }
 
   return {
-    dataRoot: (raw.dataRoot as string | undefined) ?? DEFAULT_CONFIG.dataRoot,
-    spawnCap: (raw.spawnCap as number | undefined) ?? DEFAULT_CONFIG.spawnCap,
-    ui: (raw.ui as Record<string, unknown> | undefined) ?? {},
+    dataRoot: typeof raw.dataRoot === 'string' ? raw.dataRoot : DEFAULT_CONFIG.dataRoot,
+    spawnCap: typeof raw.spawnCap === 'number' ? raw.spawnCap : DEFAULT_CONFIG.spawnCap,
+    ui: (raw.ui ?? {}) as Record<string, unknown>,
   };
+}
+
+/**
+ * Storage roots are daemon-validated: the webview may send a path, never the
+ * authority to use one. An empty root means "back to the XDG default".
+ */
+export function saveConfig(file: string, patch: Partial<Pick<Config, 'dataRoot'>>): Config {
+  const current = loadConfig(file);
+  const dataRoot = patch.dataRoot === undefined ? current.dataRoot : patch.dataRoot.trim();
+  if (dataRoot && !isAbsolute(dataRoot)) {
+    throw new ArtinareyError('INVALID_INPUT', 'dataRoot must be an absolute path');
+  }
+  const next: Config = { ...current, dataRoot: dataRoot ? resolve(dataRoot) : '' };
+  atomicWrite(file, `${JSON.stringify(next, null, 2)}\n`, 0o600);
+  return next;
 }

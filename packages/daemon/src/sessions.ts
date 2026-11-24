@@ -571,6 +571,17 @@ export class SessionSupervisor {
     }
   }
 
+  /** M7 chat: deliver to a running vendor session; false means "queue as mail". */
+  async sendMessage(sessionId: string, text: string): Promise<boolean> {
+    const session = this.registry.projects.list()
+      .flatMap((project) => readSessions(this.summaryFile(project.id)))
+      .find((row) => row.id === sessionId && row.status === 'running' && row.vendorSessionId);
+    if (!session?.vendorSessionId) return false;
+    const state = await this.adapter.ensureServe();
+    await this.adapter.sendPrompt(state, session.vendorSessionId, text);
+    return true;
+  }
+
   async stopSession(id: string): Promise<boolean> {
     const summaries = this.registry.projects.list()
       .flatMap((project) => readSessions(this.summaryFile(project.id)));
