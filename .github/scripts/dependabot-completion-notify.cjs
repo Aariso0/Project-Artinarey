@@ -136,7 +136,8 @@ function escapeMarkdownBlock(value) {
 function sanitizeDescription(description, maxLength = 1200) {
   const text = String(description ?? '')
     .replace(/<details\b[^>]*>[\s\S]*?<\/details>/gi, '')
-    .replace(/<[^>]*>/g, '')
+    .replace(/</g, '')
+    .replace(/>/g, '')
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
