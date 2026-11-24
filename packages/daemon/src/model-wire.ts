@@ -185,7 +185,7 @@ export class CompletionCollector {
 
   feed(chunk: string): void {
     this.parser.feed(chunk);
-    if (this.parseFailure) throw this.failure();
+    if (this.parseFailure !== null || this.streamError !== null) throw this.failure();
   }
 
   get finished(): boolean {
@@ -200,7 +200,7 @@ export class CompletionCollector {
   }
 
   result(): { text: string; done: boolean } {
-    if (this.streamError || this.parseFailure) throw this.failure();
+    if (this.streamError !== null || this.parseFailure !== null) throw this.failure();
     if (!this.done) {
       throw Object.assign(new Error('model stream ended before [DONE]'), {
         code: 'ADAPTER_OFFLINE',

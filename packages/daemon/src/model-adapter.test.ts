@@ -99,6 +99,19 @@ test('[DONE] on an open response cancels the reader and returns the completed te
   assert.equal(s.cancelled(), true);
 });
 
+test('a named SSE error event fails fast and cancels the reader', async (t) => {
+  // The stream is deliberately left open: without a fast failure this hangs.
+  const s = sseStream(['event: error\ndata: provider rejected the request\n\n'], false);
+  const timeout = new Promise<never>((_, reject) => {
+    const timer = setTimeout(() => reject(new Error('named error event did not fail fast')), 500);
+    t.after(() => clearTimeout(timer));
+  });
+  const error = await errorFrom(Promise.race([collectCompletion(s.stream), timeout]));
+  assert.equal(error.code, 'ADAPTER_OFFLINE');
+  assert.match(error.message, /provider rejected the request/);
+  assert.equal(s.cancelled(), true);
+});
+
 test('SSE buffer overflow is ADAPTER_OFFLINE and cancels the reader', async () => {
   const s = sseStream([`data: ${'x'.repeat(MAX_SSE_BUFFER_SIZE + 1)}`], false);
   const error = await errorFrom(collectCompletion(s.stream));
