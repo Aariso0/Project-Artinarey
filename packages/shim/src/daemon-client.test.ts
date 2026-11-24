@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -135,9 +135,9 @@ test('a stale socket file triggers auto-start and connection retries', async () 
   const fakeRoot = fakeDaemonRoot(runtimeDir);
   writeFileSync(s.paths.socketPath, 'stale');
   const previous = {
-    root: process.env.ARTINAREY_ROOT,
-    socket: process.env.FAKE_DAEMON_SOCKET,
-    pid: process.env.FAKE_DAEMON_PID,
+    ARTINAREY_ROOT: process.env.ARTINAREY_ROOT,
+    FAKE_DAEMON_SOCKET: process.env.FAKE_DAEMON_SOCKET,
+    FAKE_DAEMON_PID: process.env.FAKE_DAEMON_PID,
   };
   process.env.ARTINAREY_ROOT = fakeRoot;
   process.env.FAKE_DAEMON_SOCKET = s.paths.socketPath;
@@ -163,6 +163,16 @@ test('a stale socket file triggers auto-start and connection retries', async () 
   }
 });
 
+/** A fake root whose daemon start does nothing, so startup retries stay pending. */
+function noopDaemonRoot(root: string): string {
+  const fakeRoot = join(root, 'fake-root-noop');
+  const entry = join(fakeRoot, 'packages', 'cli', 'src', 'index.ts');
+  mkdirSync(dirname(entry), { recursive: true });
+  symlinkSync(join(repoRoot, 'node_modules'), join(fakeRoot, 'node_modules'), 'dir');
+  writeFileSync(entry, '// no daemon here\n');
+  return fakeRoot;
+}
+
 test('close during connection setup discards the late socket', async () => {
   const s = setup();
   const server = createRpcServer(s.paths.socketPath, undefined, {
@@ -183,6 +193,34 @@ test('close during connection setup discards the late socket', async () => {
   } finally {
     client.close();
     await server.close();
+    s.registry.close();
+  }
+});
+
+test('close cancels daemon startup retries promptly', async () => {
+  const s = setup();
+  const runtimeDir = dirname(s.paths.socketPath);
+  const previousRoot = process.env.ARTINAREY_ROOT;
+  process.env.ARTINAREY_ROOT = noopDaemonRoot(runtimeDir);
+  writeFileSync(s.paths.socketPath, 'stale');
+
+  const client = createDaemonClient({
+    paths: s.paths, cwd: s.cwd, pid: process.pid, timeoutMs: 5000,
+  });
+  try {
+    const pending = client.invoke('check_in', {});
+    // Let the first connect fail and schedule a retry before closing.
+    await new Promise((done) => { setTimeout(done, 150); });
+    const closedAt = Date.now();
+    client.close();
+    const reply = await pending;
+    assert.equal(reply.isError, true);
+    assert.match(reply.text, /STORE_OFFLINE/);
+    assert.ok(Date.now() - closedAt < 1000, 'close should not wait for the startup timeout');
+  } finally {
+    if (previousRoot === undefined) delete process.env.ARTINAREY_ROOT;
+    else process.env.ARTINAREY_ROOT = previousRoot;
+    rmSync(s.paths.socketPath, { force: true });
     s.registry.close();
   }
 });

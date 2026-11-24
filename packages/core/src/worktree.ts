@@ -347,12 +347,31 @@ function writeGeneratedFile(path: string, content: string | Buffer): void {
   }
 }
 
-/** A failed `git worktree add` only owns artifacts git registered or an empty directory. */
-function rollbackFailedAdd(repoRoot: string, path: string): void {
-  if (listGitWorktrees(repoRoot).some((wt) => samePath(wt.path, path))) {
-    discardGitWorktree(repoRoot, path);
-    return;
+/** Reject a stale plan before mutating git metadata, the filesystem, or the registry. */
+function assertPlanAvailable(registry: Registry, repoRoot: string, plan: WorktreePlan): void {
+  if (existsSync(plan.path)) {
+    throw new ArtinareyError('INVALID_INPUT', `target directory already exists: ${plan.path}`);
   }
+  const taken = listGitWorktrees(repoRoot).some((wt) => samePath(wt.path, plan.path)) ||
+    registry.projects.list().flatMap((project) => registry.worktrees.list(project.id))
+      .some((row) => samePath(row.path, plan.path));
+  if (taken) {
+    throw new ArtinareyError('INVALID_INPUT', `worktree already registered: ${plan.path}`);
+  }
+}
+
+/** Only the exact marker this invocation wrote authorizes destructive rollback. */
+function ownsMarker(path: string, content: string): boolean {
+  try {
+    return existsSync(path) && readFileSync(path, 'utf8') === content;
+  } catch {
+    return false;
+  }
+}
+
+/** Git registration is not ownership: a failed add may only remove an empty target. */
+function rollbackFailedAdd(repoRoot: string, path: string): void {
+  if (listGitWorktrees(repoRoot).some((wt) => samePath(wt.path, path))) return;
   if (existsSync(path)) {
     try {
       rmdirSync(path);
@@ -383,9 +402,12 @@ export function createWorktree(registry: Registry, storeDir: string, plan: Workt
     throw new ArtinareyError('NOT_FOUND', `unknown project store: ${storeDir}`);
   }
   const repoRoot = dirname(dirname(plan.path));
+  assertPlanAvailable(registry, repoRoot, plan);
   ensureExcludeBlock(resolveRepo(repoRoot).commonDir);
 
   const id = newId();
+  const markerPath = join(plan.path, MARKER_FILE);
+  const markerContent = JSON.stringify({ schema: 1, project_id: project.id, worktree_id: id });
   const branchCreated = !gitSucceeds(repoRoot, [
     'show-ref', '--verify', '--quiet', `refs/heads/${plan.branch}`,
   ]);
@@ -404,9 +426,9 @@ export function createWorktree(registry: Registry, storeDir: string, plan: Workt
   const createdFiles: string[] = [];
   let registered = false;
   try {
-    const marker = join(plan.path, '.artinarey.json');
-    writeMarker(plan.path, project.id, id);
-    createdFiles.push(marker);
+    // Claim ownership immediately after the add, before any other artifact is written.
+    writeGeneratedFile(markerPath, markerContent);
+    createdFiles.push(markerPath);
     writeGeneratedFile(plan.envFile, `ARTINAREY_PORT_OFFSET=${plan.portOffset}\n`);
     createdFiles.push(plan.envFile);
     for (const file of plan.copy) {
@@ -426,8 +448,10 @@ export function createWorktree(registry: Registry, storeDir: string, plan: Workt
     if (!row) throw new ArtinareyError('NOT_FOUND', `worktree not registered: ${id}`);
     return row;
   } catch (err) {
-    for (const file of createdFiles) rmSync(file, { recursive: true, force: true });
-    discardGitWorktree(repoRoot, plan.path);
+    if (ownsMarker(markerPath, markerContent)) {
+      for (const file of createdFiles) rmSync(file, { recursive: true, force: true });
+      discardGitWorktree(repoRoot, plan.path);
+    }
     if (registered) registry.worktrees.delete(id);
     if (branchCreated) discardCreatedBranch(repoRoot, plan.branch, baseCommit);
     throw err;

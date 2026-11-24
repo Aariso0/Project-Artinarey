@@ -1,5 +1,5 @@
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readdirSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { ArtinareyError } from './errors.ts';
 import { newId } from './ids.ts';
 import { appendJournal, atomicWrite, withProjectLock } from './store.ts';
@@ -143,6 +143,14 @@ export function serializeMail(record: MailRecord): string {
   return lines.join('\n');
 }
 
+/** An explicit id is committed across every month directory, not just the current one. */
+function mailIdExists(storeDir: string, id: string): boolean {
+  const root = join(storeDir, 'mail');
+  if (!existsSync(root)) return false;
+  return readdirSync(root, { recursive: true })
+    .some((entry) => basename(String(entry)) === `${id}.md`);
+}
+
 /** Sole-writer entry point: validate, then atomically write mail and audit line. */
 export async function sendMail(
   storeDir: string,
@@ -163,7 +171,7 @@ export async function sendMail(
       `${record.id}.md`,
     );
 
-    if (existsSync(file)) {
+    if (mailIdExists(storeDir, record.id)) {
       throw new ArtinareyError('MAIL_REJECTED', `mail id already exists: ${record.id}`);
     }
     atomicWrite(file, serializeMail(record), 0o444);

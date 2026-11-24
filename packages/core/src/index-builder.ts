@@ -122,7 +122,7 @@ export function buildIndex(indexFile: string, storeDir: string): IndexReport {
 }
 
 type MailRow = {
-  id: string; thread: string; from_id: string; to_json: string; cc_json: string;
+  id: string; thread: string; from_id: string; to_json: string; cc_json?: string | null;
   subject: string; kind: string; created_at: string; file: string;
 };
 
@@ -136,7 +136,8 @@ export function queryMail(indexFile: string, opts: QueryOptions = {}): IndexedMa
     const rows = db.prepare('SELECT * FROM mail ORDER BY id').all() as MailRow[];
     let result: IndexedMail[] = rows.map((r) => ({
       id: r.id, thread: r.thread, from: r.from_id,
-      to: JSON.parse(r.to_json) as string[], cc: JSON.parse(r.cc_json) as string[],
+      to: JSON.parse(r.to_json) as string[],
+      cc: r.cc_json ? JSON.parse(r.cc_json) as string[] : [],
       subject: r.subject, kind: r.kind, createdAt: r.created_at, file: r.file,
     }));
     if (opts.recipient) {

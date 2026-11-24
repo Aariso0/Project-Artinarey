@@ -35,6 +35,10 @@ importers:
       '@artinarey/daemon':
         specifier: workspace:*
         version: link:../daemon
+    devDependencies:
+      better-sqlite3:
+        specifier: 13.2.0
+        version: 13.2.0
 
   packages/core:
     dependencies:
@@ -50,6 +54,9 @@ importers:
       '@artinarey/core':
         specifier: workspace:*
         version: link:../core
+      better-sqlite3:
+        specifier: 13.2.0
+        version: 13.2.0
 
   packages/shim:
     dependencies:

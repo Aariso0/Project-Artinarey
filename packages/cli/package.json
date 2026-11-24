@@ -9,5 +9,8 @@
   "dependencies": {
     "@artinarey/core": "workspace:*",
     "@artinarey/daemon": "workspace:*"
+  },
+  "devDependencies": {
+    "better-sqlite3": "13.2.0"
   }
 }

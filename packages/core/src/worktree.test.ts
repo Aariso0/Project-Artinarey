@@ -520,6 +520,34 @@ test('createWorktree rollback on add failure leaves a target populated by someon
   }
 });
 
+test('a stale plan for the same name cannot remove another caller\'s worktree', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    // Both callers plan the same name before either one creates it.
+    const firstPlan = core.planWorktree(registry, project.id, repo, 'shared');
+    const secondPlan = core.planWorktree(registry, project.id, repo, 'shared');
+    assert.deepEqual(secondPlan, firstPlan);
+
+    const first = core.createWorktree(registry, storeDir, firstPlan);
+    const userFile = join(firstPlan.path, 'untracked.txt');
+    writeFileSync(userFile, 'user data\n');
+
+    expectInvalidInput(() => core.createWorktree(registry, storeDir, secondPlan),
+      'second caller with a stale plan');
+
+    assert.equal(readFileSync(userFile, 'utf8'), 'user data\n');
+    assert.equal(listGitWorktrees(repo).some((wt) => wt.path === firstPlan.path), true);
+    assert.equal(core.findMarker(firstPlan.path)?.marker.worktree_id, first.id);
+    assert.equal(registry.worktrees.list(project.id).length, 2);
+    assert.equal(gitSucceeds(
+      ['show-ref', '--verify', '--quiet', `refs/heads/${first.branch}`], repo,
+    ), true, 'the first caller\'s branch is left intact');
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('createWorktree refuses a symlinked env destination without writing through it', () => {
   const { dir, repo, storeDir, registry, project } = newProjectRepo();
   try {

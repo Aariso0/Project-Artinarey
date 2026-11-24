@@ -320,13 +320,16 @@ export function claimPersona(
   lockGitWorktree(identity.markerDir, persona.role);
   const nextHome = options.rehome || !home ? identity.worktreeId : home;
   writePersona(storeDir, personaId, { ...personaState, home_worktree_id: nextHome, state: 'active' });
-  audit(storeDir, { type: 'persona_claimed', persona_id: personaId,
-    worktree_id: identity.worktreeId, home_worktree_id: nextHome,
-    confirmed_move: Boolean(options.confirmMove), rehome: Boolean(options.rehome) });
-
-  // A confirmed move transfers the lock: release the worktree this persona left.
-  if (previousPath && !sameDirectory(previousPath, identity.markerDir)) {
-    unlockGitWorktree(previousPath);
+  try {
+    audit(storeDir, { type: 'persona_claimed', persona_id: personaId,
+      worktree_id: identity.worktreeId, home_worktree_id: nextHome,
+      confirmed_move: Boolean(options.confirmMove), rehome: Boolean(options.rehome) });
+  } finally {
+    // A confirmed move transfers the lock: release the worktree this persona left,
+    // even if the audit append fails. The audit error still propagates.
+    if (previousPath && !sameDirectory(previousPath, identity.markerDir)) {
+      unlockGitWorktree(previousPath);
+    }
   }
 
   return {

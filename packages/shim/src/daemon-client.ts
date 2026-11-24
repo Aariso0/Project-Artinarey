@@ -32,15 +32,39 @@ function connectSocket(path: string): Promise<Socket> {
 }
 
 /** A socket file is not readiness: a crashed daemon can leave a file with no listener. */
-function waitForDaemon(path: string, timeoutMs: number): Promise<Socket> {
+function waitForDaemon(path: string, timeoutMs: number, signal: AbortSignal): Promise<Socket> {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolvePromise, reject) => {
+    if (signal.aborted) {
+      reject(new Error('daemon client closed'));
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    function cleanup() {
+      if (timer) clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+    }
+    function onAbort() {
+      cleanup();
+      reject(new Error('daemon client closed'));
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
     const attempt = () => {
-      connectSocket(path).then(resolvePromise, (err: NodeJS.ErrnoException) => {
-        if (Date.now() >= deadline) {
-          return reject(new Error(`daemon did not start in time: ${err.message}`));
+      connectSocket(path).then((socket) => {
+        if (signal.aborted) {
+          socket.destroy();
+          return;
         }
-        setTimeout(attempt, 50);
+        cleanup();
+        resolvePromise(socket);
+      }, (err: NodeJS.ErrnoException) => {
+        if (signal.aborted) return;
+        if (Date.now() >= deadline) {
+          cleanup();
+          reject(new Error(`daemon did not start in time: ${err.message}`));
+          return;
+        }
+        timer = setTimeout(attempt, 50);
       });
     };
     attempt();
@@ -75,6 +99,7 @@ export function createDaemonClient(options: DaemonClientOptions): DaemonClient {
   let connecting: Promise<Socket> | undefined;
   let closed = false;
   let attached = false;
+  const shutdown = new AbortController();
   const pending = new Map<string, {
     resolve: (response: RpcResponse) => void;
     reject: (err: Error) => void;
@@ -92,7 +117,7 @@ export function createDaemonClient(options: DaemonClientOptions): DaemonClient {
           const code = (err as NodeJS.ErrnoException).code;
           if (!autoStart || (code !== 'ENOENT' && code !== 'ECONNREFUSED')) throw err;
           startDaemon();
-          connected = await waitForDaemon(options.paths.socketPath, timeoutMs);
+          connected = await waitForDaemon(options.paths.socketPath, timeoutMs, shutdown.signal);
         }
 
         connected.setEncoding('utf8');
@@ -183,7 +208,9 @@ export function createDaemonClient(options: DaemonClientOptions): DaemonClient {
       }
     },
     close() {
+      if (closed) return;
       closed = true;
+      shutdown.abort();
       attached = false;
       socket?.destroy();
       socket = undefined;

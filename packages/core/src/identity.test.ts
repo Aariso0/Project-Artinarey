@@ -400,6 +400,36 @@ test('claimPersona unlocks the previous worktree after a confirmed move', () => 
   }
 });
 
+test('claimPersona unlocks the previous worktree even when the move audit fails', () => {
+  const s = gitRegistrySetup();
+  try {
+    const x = s.add('x');
+    const y = s.add('y');
+    const persona = createPersona(s.registry, s.storeDir, s.project.id, 'dev-audit-move', 'Move');
+    const fromIdentity = resolveIdentity(s.registry, x.path);
+    const toIdentity = resolveIdentity(s.registry, y.path);
+    assert.equal(fromIdentity.ok, true);
+    assert.equal(toIdentity.ok, true);
+    if (!fromIdentity.ok || !toIdentity.ok) return;
+    assert.equal(claimPersona(s.registry, s.storeDir, fromIdentity.identity, { personaId: persona }).ok, true);
+    assert.equal(isLocked(s.repo, x.path), true);
+
+    // A failing audit must not strand the worktree this persona left behind.
+    rmSync(join(s.storeDir, 'events', 'audit.jsonl'), { force: true });
+    mkdirSync(join(s.storeDir, 'events', 'audit.jsonl'), { recursive: true });
+    assert.throws(() => claimPersona(s.registry, s.storeDir, toIdentity.identity, {
+      personaId: persona, confirmMove: true,
+    }));
+
+    assert.equal(s.registry.bindings.forWorktree(x.id), undefined);
+    assert.equal(s.registry.bindings.forWorktree(y.id)?.id, persona);
+    assert.equal(isLocked(s.repo, x.path), false, 'old worktree is unlocked after an audit failure');
+    assert.equal(isLocked(s.repo, y.path), true);
+  } finally {
+    s.registry.close();
+  }
+});
+
 test('release and force release unlock even when the audit append fails', () => {
   const s = gitRegistrySetup();
   try {

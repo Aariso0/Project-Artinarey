@@ -141,6 +141,24 @@ test('sendMail refuses an id that is already committed without replacing the mai
   ).length, 1);
 });
 
+test('sendMail refuses an explicit id already committed in another month', async () => {
+  const dir = tempStore();
+  const id = newId();
+  await sendMail(dir, { ...base, id, subject: 'original' }, ctx);
+
+  const otherMonth: MailContext = { ...ctx, now: new Date('2025-04-02T09:00:00Z') };
+  await assert.rejects(
+    () => sendMail(dir, { ...base, id, subject: 'cross-month duplicate' }, otherMonth),
+    (err: unknown) => err instanceof ArtinareyError && err.code === 'MAIL_REJECTED',
+  );
+
+  const files = readdirSync(join(dir, 'mail'), { recursive: true })
+    .filter((p) => String(p).endsWith('.md'));
+  assert.equal(files.length, 1, 'no mail file was added in the second month');
+  assert.match(readFileSync(join(dir, 'mail', '2026', '11', `${id}.md`), 'utf8'),
+    /subject: original/);
+});
+
 test('sendMail reports a committed id when only the audit append fails', async () => {
   const dir = tempStore();
   mkdirSync(join(dir, 'events', 'audit.jsonl'), { recursive: true });

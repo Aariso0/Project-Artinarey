@@ -2,13 +2,14 @@ import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
-  mkdirSync, readFileSync, readdirSync, rmSync,
+  existsSync, mkdirSync, readFileSync, readdirSync, rmSync,
 } from 'node:fs';
 import { connect, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import {
-  createPersona, findMarker, newId, openRegistry, resolveXdgPaths, writeMarker,
+  createPersona, findMarker, newId, openRegistry, queryMail, resolveXdgPaths, writeMarker,
 } from '@artinarey/core';
 import { createRpcServer, type RpcResponse, type RpcServer } from './server.ts';
 
@@ -528,5 +529,137 @@ test('RPC replies always end with unread and next', async (t) => {
       const text = (response.result as { text: string }).text;
       assert.match(text, /\nunread: \d+\nnext: \S.*$/);
     }
+  }
+});
+
+test('a repeat claim refreshes ownership so disconnect releases the binding', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, dev);
+  await claim(client, dev);
+
+  const claims = readFileSync(join(s.project.storeDir, 'events', 'audit.jsonl'), 'utf8')
+    .split('\n').filter((line) => line.includes('"type":"persona_claimed"'));
+  assert.equal(claims.length, 2, 'a repeat claim appends another audit line');
+  assert.ok(s.registry.bindings.forWorktree(s.ids[0]!));
+
+  client.close();
+  cleanup.clients.splice(cleanup.clients.indexOf(client), 1);
+  await flush();
+  assert.equal(s.registry.bindings.forWorktree(s.ids[0]!), undefined,
+    'the connection must still own the binding after a repeat claim');
+});
+
+test('mark_done rebuilds the index when the receipt already exists', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  const lead = createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const sender = await openClient(started.socketPath);
+  cleanup.clients.push(sender);
+  await attach(sender, s.worktrees[0]!);
+  await claim(sender, dev);
+  const mailId = mailIdOf(await sender.call('send_mail', {
+    to: ['senior-dev'], subject: 'index me on retry', kind: 'task', action: 'review',
+    body: 'Please review.',
+  }));
+  assert.ok(mailId);
+
+  const receiver = await openClient(started.socketPath);
+  cleanup.clients.push(receiver);
+  await attach(receiver, s.worktrees[1]!);
+  await claim(receiver, lead);
+  const done = await receiver.call('mark_done', { id: mailId, note: 'Done once.' });
+  assert.equal(done.ok, true, JSON.stringify(done));
+
+  const index = join(s.paths.cacheRoot, s.project.id, 'index.sqlite');
+  const receipt = queryMail(index).find((mail) => mail.kind === 'receipt');
+  assert.ok(receipt, 'the first call must index its receipt');
+  // Simulate a committed receipt with a stale index (a prior buildIndex failed).
+  const db = new Database(index);
+  db.exec(`DELETE FROM mail WHERE id = '${receipt!.id}'`);
+  db.close();
+  assert.equal(queryMail(index).some((mail) => mail.id === receipt!.id), false);
+
+  const retry = await receiver.call('mark_done', { id: mailId, note: 'Done once.' });
+  assert.equal(retry.ok, true, JSON.stringify(retry));
+  assert.ok(existsSync(index));
+  assert.ok(queryMail(index).some((mail) => mail.id === receipt!.id),
+    'a retry with an existing receipt must rebuild the index');
+  const receipts = readdirSync(join(s.project.storeDir, 'mail'), { recursive: true })
+    .filter((f) => String(f).endsWith('.md'))
+    .map((f) => readFileSync(join(s.project.storeDir, 'mail', String(f)), 'utf8'))
+    .filter((text) => /^kind: receipt$/m.test(text));
+  assert.equal(receipts.length, 1, 'a retry must not send a second receipt');
+});
+
+test('send_mail indexes a committed mail even when the audit append fails', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, dev);
+
+  const audit = join(s.project.storeDir, 'events', 'audit.jsonl');
+  rmSync(audit, { force: true });
+  mkdirSync(audit, { recursive: true });
+  const sent = await client.call('send_mail', {
+    to: ['senior-dev'], subject: 'partial but committed', kind: 'note', action: 'read',
+    body: 'The mail file is durable.',
+  });
+  assert.equal(sent.ok, false, JSON.stringify(sent));
+  if (!sent.ok) {
+    assert.equal(sent.error.code, 'MAIL_PARTIAL');
+    assert.match(sent.error.message, /do not resend/i);
+  }
+
+  const index = join(s.paths.cacheRoot, s.project.id, 'index.sqlite');
+  const mails = queryMail(index);
+  assert.equal(mails.length, 1, 'the committed mail must be indexed');
+  assert.equal(mails[0]?.subject, 'partial but committed');
+});
+
+test('a failed best-effort reindex never replaces the MAIL_PARTIAL error', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, dev);
+
+  const audit = join(s.project.storeDir, 'events', 'audit.jsonl');
+  rmSync(audit, { force: true });
+  mkdirSync(audit, { recursive: true });
+  const index = join(s.paths.cacheRoot, s.project.id, 'index.sqlite');
+  mkdirSync(index, { recursive: true }); // buildIndex cannot open a directory as a DB
+  const sent = await client.call('send_mail', {
+    to: ['senior-dev'], subject: 'partial and unindexed', kind: 'note', action: 'read',
+    body: 'The index is broken too.',
+  });
+  assert.equal(sent.ok, false, JSON.stringify(sent));
+  if (!sent.ok) {
+    assert.equal(sent.error.code, 'MAIL_PARTIAL', 'the original error must survive');
+    assert.match(sent.error.message, /do not resend/i);
   }
 });

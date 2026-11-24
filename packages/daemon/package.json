@@ -4,6 +4,7 @@
   "type": "module",
   "main": "src/index.ts",
   "dependencies": {
-    "@artinarey/core": "workspace:*"
+    "@artinarey/core": "workspace:*",
+    "better-sqlite3": "13.2.0"
   }
 }

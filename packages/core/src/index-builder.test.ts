@@ -118,6 +118,32 @@ test('buildIndex migrates an existing index that has no cc_json column', async (
   assert.deepEqual(queryMail(indexFile)[0]?.cc, ['dev-b', 'senior-dev']);
 });
 
+test('queryMail reads a populated legacy mail table without cc_json', () => {
+  const indexFile = join(tempDir('artinarey-index-cache'), 'index.sqlite');
+  const legacy = new Database(indexFile);
+  legacy.exec(`CREATE TABLE mail (
+    id TEXT PRIMARY KEY, thread TEXT NOT NULL, from_id TEXT NOT NULL,
+    to_json TEXT NOT NULL, subject TEXT NOT NULL, kind TEXT NOT NULL,
+    created_at TEXT NOT NULL, file TEXT NOT NULL
+  )`);
+  legacy.prepare(`INSERT INTO mail
+    (id, thread, from_id, to_json, subject, kind, created_at, file)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'legacy-id', 'legacy-thread', 'dev-a', '["senior-dev"]', 'legacy subject', 'status',
+    '2026-11-23T10:15:00Z', '/store/mail/2026/11/legacy-id.md',
+  );
+  legacy.close();
+
+  // No buildIndex: the derived index may still be in its pre-cc_json shape.
+  assert.deepEqual(queryMail(indexFile), [{
+    id: 'legacy-id', thread: 'legacy-thread', from: 'dev-a',
+    to: ['senior-dev'], cc: [], subject: 'legacy subject', kind: 'status',
+    createdAt: '2026-11-23T10:15:00Z', file: '/store/mail/2026/11/legacy-id.md',
+  }]);
+  assert.deepEqual(queryMail(indexFile, { recipient: 'senior-dev' }).map((m) => m.id),
+    ['legacy-id']);
+});
+
 test('a read failure mid-rebuild rolls back the whole index rebuild', async () => {
   const store = tempDir('artinarey-index-store');
   const ids = await seedThree(store);

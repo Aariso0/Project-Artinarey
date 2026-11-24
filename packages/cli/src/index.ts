@@ -6,9 +6,10 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   adoptWorktree, atomicWrite, buildIndex, claimPersona, createWorktree, ensureExcludeBlock,
-  findMarker, globalIgnoreCoverage, listGitWorktrees, newId, openRegistry, planWorktree,
-  projectStore, readPersona, reconcileWorktrees, rehomePersona, releasePersona, removeWorktree,
-  resolveIdentity, resolveRepo, resolveXdgPaths, roster, unlockGitWorktree, writeMarker, writePersona,
+  findMarker, globalIgnoreCoverage, listGitWorktrees, lockGitWorktree, newId, openRegistry,
+  planWorktree, projectStore, readPersona, reconcileWorktrees, rehomePersona, releasePersona,
+  removeWorktree, resolveIdentity, resolveRepo, resolveXdgPaths, roster, unlockGitWorktree,
+  writeMarker, writePersona,
 } from '@artinarey/core';
 import { callDaemon, daemonStatus, startDaemon, stopDaemon } from '@artinarey/daemon';
 
@@ -20,6 +21,14 @@ const MCP_TOOLS = [
 const VENDOR_COMMANDS: Record<string, string> = { opencode: 'opencode' };
 const RUN_USAGE =
   'usage: artinarey run <vendor> --persona <persona> [--confirm-move] [--rehome] [--yes]';
+
+/**
+ * Overlap policy: the claim stays bound while any other live session for this
+ * persona+worktree remains; only the last run releases it. An unended session
+ * older than this window is treated as stale so a crashed run cannot pin a claim
+ * forever. 24h is deliberately conservative.
+ */
+const ACTIVE_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
 function shimCommand(): string[] {
   const require = createRequire(import.meta.url);
@@ -64,19 +73,45 @@ function resolveWorktree(registry: RegistryHandle, token: string): Resolution {
   return { id: matches[0]?.id };
 }
 
-/** Undo the binding, persona state and lock if claimPersona throws after acquiring them. */
+/** Bindings have no by-persona lookup, so find the worktree this persona came from. */
+function boundWorktree(
+  registry: RegistryHandle, personaId: string,
+): { id: string; path: string } | undefined {
+  for (const project of registry.projects.list()) {
+    for (const worktree of registry.worktrees.list(project.id)) {
+      if (registry.bindings.forWorktree(worktree.id)?.id === personaId) {
+        return { id: worktree.id, path: worktree.path };
+      }
+    }
+  }
+  return undefined;
+}
+
+/** Undo the binding, persona state and locks if claimPersona throws after acquiring them. */
 function rollbackFailedClaim(
   registry: RegistryHandle,
   identity: Parameters<typeof claimPersona>[2],
   personaId: string | undefined,
   previousBinding: string | undefined,
   previousState: ReturnType<typeof readPersona>,
+  originalWorktree: { id: string; path: string } | undefined,
 ): void {
   if (!personaId || registry.bindings.forWorktree(identity.worktreeId)?.id !== personaId) return;
-  writePersona(identity.storeDir, personaId, previousState);
-  if (previousBinding === personaId) return;
-  registry.bindings.release(personaId);
-  unlockGitWorktree(identity.markerDir);
+  try {
+    writePersona(identity.storeDir, personaId, previousState);
+  } finally {
+    // Only undo resources this attempt acquired; keep a binding/lock that predated it.
+    if (previousBinding !== personaId) {
+      registry.bindings.release(personaId);
+      unlockGitWorktree(identity.markerDir);
+      // A confirmed move may have rebound the persona from its old worktree;
+      // put that binding and lock back instead of losing the original home.
+      if (originalWorktree && originalWorktree.id !== identity.worktreeId) {
+        registry.bindings.bind(personaId, originalWorktree.id);
+        lockGitWorktree(originalWorktree.path, registry.personas.get(personaId)?.role ?? personaId);
+      }
+    }
+  }
 }
 
 /** Git is the authority on whether a registered worktree is still attached here. */
@@ -438,6 +473,7 @@ export async function main(
     let registry: RegistryHandle | undefined;
     let claimed: ClaimedPersona | undefined;
     let claimedWorktreeId: string | undefined;
+    let newlyAcquired = false;
     let sessionId: string | undefined;
     try {
       registry = openRegistry(resolveXdgPaths(env).registryFile);
@@ -455,13 +491,16 @@ export async function main(
       const options = { personaId: personaToken, confirmMove, rehome };
       const attemptedId = resolvePersona(registry, identity.projectId, personaToken).id ?? personaToken;
       const previousBinding = registry.bindings.forWorktree(identity.worktreeId)?.id;
+      const originalWorktree = boundWorktree(registry, attemptedId);
       const previousState = readPersona(identity.storeDir, attemptedId);
       const db = registry;
       const tryClaim = (claimOptions: Parameters<typeof claimPersona>[3]) => {
         try {
           return claimPersona(db, identity.storeDir, identity, claimOptions);
         } catch (err) {
-          rollbackFailedClaim(db, identity, attemptedId, previousBinding, previousState);
+          rollbackFailedClaim(
+            db, identity, attemptedId, previousBinding, previousState, originalWorktree,
+          );
           throw err;
         }
       };
@@ -480,6 +519,7 @@ export async function main(
       }
       claimed = claim;
       claimedWorktreeId = claim.identity.worktreeId;
+      newlyAcquired = previousBinding !== claim.personaId;
 
       sessionId = registry.sessions.append({
         projectId: identity.projectId,
@@ -500,14 +540,16 @@ export async function main(
       return 1;
     } finally {
       if (registry) {
-        if (claimed && claimedWorktreeId && sessionId) {
+        if (claimed && claimedWorktreeId && newlyAcquired) {
           const record = claimed;
-          const active = registry.sessions.list(record.identity.projectId)
-            .filter((session) => session.worktreeId === claimedWorktreeId
-              && session.personaId === record.personaId && !session.endedAt)
-            .sort((a, b) => a.startedAt.localeCompare(b.startedAt) || a.id.localeCompare(b.id));
-          const ownsClaim = active.at(-1)?.id === sessionId;
-          if (ownsClaim && registry.bindings.forWorktree(claimedWorktreeId)?.id === record.personaId) {
+          const now = Date.now();
+          const otherActive = registry.sessions.list(record.identity.projectId)
+            .some((session) => session.worktreeId === claimedWorktreeId
+              && session.personaId === record.personaId && !session.endedAt
+              && session.id !== sessionId
+              && now - Date.parse(session.startedAt) <= ACTIVE_SESSION_TTL_MS);
+          if (!otherActive
+              && registry.bindings.forWorktree(claimedWorktreeId)?.id === record.personaId) {
             releasePersona(registry, record.identity.storeDir, record.personaId);
           }
         }

@@ -9,6 +9,7 @@ import {
   unlinkSync,
   writeSync,
 } from 'node:fs';
+import Database from 'better-sqlite3';
 import { ArtinareyError, withProjectLock } from '@artinarey/core';
 
 export type InstanceLock = {
@@ -41,6 +42,24 @@ function removeIfSame(file: string, id: FileId | undefined): void {
     unlinkSync(file);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+}
+
+/** SQLite's BEGIN IMMEDIATE is a cross-process reserved lock; a crash releases it. */
+function withStaleGuard<T>(file: string, fn: () => T): T {
+  const db = new Database(`${file}.guard.sqlite`, { timeout: 2000 });
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = fn();
+      db.exec('COMMIT');
+      return result;
+    } catch (err) {
+      try { db.exec('ROLLBACK'); } catch { /* the transaction already ended */ }
+      throw err;
+    }
+  } finally {
+    db.close();
   }
 }
 
@@ -120,13 +139,19 @@ export async function acquireLock(file: string): Promise<InstanceLock> {
         if (isAlive(pid)) {
           throw new ArtinareyError('ALREADY_RUNNING', `daemon already running with pid ${pid}`);
         }
-        // Only reclaim the same file we inspected; a replacement belongs to another starter.
-        if (!sameFile(seen, statIfExists(file)) || readLock(file) !== pid) continue;
-        try {
-          unlinkSync(file);
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-        }
+        // Validation and removal must be one cross-process step: without the guard a
+        // second starter can validate the dead pid, then unlink the winner's new file.
+        const reclaimed = withStaleGuard(file, () => {
+          // Only reclaim the same file we inspected; a replacement belongs to another starter.
+          if (!sameFile(seen, statIfExists(file)) || readLock(file) !== pid) return false;
+          try {
+            unlinkSync(file);
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+          }
+          return true;
+        });
+        if (!reclaimed) continue;
       }
     }
     throw new ArtinareyError('ALREADY_RUNNING', 'could not acquire the daemon lock');

@@ -2,6 +2,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   appendJournal,
+  ArtinareyError,
   atomicWrite,
   buildIndex,
   claimPersona,
@@ -269,20 +270,23 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
     });
     if (!result.ok) return toolFail(id, result.code, result.message);
     ctx.identity = result.identity;
-    // A repeat claim only refreshes an existing binding; it does not transfer ownership.
-    if (!alreadyBound) {
-      const bindings = ctx.claimedBindings ?? [];
-      if (!bindings.some((b) => b.worktreeId === result.identity.worktreeId
-          && b.personaId === result.personaId)) {
-        bindings.push({
-          personaId: result.personaId,
-          storeDir: result.identity.storeDir,
-          worktreeId: result.identity.worktreeId,
-          claimLine: claimLine(result.identity.storeDir, result.personaId),
-        });
-      }
-      ctx.claimedBindings = bindings;
+    const bindings = ctx.claimedBindings ?? [];
+    const owned = bindings.find((b) => b.worktreeId === result.identity.worktreeId
+      && b.personaId === result.personaId);
+    if (owned) {
+      // A repeat claim by this connection appends a new audit line: refresh it so
+      // releaseConnection still recognises the binding as ours.
+      owned.claimLine = claimLine(result.identity.storeDir, result.personaId);
+    } else if (!alreadyBound) {
+      // A repeat claim of another owner's binding must not transfer ownership.
+      bindings.push({
+        personaId: result.personaId,
+        storeDir: result.identity.storeDir,
+        worktreeId: result.identity.worktreeId,
+        claimLine: claimLine(result.identity.storeDir, result.personaId),
+      });
     }
+    ctx.claimedBindings = bindings;
     const who = readPersona(result.identity.storeDir, result.personaId);
     return toolOk(
       id,
@@ -352,6 +356,18 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
         sharedTasks: [],
       });
     } catch (err) {
+      if (err instanceof ArtinareyError && err.code === 'MAIL_PARTIAL') {
+        // The mail file is committed: make it visible before returning the partial failure.
+        try {
+          buildIndex(indexFile(ctx, identity.projectId), identity.storeDir);
+        } catch {
+          // Best effort only: an index failure must not replace the original error.
+        }
+        const message = err.mailId && !err.message.includes(err.mailId)
+          ? `${err.message} (mail ${err.mailId})`
+          : err.message;
+        return toolFail(id, err.code, message);
+      }
       const e = err as { code?: ArtinareyErrorCode; message?: string };
       return toolFail(id, e.code ?? 'MAIL_REJECTED', e.message ?? 'mail rejected');
     }
@@ -396,10 +412,16 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
           role: identity.role!,
           sharedTasks: [],
         });
-        buildIndex(indexFile(ctx, identity.projectId), identity.storeDir);
       } catch (err) {
         return toolFail(id, 'MAIL_REJECTED', (err as Error).message);
       }
+    }
+    // Retry-safe mail, but the index is derived: rebuild it even when the receipt
+    // was committed by an earlier call whose index build failed.
+    try {
+      buildIndex(indexFile(ctx, identity.projectId), identity.storeDir);
+    } catch (err) {
+      return toolFail(id, 'INDEX_ERROR', (err as Error).message);
     }
     // The receipt is committed first; retries must not duplicate the completion event.
     if (!hasTaskDone(identity.storeDir, identity.role!, mailId)) {
