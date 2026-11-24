@@ -630,8 +630,11 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
         const e = err as { code?: ArtinareyErrorCode; message?: string };
         return toolFail(id, e.code ?? 'INVALID_INPUT', e.message ?? 'invalid committed scope');
       }
-      if (committedScope.length !== scope.length
-          || scope.some((path) => !committedScope.includes(path))) {
+      const committedPaths = new Set(committedScope);
+      const requestedPaths = new Set(scope);
+      if (committedPaths.size !== requestedPaths.size
+          || [...committedPaths].some((path) => !requestedPaths.has(path))
+          || [...requestedPaths].some((path) => !committedPaths.has(path))) {
         return toolFail(id, 'INVALID_INPUT', 'scope must match the committed task');
       }
     } else {

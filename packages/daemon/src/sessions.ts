@@ -559,7 +559,13 @@ export class SessionSupervisor {
             summaryAppended = true;
           }
         } catch { /* registry row already keeps the launch visible */ }
-        if (sessionId) this.heldBySession.set(sessionId, persona.id);
+        // A stop may have settled the persisted row while the cleanup interrupt
+        // was still pending, before a held entry could be stored.
+        const stopped = sessionId
+          && readSessions(this.summaryFile(caller.projectId))
+            .some((s) => s.id === sessionId && s.status === 'stopped');
+        if (stopped) releasePersona();
+        else if (sessionId) this.heldBySession.set(sessionId, persona.id);
       }
       return fail('STORE_OFFLINE', `spawn failed: ${(err as Error).message ?? String(err)}`);
     }

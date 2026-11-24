@@ -1435,3 +1435,60 @@ test('assign_task normalizes scopes for assignment, claim and recovery', async (
   assert.equal(mails.length, 1, 'recovery must send exactly one notification');
   assert.match(readFileSync(mails[0]!.file, 'utf8'), new RegExp(`in_reply_to: ${taskId}`));
 });
+
+test('assign_task recovery rejects duplicate spellings that hide a committed path', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev', 'Dev');
+  const lead = createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, lead);
+
+  const args = { persona_id: dev, title: 'dedup recovery', scope: ['src/a.ts', './package.json'] };
+  const failed = await client.call('assign_task', { ...args, body: 'API_KEY=do-not-send' });
+  assert.equal(failed.ok, false, JSON.stringify(failed));
+  if (failed.ok) return;
+  assert.equal(failed.error.code, 'MAIL_REJECTED');
+  const taskId = (failed.error as { taskId?: string }).taskId;
+  assert.ok(taskId, 'the committed task id must be returned');
+
+  const committed = readTasks(s.project.storeDir);
+  assert.deepEqual(committed[0]!.scope, ['src/a.ts', 'package.json']);
+  const leaseFile = join(s.project.storeDir, 'events', 'leases.jsonl');
+  const claimEvents = (): string[] => existsSync(leaseFile)
+    ? readFileSync(leaseFile, 'utf8').split('\n')
+      .filter((line) => line.includes('"type":"shared_claim"'))
+    : [];
+  assert.equal(claimEvents().length, 1);
+  reindex(s);
+  const index = join(s.paths.cacheRoot, s.project.id, 'index.sqlite');
+  const taskMails = () => queryMail(index).filter((mail) => mail.kind === 'task'
+    && mail.subject === 'Task: dedup recovery');
+  assert.equal(taskMails().length, 0);
+
+  const rejected = await client.call('assign_task', {
+    ...args, scope: ['src/a.ts', './src/a.ts'], body: 'do it', task_id: taskId,
+  });
+  assert.equal(rejected.ok, false, JSON.stringify(rejected));
+  if (!rejected.ok) assert.equal(rejected.error.code, 'INVALID_INPUT');
+  assert.deepEqual(readTasks(s.project.storeDir), committed,
+    'rejected recovery must not mutate the committed task');
+  assert.equal(claimEvents().length, 1, 'rejected recovery must not add a claim');
+  reindex(s);
+  assert.equal(taskMails().length, 0, 'rejected recovery must not send mail');
+
+  const recovered = await client.call('assign_task', {
+    ...args, scope: ['./package.json/', 'src//a.ts'], body: 'do it', task_id: taskId,
+  });
+  assert.equal(recovered.ok, true, JSON.stringify(recovered));
+  assert.deepEqual(readTasks(s.project.storeDir), committed,
+    'recovery must reuse the committed task');
+  assert.equal(claimEvents().length, 1, 'recovery must not add a claim');
+  reindex(s);
+  assert.equal(taskMails().length, 1, 'reordered equivalent recovery sends one notification');
+  assert.match(readFileSync(taskMails()[0]!.file, 'utf8'), new RegExp(`in_reply_to: ${taskId}`));
+});

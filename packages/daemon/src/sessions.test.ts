@@ -663,6 +663,49 @@ test('an unconfirmed vendor cleanup keeps the session visible and its persona he
   }
 });
 
+test('a stop during a failed cleanup interrupt releases the persona reservation', async () => {
+  const s = setup();
+  try {
+    s.adapter.failPrompt = true;
+    let releaseCleanup!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+    let interrupts = 0;
+    s.adapter.interruptSession = async () => {
+      interrupts += 1;
+      if (interrupts === 1) {
+        await cleanupGate;
+        throw new Error('cleanup interrupt failed');
+      }
+    };
+
+    const launch = s.supervisor.requestSession(s.caller, {
+      persona_id: s.devs[0]!, task_id: 'T-0',
+    });
+    await waitFor(() => interrupts === 1);
+    const sessionId = s.supervisor.sessions(s.project.id).find(
+      (session) => session.status === 'running',
+    )!.id;
+    assert.equal(await s.supervisor.stopSession(sessionId), true);
+    assert.equal(s.supervisor.sessions(s.project.id)[0]?.status, 'stopped');
+
+    releaseCleanup();
+    const failed = await launch;
+    assert.equal(failed.ok, false);
+    if (failed.ok) return;
+    assert.equal(failed.code, 'STORE_OFFLINE');
+    assert.equal(s.supervisor.liveCount(s.project.id), 0);
+
+    s.adapter.failPrompt = false;
+    const retry = await s.supervisor.requestSession(s.caller, {
+      persona_id: s.devs[0]!, task_id: 'T-0',
+    });
+    assert.equal(retry.ok, true, retry.ok ? '' : `${retry.code}: ${retry.message}`);
+    assert.equal(s.supervisor.liveCount(s.project.id), 1);
+  } finally {
+    cleanup(s);
+  }
+});
+
 test('stopSession never reports success when the vendor interrupt fails', async () => {
   const s = setup();
   try {
