@@ -1,0 +1,32 @@
+name: Dependabot completion notification
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+  checks: read
+  pull-requests: write
+
+concurrency:
+  group: dependabot-notify-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out trusted base ref for helper module
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Notify Dependabot PR
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { main } = require('./.github/scripts/dependabot-completion-notify.cjs')
+            await main({ github, context, core })
