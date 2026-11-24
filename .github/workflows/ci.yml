@@ -30,10 +30,24 @@ jobs:
 
   rust:
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: 0
+      RUST_VERSION: stable
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Cache Cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            apps/gui/src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.RUST_VERSION }}-
       - name: Install Tauri system dependencies
         run: |
           sudo apt-get update
