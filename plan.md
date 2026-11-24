@@ -725,35 +725,35 @@ Final gate outputs (all exit 0): `pnpm run typecheck` — no diagnostics; `pnpm 
 Native window launch was possible in this environment: `DISPLAY=:0`, `WAYLAND_DISPLAY=wayland-1`, `XDG_SESSION_TYPE=wayland`, `/tmp/.X11-unix/X0` and `/run/user/1000/wayland-1` exist, and `command -v Xvfb` found nothing. `timeout 15s` on the built binary exited 124 (still running, no stderr). With `WAYLAND_DISPLAY` unset, launching on `DISPLAY=:0` added `0x1200003` to `_NET_CLIENT_LIST` while the process ran; that id returned `BadWindow` after the process was stopped. No screenshot was captured, so visual rendering was not independently inspected. Security trackers and release cadence remain unverified. Dependency notices were verified against installed npm metadata and Cargo metadata before updating `NOTICE`. Implementation plan: `docs/plans/2026-11-24-m6-read-only-window.md`.
 
 ### M7 · Full window and Move
-**Status:** ⬜ · **Estimate:** 4–5 d · **Depends on:** M6
+**Status:** ✅ · **Estimate:** 4–5 d · **Depends on:** M6
 
-- [ ] Chat: live through the adapter; queued as mail when no session; copy to senior dev
-- [ ] New worktree and Adopt dialogs with the C4 warning
-- [ ] Edit a persona's home worktree (same project only)
-- [ ] Approvals tray: risky calls, spawn over cap, scope requests, takeover, spawn into worktrees with pending work; per-worktree auto-approve button
-- [ ] Active-worktree blocker modal: name the project, worktree and blocking persona; say the user must stop or delete persona X to do Y; single OK button
-- [ ] Tabs: Tasks and leases, Sessions, Pre-merge, Audit
-- [ ] Storage settings: data root, per-project override, `storage set`
-- [ ] Move wizard: preflight, pause, copy, verify, switch, rebuild, resume, undo, delete-old confirmation
-- [ ] Offline store handling (`STORE_OFFLINE`, Reconnect)
-- [ ] Tests: `kill -9` during Move; unplugged drive
+- [x] Chat: live through the adapter; queued as mail when no session; copy to senior dev
+- [x] New worktree and Adopt dialogs with the C4 warning
+- [x] Edit a persona's home worktree (same project only)
+- [x] Approvals tray: risky calls, spawn over cap, scope requests, takeover, spawn into worktrees with pending work; per-worktree auto-approve button
+- [x] Active-worktree blocker modal: name the project, worktree and blocking persona; say the user must stop or delete persona X to do Y; single OK button
+- [x] Tabs: Tasks and leases, Sessions, Pre-merge, Audit
+- [x] Storage settings: data root, per-project override, `storage set`
+- [x] Move wizard: preflight, pause, copy, verify, switch, rebuild, resume, undo, delete-old confirmation
+- [x] Offline store handling (`STORE_OFFLINE`, Reconnect)
+- [x] Tests: `kill -9` during Move; unplugged drive
 
 **Done when:** Move survives a crash and an offline drive.
-**Notes / blockers:**
+**Notes / blockers:** Full replacement of the M6 GitHub-dark world: `#000000` ground, `#0a0a0a`/`#121212` layers, `#1f1f1f` hairlines, one orange action accent, system font, tabular numerals, equal edges. Motion, Phosphor, Radix Dialog and Radix Tabs replaced the old primitives; reduced motion cross-fades without transform. The signed `assets/artinarey.svg` source was left untouched and the in-app mark is a transparent SVG. The GUI now has 24 `gui.*` methods behind one `invoke('daemon_call', ...)`; no token, port, URL or secret is present in the webview. Native allowlist and daemon prefix check both gate every method. Move uses Node built-ins only (copy, rename, statfs, fsync, SHA-256) and a durable atomic journal; every phase is resumable, an interrupted copy restarts clean, and the original store is deleted only by an explicit second confirmation. Chat uses the live vendor session when one is running and otherwise commits durable mail. Tests cover a real `SIGKILL` child leaving a torn journal and a missing destination drive; both resume after Reconnect. `NOTICE` lists all new UI licenses. Security trackers and release cadence for the new candidates remain unverified.
 
 ### M8 · Model API adapter (other vendors postponed)
-**Status:** ⬜ · **Estimate:** 2 d · **Depends on:** M7 · **Checks:** U5, U6, U7
+**Status:** ✅ · **Estimate:** 2 d · **Depends on:** M7 · **Checks:** U5, U6, U7
 
 Goal: let Artinarey reach a model directly without putting an LLM in the daemon.
 
-- [ ] Separate adapter process, started and stopped by the daemon
-- [ ] Configurable base URL; no hardcoded provider; API key held by the adapter only
-- [ ] Local socket protocol for prompts and results; the daemon stays localhost-only
-- [ ] Tests: the daemon makes no outbound call; the adapter is the only outbound caller
-- [ ] Document why Claude Code, Codex and Antigravity are postponed (section 9)
+- [x] Separate adapter process, started and stopped by the daemon
+- [x] Configurable base URL; no hardcoded provider; API key held by the adapter only
+- [x] Local socket protocol for prompts and results; the daemon stays localhost-only
+- [x] Tests: the daemon makes no outbound call; the adapter is the only outbound caller
+- [x] Document why Claude Code, Codex and Antigravity are postponed (section 9)
 
 **Done when:** a task can run through the API adapter and the daemon still makes no outbound call.
-**Notes / blockers:**
+**Notes / blockers:** The adapter is a detached child reached over a `0600` unix socket; zod validates the config (base URL, optional key, model) and `eventsource-parser` accumulates OpenAI-compatible SSE deltas. The adapter deletes its `ARTINAREY_MODEL_*` variables at startup, keeps the key in process memory, and never puts it in a reply or audit line. The daemon only spawns, pings, prompts and stops the child; a source-invariant test asserts that daemon-side files contain neither `fetch(` nor the key variable name. `run_task` builds the prompt from a registered task and lease, checks identity, and audits the adapter result; `model_status`/`model_prompt` are operator-only. The end-to-end test drives a fake OpenAI-compatible endpoint: one outbound request with the adapter's bearer token, one task reply through the local socket, and a typed `ADAPTER_OFFLINE` error after the adapter stops. Section 9 keeps the verified Claude Code, Codex and Antigravity blockers. The wire profile has not been exercised against a live provider; security trackers and release cadence remain unverified.
 
 ---
 
@@ -834,3 +834,4 @@ Add one line per working session: date, what moved, what is next.
 | 2026-11-24 | M2 MCP shim implemented: stdio MCP server, folder-based identity, tools 1–7 and 13, roster and release rules, `connect opencode`. 69 tests pass and all four gates are green; two real OpenCode sessions in separate directories exchanged mail both ways. | M3 worktree manager |
 | 2026-11-24 | M3 worktree manager implemented: porcelain parser and reconciliation, `init`, `worktree new/adopt/list/remove` with port offsets and binding locks, home-worktree warnings, `run <vendor>` and `persona rehome`. 116 tests pass and all four gates are green; six-command CLI smoke check passed in a fresh temp repo with isolated XDG roots. | M4 leases and enforcement |
 | 2026-11-24 | M4–M6 complete: leases and pre-merge check, OpenCode adapter with spawning and approvals, and the M6 read-only Tauri window. Acceptance fixture (one senior dev, two developers, three worktrees, three mail rows) passes; 318 tests pass, 17 Rust tests pass, all eight gates green, and the native binary launched on the available display. | M7 full window and Move |
+| 2026-11-25 | M7–M8 complete: pitch-black minimal GUI with 24 gated `gui.*` methods, full task/session/approval/worktree/storage surfaces, crash- and offline-safe Move, and a separate model adapter reached only over a local socket. 371 JS/TS tests pass, 19 Rust tests pass, typecheck/lint/build/GUI build are green, and an Impeccable regex detect pass returned no findings. | Tester verification; live-provider wire smoke test |

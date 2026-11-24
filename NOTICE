@@ -19,6 +19,11 @@ Runtime dependencies
 - @tauri-apps/api 2.12.5 — Apache-2.0 OR MIT — https://github.com/tauri-apps/tauri#readme
 - react 19.3.1 — MIT — https://react.dev/
 - react-dom 19.3.1 — MIT — https://react.dev/
+- motion 14.14.0 — MIT — https://motion.dev/
+- @phosphor-icons/react 2.1.10 — MIT — https://phosphoricons.com/
+- @radix-ui/react-dialog 1.3.1 — MIT — https://www.radix-ui.com/primitives
+- @radix-ui/react-tabs 1.2.1 — MIT — https://www.radix-ui.com/primitives
+- eventsource-parser 4.1.3 — MIT — https://github.com/rexxars/eventsource-parser
 
 Build and test dependencies
 - @types/better-sqlite3 9.6.0 — MIT — https://github.com/DefinitelyTyped/DefinitelyTyped

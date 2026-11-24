@@ -160,20 +160,25 @@ fn built_request_has_canonical_headers_and_keeps_native_token_out_of_payload() {
 }
 
 #[test]
-fn only_the_allowlisted_read_only_methods_are_accepted_locally() {
-    assert_eq!(validate_gui_method("send_mail").unwrap_err().code, "FORBIDDEN_METHOD");
-    assert_eq!(validate_gui_method("approve").unwrap_err().code, "FORBIDDEN_METHOD");
-    assert_eq!(validate_gui_method("gui.nope").unwrap_err().code, "FORBIDDEN_METHOD");
-    assert_eq!(validate_gui_method("gui.approve").unwrap_err().code, "FORBIDDEN_METHOD");
-    assert_eq!(validate_gui_method("gui.approvals_approve").unwrap_err().code, "FORBIDDEN_METHOD");
-    for method in ["gui.projects", "gui.personas", "gui.worktrees", "gui.mail"] {
+fn only_the_deliberately_listed_gui_methods_are_accepted_locally() {
+    for method in ["send_mail", "approve", "tasks", "gui.nope", "gui.approvals_approve"] {
+        assert_eq!(validate_gui_method(method).unwrap_err().code, "FORBIDDEN_METHOD", "{method}");
+    }
+    for method in [
+        "gui.projects", "gui.personas", "gui.worktrees", "gui.mail",
+        "gui.tasks", "gui.leases", "gui.sessions", "gui.preMerge", "gui.audit",
+        "gui.approvals", "gui.approve", "gui.autoApprove", "gui.stopSession",
+        "gui.createWorktree", "gui.adoptWorktree", "gui.setHomeWorktree", "gui.chat",
+        "gui.storage", "gui.setStorage", "gui.movePreflight", "gui.moveStart",
+        "gui.moveStatus", "gui.moveUndo", "gui.moveDeleteOld",
+    ] {
         assert!(validate_gui_method(method).is_ok(), "{method}");
     }
 }
 
 #[test]
 fn blocking_call_keeps_the_method_allowlist_before_any_io() {
-    for method in ["send_mail", "gui.approve", "gui.nope"] {
+    for method in ["send_mail", "gui.nope", "gui.approvals_approve"] {
         let error = blocking_daemon_call(method.to_string(), json!({})).unwrap_err();
         assert_eq!(error.code, "FORBIDDEN_METHOD", "{method}");
     }

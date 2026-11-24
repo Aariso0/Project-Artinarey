@@ -34,13 +34,14 @@ import {
   type ToolReply,
   type XdgPaths,
 } from '@artinarey/core';
+import type { ModelAdapterClient } from './model-client.ts';
 import type { RpcRequest, RpcResponse } from './server.ts';
 import type { SessionSupervisor } from './sessions.ts';
 
 export const TOOL_METHODS = new Set([
   'attach', 'release_force', 'check_in', 'claim_persona', 'inbox',
   'read_mail', 'send_mail', 'mark_done', 'report', 'worktrees',
-  'task_update', 'request_scope', 'assign_task', 'request_session',
+  'task_update', 'request_scope', 'assign_task', 'request_session', 'run_task',
 ]);
 
 export function isToolMethod(method: string): boolean {
@@ -67,6 +68,8 @@ export type RpcContext = {
   invalidateWorktree?: (worktreeId: string) => void;
   /** The only component allowed to spawn processes or resolve approvals. */
   supervisor?: SessionSupervisor;
+  /** M8: local-socket client to the only process allowed to call a model API. */
+  model?: ModelAdapterClient;
 };
 
 function toolOk(id: string, reply: ToolReply): RpcResponse {
@@ -348,6 +351,41 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
       id,
       ok(`${who}\n${rosterText(people)}`, count, identity.role ? 'inbox' : 'claim_persona'),
     );
+  }
+
+  /** M8: a task's prompt goes to the adapter over the local socket, never to the daemon's network. */
+  if (request.method === 'run_task') {
+    if (!ctx.identity) return toolFail(id, 'NO_PROJECT', 'call attach before run_task');
+    if (!ctx.model) return toolFail(id, 'ADAPTER_OFFLINE', 'model adapter is not available');
+    const identity = ctx.identity;
+    const taskId = str(params.task_id) ?? str(params.taskId);
+    if (!taskId) return toolFail(id, 'INVALID_INPUT', 'run_task needs a task_id');
+    const task = readTasks(identity.storeDir).find((entry) => entry.id === taskId);
+    if (!task || task.projectId !== identity.projectId) {
+      return toolFail(id, 'NOT_FOUND', `unknown task: ${taskId}`);
+    }
+    if (task.worktreeId && task.worktreeId !== identity.worktreeId) {
+      return toolFail(id, 'FORBIDDEN_ROLE', 'this task belongs to another worktree');
+    }
+    if (task.assignee && identity.personaId && task.assignee !== identity.personaId) {
+      return toolFail(id, 'FORBIDDEN_ROLE', 'this task is assigned to another persona');
+    }
+    const system = `Work on task ${task.id} in worktree ${identity.worktreeId}. `
+      + `Change only files inside the lease: ${task.scope.join(', ') || '(none)'}.`;
+    try {
+      const result = await ctx.model.prompt({ prompt: task.title, system });
+      appendJournal(join(identity.storeDir, 'events', 'audit.jsonl'), {
+        type: 'model_task', task_id: task.id, project_id: identity.projectId,
+        persona_id: identity.personaId ?? null, adapter_done: result.done,
+        created_at: new Date().toISOString(),
+      });
+      return toolOk(id, ok(
+        `Task ${task.id} ran through the model adapter.\n${result.text}`,
+        unread(ctx, identity), 'check_in',
+      ));
+    } catch (err) {
+      return toolFail(id, 'ADAPTER_OFFLINE', (err as Error).message ?? 'model adapter failed');
+    }
   }
 
   if (request.method === 'claim_persona') {

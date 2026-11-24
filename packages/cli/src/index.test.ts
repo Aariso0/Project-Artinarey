@@ -53,6 +53,41 @@ test('the artinarey bin runs the CLI directly', () => {
   assert.match(result.stdout, /daemon not running/);
 });
 
+test('artinarey storage show and set validate the data root', async () => {
+  const { env, paths } = tempEnv();
+  let output = '';
+  const restore = capture((s) => { output += `${s}\n`; });
+  let code: number;
+  try {
+    code = await main(['storage', 'show'], env);
+  } finally {
+    restore();
+  }
+  assert.equal(code, 0);
+  assert.equal(output.trim(), paths.dataRoot);
+
+  output = '';
+  const restoreSet = capture((s) => { output += `${s}\n`; });
+  try {
+    code = await main(['storage', 'set', join(paths.dataRoot, 'elsewhere')], env);
+  } finally {
+    restoreSet();
+  }
+  assert.equal(code, 0);
+  assert.match(output.trim(), /elsewhere$/);
+
+  const originalError = console.error;
+  let error = '';
+  console.error = (s: unknown) => { error += `${String(s)}\n`; };
+  try {
+    code = await main(['storage', 'set', 'relative/root'], env);
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(code, 1);
+  assert.match(error, /must be an absolute path/);
+});
+
 test('artinarey reindex builds a cache index from the registered store', async () => {
   const { env, paths } = tempEnv();
   const registry = openRegistry(paths.registryFile);

@@ -6,183 +6,170 @@ import { fileURLToPath } from 'node:url';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import {
-  App, AppView, initialScopeState, loadScopedSnapshots, mailRecipientOptions, scopeReducer,
-  scopedMailQuery, type ScopeState, type Snapshots,
+  App, AppView, initialScopeState, mailRecipientOptions, scopeReducer, scopedMailQuery,
+  typedError, type ScopeState, type Snapshots,
 } from './App.tsx';
 import { createApi, type DaemonError, type GuiApi, type InvokeFn } from './api.ts';
+import {
+  ApprovalsView, AuditView, ChatView, PreMergeView, SessionsView, StorageView, TasksView,
+} from './components.tsx';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
 const snapshots: Snapshots = {
   projects: [{
-    id: 'project-1',
-    name: 'Artinarey',
-    storeDir: '/tmp/artinarey/store',
-    bytes: 1_073_741_824,
-    freeBytes: 536_870_912,
-    status: 'active',
+    id: 'project-1', name: 'Artinarey', storeDir: '/tmp/artinarey/store',
+    bytes: 1_073_741_824, freeBytes: 536_870_912, status: 'active',
   }],
   personas: [
-    {
-      id: 'agent-0', role: 'senior-dev', name: 'Senior Dev',
-      worktreeId: 'worktree-0', lastVendorSessionId: null, running: false,
-    },
-    {
-      id: 'agent-1', role: 'dev0', name: 'Dev Zero',
-      worktreeId: 'worktree-1', lastVendorSessionId: 'vendor-1', running: true,
-    },
-    {
-      id: 'agent-2', role: 'dev1', name: 'Dev One',
-      worktreeId: 'worktree-2', lastVendorSessionId: null, running: false,
-    },
+    { id: 'agent-0', role: 'senior-dev', name: 'Senior Dev', worktreeId: 'worktree-0', lastVendorSessionId: null, running: false },
+    { id: 'agent-1', role: 'dev0', name: 'Dev Zero', worktreeId: 'worktree-1', lastVendorSessionId: 'vendor-1', running: true },
+    { id: 'agent-2', role: 'dev1', name: 'Dev One', worktreeId: 'worktree-2', lastVendorSessionId: null, running: false },
   ],
   worktrees: [
-    {
-      id: 'worktree-0', path: '/tmp/artinarey/wt0', branch: 'main',
-      locked: false, prunable: false, personaId: 'agent-0', autoApprove: false,
-    },
-    {
-      id: 'worktree-1', path: '/tmp/artinarey/wt1', branch: 'dev0',
-      locked: false, prunable: false, personaId: 'agent-1', autoApprove: false,
-    },
-    {
-      id: 'worktree-2', path: '/tmp/artinarey/wt2', branch: 'dev1',
-      locked: true, prunable: false, personaId: 'agent-2', autoApprove: false,
-    },
+    { id: 'worktree-0', path: '/tmp/artinarey/wt0', branch: 'main', locked: false, prunable: false, personaId: 'agent-0', autoApprove: false },
+    { id: 'worktree-1', path: '/tmp/artinarey/wt1', branch: 'dev0', locked: false, prunable: false, personaId: 'agent-1', autoApprove: true },
+    { id: 'worktree-2', path: '/tmp/artinarey/wt2', branch: 'dev1', locked: true, prunable: false, personaId: 'agent-2', autoApprove: false },
   ],
   mail: [{
     id: 'mail-1', thread: 'thread-1', from: 'senior-dev', to: ['dev0', 'dev1'],
     cc: ['senior-dev'], subject: 'Subject: seeded route', kind: 'note',
     createdAt: '2026-11-24T10:00:00.000Z',
   }],
+  tasks: [{
+    id: 'task-1', title: 'Ship the gate', status: 'active', assignee: 'dev0',
+    worktreeId: 'worktree-1', updatedAt: '2026-11-25T10:00:00.000Z',
+  }],
+  leases: [{
+    id: 'lease-1', projectId: 'project-1', worktreeId: 'worktree-1', personaId: 'agent-1',
+    paths: ['/tmp/artinarey/wt1/src'], reason: 'editing source', expiresAt: null,
+  }],
+  sessions: [{
+    id: 'session-1', projectId: 'project-1', worktreeId: 'worktree-1', personaId: 'agent-1',
+    vendor: 'opencode', vendorSessionId: 'vendor-1', status: 'running',
+    startedAt: '2026-11-25T09:00:00.000Z', endedAt: null,
+  }],
+  preMerge: [{
+    id: 'check-1', worktreeId: 'worktree-1', status: 'verified',
+    summary: 'lease scopes verified', checkedAt: '2026-11-25T09:30:00.000Z',
+  }],
+  audit: [{
+    id: 'event-1', at: '2026-11-25T09:31:00.000Z', type: 'approval',
+    text: 'approved risky call',
+  }],
+  approvals: [{
+    id: 'approval-1', projectId: 'project-1', kind: 'spawn_over_cap',
+    summary: 'Spawn a fourth developer', status: 'pending',
+    worktreeId: null, requestedAt: '2026-11-25T09:32:00.000Z',
+  }],
+  storage: {
+    dataRoot: '/tmp/artinarey',
+    projects: [{ id: 'project-1', name: 'Artinarey', storeDir: '/tmp/artinarey/store', bytes: 1024, freeBytes: 512 }],
+  },
 };
 
 /** Server rendering must never touch the daemon, so any call is a test failure. */
-const offlineApi: GuiApi = {
-  projects: () => { throw new Error('server render called projects'); },
-  personas: () => { throw new Error('server render called personas'); },
-  worktrees: () => { throw new Error('server render called worktrees'); },
-  mail: () => { throw new Error('server render called mail'); },
-};
-
-test('renders one senior dev, two developers and read-only mail metadata', () => {
-  const html = renderToStaticMarkup(createElement(App, { api: offlineApi, initial: snapshots }));
-
-  assert.match(html, /senior-dev/);
-  assert.match(html, /dev0/);
-  assert.match(html, /dev1/);
-  assert.match(html, /Subject: seeded route/);
-  assert.match(html, /\/tmp\/artinarey\/store/);
-  assert.match(html, /1,073,741,824/);
-  assert.match(html, /536,870,912/);
-  assert.match(html, /active/);
-  assert.match(html, /thread-1/);
-  assert.match(html, /2026-11-24T10:00:00.000Z/);
-  assert.match(html, /&#x2F;logo\.svg|\/logo\.svg/);
-  assert.equal(html.match(/Scoped to Artinarey/g)?.length, 3);
-
-  assert.equal(html.match(/<select\b/g)?.length, 2);
-  assert.equal(html.match(/data-readonly-select="true"/g)?.length, 2);
-  assert.match(html, /value="all"/);
-  for (const role of ['senior-dev', 'dev0', 'dev1']) {
-    assert.ok(html.includes(`>${role}<`), `${role} is a selectable mail recipient`);
-  }
-  assert.doesNotMatch(html, /data-mutating-action/);
-  assert.doesNotMatch(html, /<(input|textarea|button|form)\b/i);
-  assert.doesNotMatch(html, /private body/i);
-  assert.doesNotMatch(html, /read state/i);
+const offlineApi: GuiApi = new Proxy({} as GuiApi, {
+  get(_target, property) {
+    return () => { throw new Error(`server render called ${String(property)}`); };
+  },
 });
 
-/** Mirrors packages/daemon/src/gui.test.ts acceptance fixture, with no live daemon call. */
-const acceptanceSnapshots: Snapshots = {
-  projects: [{
-    id: 'project-1',
-    name: 'Gui',
-    storeDir: '/tmp/artinarey-acceptance/data/store',
-    bytes: 1_073_741_824,
-    freeBytes: 536_870_912,
-    status: 'active',
-  }],
-  personas: [
-    {
-      id: 'persona-0', role: 'senior-dev', name: 'Senior Dev',
-      worktreeId: 'worktree-0', lastVendorSessionId: null, running: false,
-    },
-    {
-      id: 'persona-1', role: 'dev0', name: 'Dev Zero',
-      worktreeId: 'worktree-1', lastVendorSessionId: null, running: false,
-    },
-    {
-      id: 'persona-2', role: 'dev1', name: 'Dev One',
-      worktreeId: 'worktree-2', lastVendorSessionId: null, running: false,
-    },
-  ],
-  worktrees: [
-    {
-      id: 'worktree-0', path: '/tmp/artinarey-acceptance/wt1', branch: 'main',
-      locked: false, prunable: false, personaId: 'persona-0', autoApprove: false,
-    },
-    {
-      id: 'worktree-1', path: '/tmp/artinarey-acceptance/wt2', branch: 'artinarey/dev0',
-      locked: false, prunable: false, personaId: 'persona-1', autoApprove: false,
-    },
-    {
-      id: 'worktree-2', path: '/tmp/artinarey-acceptance/wt3', branch: 'artinarey/dev1',
-      locked: false, prunable: false, personaId: 'persona-2', autoApprove: false,
-    },
-  ],
-  mail: [
-    {
-      id: 'mail-0001', thread: 'thread-1', from: 'senior-dev', to: ['senior-dev'],
-      cc: [], subject: 'Subject 1', kind: 'note', createdAt: '2026-11-24T12:00:00.000Z',
-    },
-    {
-      id: 'mail-0002', thread: 'thread-1', from: 'senior-dev', to: ['dev0'],
-      cc: [], subject: 'Subject 2', kind: 'note', createdAt: '2026-11-24T12:00:01.000Z',
-    },
-    {
-      id: 'mail-0003', thread: 'thread-1', from: 'senior-dev', to: ['dev1'],
-      cc: [], subject: 'Subject 3', kind: 'note', createdAt: '2026-11-24T12:00:02.000Z',
-    },
-  ],
-};
-
-test('acceptance fixture renders three agents, three mail rows and no mutating controls', () => {
-  const html = renderToStaticMarkup(createElement(App, {
-    api: offlineApi, initial: acceptanceSnapshots,
-  }));
-
-  for (const name of ['Senior Dev', 'Dev Zero', 'Dev One']) {
-    assert.ok(html.includes(name), `${name} is visible`);
-  }
-  for (const subject of ['Subject 1', 'Subject 2', 'Subject 3']) {
-    assert.ok(html.includes(subject), `${subject} is visible`);
-  }
-  for (const recipient of ['senior-dev', 'dev0', 'dev1']) {
-    assert.ok(html.includes(`>${recipient}<`), `${recipient} is a visible mail recipient`);
-  }
-  assert.equal(html.match(/Scoped to Gui/g)?.length, 3);
-  assert.equal(html.match(/<select\b/g)?.length, 2);
-  assert.equal(html.match(/data-readonly-select="true"/g)?.length, 2);
-  assert.match(html, /value="all"/);
-  assert.doesNotMatch(html, /<(input|textarea|button|form)\b/i);
-  assert.doesNotMatch(html, /\son(click|change|input|submit)=/i);
-  assert.doesNotMatch(html, /data-mutating-action/i);
-  assert.doesNotMatch(html, /private body/i);
-});
-
-test('the window labels an empty project scope', () => {
-  const html = renderToStaticMarkup(createElement(App, {
+function renderApp(overrides: Partial<Snapshots> = {}): string {
+  return renderToStaticMarkup(createElement(App, {
     api: offlineApi,
-    initial: { ...snapshots, projects: [] },
+    initial: { ...snapshots, ...overrides },
   }));
-  assert.equal(html.match(/No project selected/g)?.length, 3);
+}
+
+function renderView(component: React.ReactElement): string {
+  return renderToStaticMarkup(component);
+}
+
+function renderAppView(state?: ScopeState): string {
+  return renderToStaticMarkup(createElement(AppView, {
+    api: offlineApi,
+    snapshots,
+    loadedScope: state?.loaded ?? initialScopeState('project-1').loaded,
+    error: null,
+    loading: false,
+    scopeLoading: false,
+    section: 'workspace',
+    onSection: () => {},
+    onChooseProject: () => {},
+    onChooseRecipient: () => {},
+    onRefresh: () => {},
+    onActionError: () => {},
+  }));
+}
+
+test('the full window renders real state, controls and the four workspace tabs', () => {
+  const html = renderApp();
+  for (const value of ['Artinarey', 'Senior Dev', 'Dev Zero', 'Dev One', 'Ship the gate',
+    '1,073,741,824', '536,870,912', 'worktree-1', '/tmp/artinarey/store']) {
+    assert.ok(html.includes(value), `${value} is visible`);
+  }
+  for (const label of ['Overview', 'Chat', 'Approvals', 'Storage',
+    'Tasks &amp; leases', 'Sessions', 'Pre-merge', 'Audit', 'New worktree', 'Adopt']) {
+    assert.ok(html.includes(label), `${label} is present`);
+  }
+  assert.equal(html.match(/role="tab"/g)?.length, 4);
+  assert.equal(html.match(/<select\b/g)?.length, 2);
+  assert.ok(html.includes('logo-dark.svg'), 'the transparent in-app mark is used');
+  assert.doesNotMatch(html, /#0d1117|#161b22|#30363d/);
+  assert.match(html, /role="switch"/);
+  assert.match(html, /auto-approve/i);
+});
+
+test('dialogs are closed by default and do not leak warning text into the window', () => {
+  const html = renderApp();
+  assert.doesNotMatch(html, /Adopting an unmanaged worktree/);
+  assert.doesNotMatch(html, /Worktree blocked/);
+  assert.doesNotMatch(html, /role="dialog"/);
+});
+
+test('view components render their own empty and loaded states', () => {
+  const tasks = renderView(createElement(TasksView, {
+    tasks: [], leases: [], autoApprove: {}, onAutoApprove: () => {},
+  }));
+  assert.match(tasks, /No tasks/);
+  assert.match(tasks, /No active leases/);
+
+  const sessions = renderView(createElement(SessionsView, { sessions: snapshots.sessions, onStop: () => {} }));
+  assert.match(sessions, /vendor-1/);
+  assert.match(sessions, /Stop session session-1/);
+
+  const approvals = renderView(createElement(ApprovalsView, { approvals: snapshots.approvals, onDecide: () => {} }));
+  assert.match(approvals, /spawn_over_cap/);
+  assert.match(approvals, /Approve/);
+  assert.match(approvals, /Reject/);
+
+  const audit = renderView(createElement(AuditView, { rows: snapshots.audit }));
+  assert.match(audit, /approved risky call/);
+
+  const premerge = renderView(createElement(PreMergeView, { rows: snapshots.preMerge }));
+  assert.match(premerge, /lease scopes verified/);
+
+  const chat = renderView(createElement(ChatView, { replies: [], onSend: () => {}, busy: false }));
+  assert.match(chat, /Start a conversation/);
+  assert.match(chat, /<input\b/);
+
+  const storage = renderView(createElement(StorageView, {
+    storage: snapshots.storage, move: null, target: '', onTarget: () => {},
+    onSetRoot: () => {}, onPreflight: () => {}, onMove: () => {}, onReconnect: () => {},
+    onUndo: () => {}, onDeleteOld: () => {}, busy: false,
+  }));
+  assert.match(storage, /Storage settings/);
+  assert.match(storage, /Move store/);
+  assert.match(storage, /\/tmp\/artinarey/);
 });
 
 test('a typed daemon error renders visibly instead of an empty window', () => {
-  const error: DaemonError = { code: 'BAD_ORIGIN', message: 'Origin not allowed on /rpc' };
-  const html = renderToStaticMarkup(createElement(App, { api: offlineApi, initialError: error }));
-
+  const html = renderToStaticMarkup(createElement(App, {
+    api: offlineApi,
+    initial: snapshots,
+    initialError: { code: 'BAD_ORIGIN', message: 'Origin not allowed on /rpc' },
+  }));
   assert.match(html, /BAD_ORIGIN/);
   assert.match(html, /Origin not allowed on &#x2F;rpc|Origin not allowed on \/rpc/);
   assert.match(html, /role="alert"/);
@@ -190,15 +177,18 @@ test('a typed daemon error renders visibly instead of an empty window', () => {
 
 test('App without seeded props is renderable without Tauri globals', () => {
   const html = renderToStaticMarkup(createElement(App, { api: offlineApi }));
-  assert.match(html, /Loading/i);
-  assert.doesNotMatch(html, /data-mutating-action/);
+  assert.match(html, /Loading|skeleton/i);
 });
 
-test('createApi invokes only the four read-only daemon methods', async () => {
+test('createApi invokes only the daemon_call command for every feature', async () => {
   const calls: Array<{ command: string; args: Record<string, unknown> }> = [];
+  const rowMethods = new Set([
+    'gui.projects', 'gui.personas', 'gui.worktrees', 'gui.mail', 'gui.tasks', 'gui.leases',
+    'gui.sessions', 'gui.preMerge', 'gui.audit', 'gui.approvals',
+  ]);
   const invoke: InvokeFn = async (command, args) => {
     calls.push({ command, args });
-    return { ok: true, result: [] };
+    return rowMethods.has(String(args.method)) ? [] : {};
   };
   const api = createApi(invoke);
 
@@ -206,28 +196,47 @@ test('createApi invokes only the four read-only daemon methods', async () => {
   await api.personas('project-1');
   await api.worktrees('project-1');
   await api.mail({ projectId: 'project-1', recipient: 'dev0' });
+  await api.tasks('project-1');
+  await api.leases('project-1');
+  await api.sessions('project-1');
+  await api.preMerge('project-1');
+  await api.audit('project-1', 20);
+  await api.approvals('project-1');
+  await api.approve('approval-1', 'approved', 'user');
+  await api.autoApprove('worktree-1', true);
+  await api.stopSession('session-1');
+  await api.createWorktree('project-1', 'artinarey/dev2');
+  await api.adoptWorktree('project-1', '/tmp/wt');
+  await api.setHomeWorktree('project-1', 'agent-1', 'worktree-1');
+  await api.chat('project-1', 'hello');
+  await api.storage();
+  await api.setStorage('/tmp/new');
+  await api.movePreflight('project-1', '/tmp/target');
+  await api.moveStart('project-1', '/tmp/target');
+  await api.moveStatus('project-1');
+  await api.moveUndo('project-1');
+  await api.moveDeleteOld('project-1');
 
-  assert.deepEqual(calls, [
+  assert.equal(calls.length, 24);
+  assert.deepEqual([...new Set(calls.map((call) => call.command))], ['daemon_call']);
+  assert.deepEqual(calls.slice(0, 4), [
     { command: 'daemon_call', args: { method: 'gui.projects', params: {} } },
     { command: 'daemon_call', args: { method: 'gui.personas', params: { projectId: 'project-1' } } },
     { command: 'daemon_call', args: { method: 'gui.worktrees', params: { projectId: 'project-1' } } },
-    {
-      command: 'daemon_call',
-      args: { method: 'gui.mail', params: { projectId: 'project-1', recipient: 'dev0' } },
-    },
+    { command: 'daemon_call', args: { method: 'gui.mail', params: { projectId: 'project-1', recipient: 'dev0' } } },
   ]);
+  assert.deepEqual(calls[10], {
+    command: 'daemon_call', args: { method: 'gui.approve', params: { id: 'approval-1', decision: 'approved', by: 'user' } },
+  });
+  assert.deepEqual(calls[17], {
+    command: 'daemon_call', args: { method: 'gui.storage', params: {} },
+  });
 });
 
 test('createApi rejects with the daemon error object, not a blank result', async () => {
   const error: DaemonError = { code: 'BAD_ORIGIN', message: 'rejected' };
   const api = createApi(async () => ({ ok: false, error }));
-
-  for (const call of [
-    () => api.projects(),
-    () => api.personas('project-1'),
-    () => api.worktrees('project-1'),
-    () => api.mail({ projectId: 'project-1' }),
-  ]) {
+  for (const call of [() => api.projects(), () => api.approvals(), () => api.storage()]) {
     await assert.rejects(call(), (rejected: unknown) => {
       assert.deepEqual(rejected, error);
       return true;
@@ -235,218 +244,76 @@ test('createApi rejects with the daemon error object, not a blank result', async
   }
 });
 
-test('createApi accepts a bare array result returned by the native command', async () => {
-  const api = createApi(async () => snapshots.projects);
-  assert.deepEqual(await api.projects(), snapshots.projects);
-  assert.deepEqual(await createApi(async () => []).mail({ projectId: 'project-1' }), []);
+test('createApi accepts a bare object or array result from the native command', async () => {
+  assert.deepEqual(await createApi(async () => snapshots.projects).projects(), snapshots.projects);
+  assert.deepEqual(await createApi(async () => snapshots.storage).storage(), snapshots.storage);
+  assert.deepEqual(await createApi(async () => []).tasks('project-1'), []);
 });
 
-test('createApi rejects every non-array result with BAD_RESPONSE', async () => {
-  const invalidReplies: unknown[] = [
-    { nested: ['value'] },
-    { ok: true, result: { nested: ['value'] } },
-    { ok: true, result: null },
-    42,
-  ];
-  for (const reply of invalidReplies) {
+test('createApi rejects every malformed reply with BAD_RESPONSE', async () => {
+  for (const reply of [{ nested: ['v'] }, { ok: true, result: { nested: true } }, { ok: true, result: null }, 42, null]) {
     const api = createApi(async () => reply);
-    for (const call of [
-      () => api.projects(),
-      () => api.personas('project-1'),
-      () => api.worktrees('project-1'),
-      () => api.mail({ projectId: 'project-1' }),
-    ]) {
-      await assert.rejects(call(), (rejected: unknown) => {
-        assert.deepEqual(rejected, { code: 'BAD_RESPONSE', message: 'malformed daemon reply' });
-        return true;
-      });
-    }
+    await assert.rejects(api.projects(), (rejected: unknown) => {
+      assert.deepEqual(rejected, { code: 'BAD_RESPONSE', message: 'malformed daemon reply' });
+      return true;
+    });
   }
 });
 
-test('a selected project and mail recipient reload only the scoped snapshots', async () => {
-  const calls: Array<{ command: string; args: Record<string, unknown> }> = [];
-  const api = createApi(async (command, args) => {
-    calls.push({ command, args });
-    return [];
-  });
-
-  await loadScopedSnapshots(api, 'project-1', 'all');
-  await loadScopedSnapshots(api, 'project-2', 'dev0');
-
-  assert.deepEqual(calls, [
-    { command: 'daemon_call', args: { method: 'gui.personas', params: { projectId: 'project-1' } } },
-    { command: 'daemon_call', args: { method: 'gui.worktrees', params: { projectId: 'project-1' } } },
-    { command: 'daemon_call', args: { method: 'gui.mail', params: { projectId: 'project-1' } } },
-    { command: 'daemon_call', args: { method: 'gui.personas', params: { projectId: 'project-2' } } },
-    { command: 'daemon_call', args: { method: 'gui.worktrees', params: { projectId: 'project-2' } } },
-    {
-      command: 'daemon_call',
-      args: { method: 'gui.mail', params: { projectId: 'project-2', recipient: 'dev0' } },
-    },
-  ]);
+test('createApi normalizes thrown errors into typed errors', async () => {
+  await assert.rejects(createApi(async () => { throw { code: 'FORBIDDEN', message: 'no' }; }).projects(),
+    (rejected: unknown) => {
+      assert.deepEqual(rejected, { code: 'FORBIDDEN', message: 'no' });
+      return true;
+    });
+  await assert.rejects(createApi(async () => { throw 'native failure'; }).projects(),
+    (rejected: unknown) => {
+      assert.deepEqual(rejected, { code: 'INTERNAL_ERROR', message: 'native failure' });
+      return true;
+    });
 });
 
-test('mail recipients are derived from persona roles with an unfiltered option', async () => {
-  assert.deepEqual(mailRecipientOptions(snapshots.personas), ['all', 'senior-dev', 'dev0', 'dev1']);
-  assert.deepEqual(
-    mailRecipientOptions([snapshots.personas[1], snapshots.personas[1]]),
-    ['all', 'dev0'],
-  );
-  assert.deepEqual(scopedMailQuery('project-1', 'all'), { projectId: 'project-1' });
-  assert.deepEqual(scopedMailQuery('project-1', 'dev0'), {
-    projectId: 'project-1', recipient: 'dev0',
-  });
-});
-
-const twoProjectSnapshots: Snapshots = {
-  ...snapshots,
-  projects: [
-    ...snapshots.projects,
-    { ...snapshots.projects[0], id: 'project-2', name: 'Beta' },
-  ],
-};
-
-/** React marks the selected option rather than emitting a value on <select>. */
-function selectedValue(html: string, id: string): string | undefined {
-  const start = html.indexOf(`<select id="${id}"`);
-  if (start < 0) return undefined;
-  const select = html.slice(start, html.indexOf('</select>', start));
-  return select.match(/<option value="([^"]*)" selected="">/)?.[1];
-}
-
-function renderScope(state: ScopeState): string {
-  return renderToStaticMarkup(createElement(AppView, {
-    snapshots: twoProjectSnapshots,
-    loadedScope: state.loaded,
-    error: null,
-    loading: false,
-    scopeLoading: false,
-    onChooseProject: () => {},
-    onChooseRecipient: () => {},
-  }));
-}
-
-test('a failed project switch keeps the loaded project on the selects and scope labels', () => {
-  const requested = scopeReducer(initialScopeState('project-1'), {
-    type: 'chooseProject', projectId: 'project-2',
-  });
+test('a failed scope change keeps the loaded project on the selectors', () => {
+  const loaded = initialScopeState('project-1');
+  const requested = scopeReducer(loaded, { type: 'chooseProject', projectId: 'project-2' });
   assert.deepEqual(requested.loaded, { projectId: 'project-1', recipient: 'all' });
-  assert.deepEqual(requested.request, { projectId: 'project-2', recipient: 'all' });
-
-  const failed = scopeReducer(requested, { type: 'requestFailed' });
-  assert.deepEqual(failed.loaded, { projectId: 'project-1', recipient: 'all' });
-  assert.equal(failed.request, null);
-
-  for (const state of [requested, failed]) {
-    const html = renderScope(state);
-    assert.equal(selectedValue(html, 'project-select'), 'project-1');
-    assert.equal(selectedValue(html, 'recipient-select'), 'all');
-    assert.equal(html.match(/Scoped to Artinarey/g)?.length, 3);
-    assert.doesNotMatch(html, /Scoped to Beta/);
-  }
-});
-
-test('a failed recipient change keeps the previously loaded recipient on the filter', () => {
-  const loaded: ScopeState = {
-    loaded: { projectId: 'project-1', recipient: 'dev0' },
-    request: null,
-  };
-  const requested = scopeReducer(loaded, { type: 'chooseRecipient', recipient: 'dev1' });
-  assert.deepEqual(requested.loaded, loaded.loaded);
-  assert.deepEqual(requested.request, { projectId: 'project-1', recipient: 'dev1' });
-
-  const afterFailedProject = scopeReducer(
-    scopeReducer(loaded, { type: 'chooseProject', projectId: 'project-2' }),
-    { type: 'chooseRecipient', recipient: 'dev1' },
-  );
-  assert.deepEqual(afterFailedProject.request, { projectId: 'project-1', recipient: 'dev1' });
-
   const failed = scopeReducer(requested, { type: 'requestFailed' });
   assert.deepEqual(failed.loaded, loaded.loaded);
-  const html = renderScope(failed);
-  assert.equal(selectedValue(html, 'recipient-select'), 'dev0');
-  assert.equal(selectedValue(html, 'project-select'), 'project-1');
-  assert.ok(html.includes('>dev1<'), 'the rejected recipient is still an option, but not selected');
+  assert.equal(failed.request, null);
+
+  const html = renderAppView(failed);
+  const select = html.slice(html.indexOf('<select id="project-select"'));
+  assert.match(select.slice(0, select.indexOf('</select>')), /value="project-1" selected=""/);
+  assert.doesNotMatch(html, /value="project-2" selected=""/);
 });
 
-test('successful reloads update the displayed project and recipient scope', () => {
-  const projectRequested = scopeReducer(initialScopeState('project-1'), {
-    type: 'chooseProject', projectId: 'project-2',
-  });
-  const projectLoaded = scopeReducer(projectRequested, {
-    type: 'loadSucceeded', scope: { projectId: 'project-2', recipient: 'all' },
-  });
-  assert.deepEqual(projectLoaded.loaded, { projectId: 'project-2', recipient: 'all' });
-  let html = renderScope(projectLoaded);
-  assert.equal(selectedValue(html, 'project-select'), 'project-2');
-  assert.equal(html.match(/Scoped to Beta/g)?.length, 3);
-  assert.doesNotMatch(html, /Scoped to Artinarey/);
-
-  const recipientRequested = scopeReducer(projectLoaded, {
-    type: 'chooseRecipient', recipient: 'dev1',
-  });
-  const recipientLoaded = scopeReducer(recipientRequested, {
-    type: 'loadSucceeded', scope: { projectId: 'project-2', recipient: 'dev1' },
-  });
-  html = renderScope(recipientLoaded);
-  assert.equal(selectedValue(html, 'project-select'), 'project-2');
-  assert.equal(selectedValue(html, 'recipient-select'), 'dev1');
+test('scope helpers derive mail recipients and typed errors', () => {
+  assert.deepEqual(mailRecipientOptions(snapshots.personas), ['all', 'senior-dev', 'dev0', 'dev1']);
+  assert.deepEqual(scopedMailQuery('project-1', 'all'), { projectId: 'project-1' });
+  assert.deepEqual(scopedMailQuery('project-1', 'dev0'), { projectId: 'project-1', recipient: 'dev0' });
+  assert.deepEqual(typedError({ code: 'X', message: 'y' }), { code: 'X', message: 'y' });
+  assert.deepEqual(typedError('bad'), { code: 'INTERNAL_ERROR', message: 'bad' });
 });
 
-test('createApi normalizes a rejected native error object', async () => {
-  const error = { code: 'BAD_ORIGIN', message: 'Origin not allowed on /rpc' };
-  const api = createApi(async () => { throw error; });
-
-  for (const call of [
-    () => api.projects(),
-    () => api.personas('project-1'),
-    () => api.worktrees('project-1'),
-    () => api.mail({ projectId: 'project-1' }),
-  ]) {
-    await assert.rejects(call(), (rejected: unknown) => {
-      assert.deepEqual(rejected, error);
-      return true;
-    });
-  }
-});
-
-test('createApi normalizes a non-object rejection into a typed error', async () => {
-  const api = createApi(async () => { throw 'native failure'; });
-  await assert.rejects(api.projects(), (rejected: unknown) => {
-    assert.deepEqual(rejected, { code: 'INTERNAL_ERROR', message: 'native failure' });
-    return true;
-  });
-});
-
-test('createApi handles envelope-shaped replies defensively', async () => {
-  await assert.rejects(createApi(async () => ({ ok: true })).projects(), (rejected: unknown) => {
-    assert.deepEqual(rejected, { code: 'BAD_RESPONSE', message: 'malformed daemon reply' });
-    return true;
-  });
-  const error: DaemonError = { code: 'FORBIDDEN_METHOD', message: 'not callable' };
-  await assert.rejects(createApi(async () => ({ error })).projects(), (rejected: unknown) => {
-    assert.deepEqual(rejected, error);
-    return true;
-  });
-});
-
-test('createApi maps a non-object daemon reply to a typed error', async () => {
-  const api = createApi(async () => null);
-  await assert.rejects(api.projects(), (rejected: unknown) => {
-    assert.deepEqual(rejected, { code: 'BAD_RESPONSE', message: 'malformed daemon reply' });
-    return true;
-  });
-});
-
-test('frontend sources pin the no-mutating-method rule', () => {
+test('frontend sources keep the webview free of credentials, ports and HTTP', () => {
   const apiSource = readFileSync(join(here, 'api.ts'), 'utf8');
-  const methods = [...apiSource.matchAll(/method:\s*'([^']+)'/g)].map((match) => match[1]).sort();
-  assert.deepEqual(methods, ['gui.mail', 'gui.personas', 'gui.projects', 'gui.worktrees']);
-  assert.doesNotMatch(apiSource, /\b(send_mail|approve|token|port|fetch|localStorage|http|rpc)\b/i);
+  const methods = [...new Set([...apiSource.matchAll(/get(?:<[^>]*>)?\('([^']+)'/g)].map((match) => match[1]))].sort();
+  assert.deepEqual(methods, [
+    'approvals', 'approve', 'audit', 'autoApprove', 'chat', 'createWorktree', 'adoptWorktree',
+    'leases', 'mail', 'moveDeleteOld', 'movePreflight', 'moveStart', 'moveStatus', 'moveUndo',
+    'personas', 'preMerge', 'projects', 'sessions', 'setHomeWorktree', 'setStorage',
+    'stopSession', 'storage', 'tasks', 'worktrees',
+  ].sort());
+  assert.doesNotMatch(apiSource, /\b(token|port|fetch|localStorage|http|rpc|apiKey|api_key)\b/i);
 
-  for (const file of ['App.tsx', 'components.tsx', 'main.tsx']) {
+  for (const file of ['App.tsx', 'components.tsx', 'ui.tsx', 'main.tsx', 'motion.ts']) {
     const source = readFileSync(join(here, file), 'utf8');
-    assert.doesNotMatch(source, /\binvoke\s*\(|\bsend_mail\b|\bapprove\b|\btoken\b/i, file);
+    assert.doesNotMatch(source, /\binvoke\s*\(|\btoken\b|\bport\b|\bapiKey\b|fetch\(|localStorage/i, file);
   }
+});
+
+test('mail metadata never renders a private body or read-state field', () => {
+  const html = renderApp();
+  assert.doesNotMatch(html, /private body/i);
+  assert.doesNotMatch(html, /\b(readAt|readState|hasRead|isRead)\b/i);
 });

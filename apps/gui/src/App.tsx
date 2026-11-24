@@ -1,34 +1,40 @@
-import { useEffect, useReducer, useState } from 'react';
+import { useCallback, useEffect, useReducer, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
+import { Bell, ChatCircle, Gear, SquaresFour } from '@phosphor-icons/react';
 import type {
-  GuiMail, GuiPersona, GuiProject, GuiWorktree,
-} from '../../../packages/daemon/src/gui.ts';
+  GuiApproval, GuiAudit, GuiChatReply, GuiLease, GuiMail, GuiMoveStatus, GuiPersona,
+  GuiPreMerge, GuiProject, GuiSession, GuiStorage, GuiTask, GuiWorktree,
+} from './api.ts';
 import { type DaemonError, type GuiApi, type MailQuery } from './api.ts';
 import {
-  ErrorPanel, Logo, MailView, PersonaView, ProjectView, ReadOnlySelect, WorktreeView,
+  AdoptDialog, ApprovalsView, AuditView, BlockerModal, ChatView, Logo, NewWorktreeDialog,
+  PersonaView, PreMergeView, ProjectView, SessionsView, StorageView, TasksView, WorktreeView,
 } from './components.tsx';
+import { Button, ErrorBanner, Select, Skeleton, TabBar, type TabItem } from './ui.tsx';
+import { useMotionTransition } from './motion.ts';
 
 export type Snapshots = {
   projects: GuiProject[];
   personas: GuiPersona[];
   worktrees: GuiWorktree[];
   mail: GuiMail[];
+  tasks: GuiTask[];
+  leases: GuiLease[];
+  sessions: GuiSession[];
+  preMerge: GuiPreMerge[];
+  audit: GuiAudit[];
+  approvals: GuiApproval[];
+  storage: GuiStorage | null;
 };
 
 export type AppProps = {
   api: GuiApi;
-  initial?: Snapshots;
+  initial?: Partial<Snapshots>;
   initialError?: DaemonError | null;
 };
 
 export type Scope = { projectId: string; recipient: string };
-
-export type ScopeState = {
-  /** Scope of the snapshot currently on screen; only a completed load may change it. */
-  loaded: Scope;
-  /** Scope being requested; never used to label the displayed rows. */
-  request: Scope | null;
-};
-
+export type ScopeState = { loaded: Scope; request: Scope | null };
 export type ScopeAction =
   | { type: 'chooseProject'; projectId: string }
   | { type: 'chooseRecipient'; recipient: string }
@@ -36,6 +42,10 @@ export type ScopeAction =
   | { type: 'requestFailed' };
 
 const ALL_RECIPIENTS = 'all';
+const EMPTY: Snapshots = {
+  projects: [], personas: [], worktrees: [], mail: [], tasks: [], leases: [],
+  sessions: [], preMerge: [], audit: [], approvals: [], storage: null,
+};
 
 export function initialScopeState(projectId: string): ScopeState {
   return { loaded: { projectId, recipient: ALL_RECIPIENTS }, request: null };
@@ -56,57 +66,115 @@ export function scopeReducer(state: ScopeState, action: ScopeAction): ScopeState
   }
 }
 
-function typedError(value: unknown): DaemonError {
+export function typedError(value: unknown): DaemonError {
   if (value && typeof value === 'object' && 'code' in value && 'message' in value) {
     const error = value as { code: unknown; message: unknown };
-    if (typeof error.code === 'string' && typeof error.message === 'string') {
-      return { code: error.code, message: error.message };
-    }
+    if (typeof error.code === 'string' && typeof error.message === 'string') return error as DaemonError;
   }
-  return { code: 'INTERNAL_ERROR', message: value instanceof Error ? value.message : 'request failed' };
+  return {
+    code: 'INTERNAL_ERROR',
+    message: value instanceof Error ? value.message : String(value),
+  };
 }
 
-/** 'all' leaves the recipient filter out of the query entirely. */
 export function scopedMailQuery(projectId: string, recipient: string): MailQuery {
   return recipient === ALL_RECIPIENTS ? { projectId } : { projectId, recipient };
 }
 
-/** The only data that changes when the user selects a project or mail recipient. */
-export async function loadScopedSnapshots(
-  api: GuiApi,
-  projectId: string,
-  recipient: string,
-): Promise<Pick<Snapshots, 'personas' | 'worktrees' | 'mail'>> {
-  const [personas, worktrees, mail] = await Promise.all([
-    api.personas(projectId),
-    api.worktrees(projectId),
-    api.mail(scopedMailQuery(projectId, recipient)),
-  ]);
-  return { personas, worktrees, mail };
-}
-
-/** One option per persona role, with the unfiltered 'all' option first. */
 export function mailRecipientOptions(personas: GuiPersona[]): string[] {
   return [ALL_RECIPIENTS, ...new Set(personas.map((persona) => persona.role).filter(Boolean))];
 }
 
-type AppViewProps = {
-  snapshots?: Snapshots;
+type Section = 'workspace' | 'chat' | 'approvals' | 'storage';
+type TabValue = 'tasks' | 'sessions' | 'premerge' | 'audit';
+
+type Blocker = { project: string; worktree: string; persona: string; action: string };
+
+function parseBlocker(error: DaemonError): Blocker | null {
+  if (error.code !== 'WORKTREE_BLOCKED') return null;
+  const [project = '', worktree = '', persona = '', ...rest] = error.message.split('|');
+  return { project, worktree, persona, action: rest.join('|') || 'continue' };
+}
+
+export function AppView({
+  api, snapshots, loadedScope, error, loading, scopeLoading, section, onSection,
+  onChooseProject, onChooseRecipient, onRefresh, onActionError,
+}: {
+  api: GuiApi;
+  snapshots: Snapshots;
   loadedScope: Scope;
   error: DaemonError | null;
   loading: boolean;
   scopeLoading: boolean;
+  section: Section;
+  onSection: (section: Section) => void;
   onChooseProject: (projectId: string) => void;
   onChooseRecipient: (recipient: string) => void;
-};
+  onRefresh: () => void;
+  onActionError: (error: DaemonError) => void;
+}) {
+  const transition = useMotionTransition('spring');
+  const [tab, setTab] = useState<TabValue>('tasks');
+  const [replies, setReplies] = useState<GuiChatReply[]>([]);
+  const [chatBusy, setChatBusy] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [target, setTarget] = useState('');
+  const [newWorktree, setNewWorktree] = useState(false);
+  const [adopt, setAdopt] = useState(false);
+  const [blocker, setBlocker] = useState<Blocker | null>(null);
+  const [move, setMove] = useState<GuiMoveStatus | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
-export function AppView({
-  snapshots, loadedScope, error, loading, scopeLoading, onChooseProject, onChooseRecipient,
-}: AppViewProps) {
-  const selectedProject = snapshots?.projects.find((project) => project.id === loadedScope.projectId)
-    ?? snapshots?.projects[0];
-  const scopeName = selectedProject?.name;
-  const scope = snapshots ? (scopeName ? `Scoped to ${scopeName}` : 'No project selected') : undefined;
+  const selectedProject = snapshots.projects.find((p) => p.id === loadedScope.projectId)
+    ?? snapshots.projects[0];
+  const projectId = selectedProject?.id ?? '';
+  const pending = approvalsPending(snapshots.approvals);
+
+  async function run(action: () => Promise<unknown>, success?: string) {
+    setBusy(true);
+    try {
+      await action();
+      if (success) setNotice(success);
+      onRefresh();
+    } catch (err) {
+      const typed = typedError(err);
+      const found = parseBlocker(typed);
+      if (found) setBlocker(found);
+      else onActionError(typed);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const tabs: TabItem[] = [
+    {
+      value: 'tasks', label: 'Tasks & leases',
+      content: <TasksView
+        tasks={snapshots.tasks}
+        leases={snapshots.leases}
+        autoApprove={Object.fromEntries(snapshots.worktrees.map((w) => [w.id, w.autoApprove]))}
+        onAutoApprove={(worktreeId, enabled) => void run(
+          () => api.autoApprove(worktreeId, enabled),
+          `Auto-approve ${enabled ? 'enabled' : 'disabled'}.`,
+        )}
+      />,
+    },
+    {
+      value: 'sessions', label: 'Sessions', badge: snapshots.sessions.filter((s) => s.status === 'running').length,
+      content: <SessionsView
+        sessions={snapshots.sessions}
+        onStop={(id) => void run(() => api.stopSession(id), 'Session stopped.')}
+      />,
+    },
+    {
+      value: 'premerge', label: 'Pre-merge',
+      content: <PreMergeView rows={snapshots.preMerge} />,
+    },
+    {
+      value: 'audit', label: 'Audit',
+      content: <AuditView rows={snapshots.audit} />,
+    },
+  ];
 
   return (
     <div className="app-shell">
@@ -115,70 +183,217 @@ export function AppView({
           <Logo />
           <div>
             <p className="brand-name">Artinarey</p>
-            <p className="brand-note">Read-only window</p>
+            <p className="brand-note">Workspace</p>
           </div>
         </div>
-        <nav aria-label="Views">
-          <a href="#projects">Projects</a>
-          <a href="#personas">Personas</a>
-          <a href="#worktrees">Worktrees</a>
-          <a href="#mail">Mail</a>
+
+        <nav className="source-list" aria-label="Sections">
+          <button
+            type="button"
+            className={`source-item${section === 'workspace' ? ' is-selected' : ''}`}
+            onClick={() => onSection('workspace')}
+            aria-current={section === 'workspace' ? 'page' : undefined}
+          ><SquaresFour size={16} aria-hidden="true" /><span>Overview</span></button>
+          <button
+            type="button"
+            className={`source-item${section === 'chat' ? ' is-selected' : ''}`}
+            onClick={() => onSection('chat')}
+            aria-current={section === 'chat' ? 'page' : undefined}
+          ><ChatCircle size={16} aria-hidden="true" /><span>Chat</span></button>
+          <button
+            type="button"
+            className={`source-item${section === 'approvals' ? ' is-selected' : ''}`}
+            onClick={() => onSection('approvals')}
+            aria-current={section === 'approvals' ? 'page' : undefined}
+          >
+            <Bell size={16} aria-hidden="true" /><span>Approvals</span>
+            {pending > 0 && <span className="source-badge">{pending}</span>}
+          </button>
+          <button
+            type="button"
+            className={`source-item${section === 'storage' ? ' is-selected' : ''}`}
+            onClick={() => onSection('storage')}
+            aria-current={section === 'storage' ? 'page' : undefined}
+          ><Gear size={16} aria-hidden="true" /><span>Storage</span></button>
         </nav>
-        <p className="sidebar-note">Snapshots only. No actions are available.</p>
+
+        <div className="sidebar-fields">
+          <Select
+            id="project-select"
+            label="Project"
+            value={loadedScope.projectId}
+            options={snapshots.projects.map((p) => ({ value: p.id, label: p.name }))}
+            onChange={onChooseProject}
+          />
+          {section === 'workspace' && (
+            <Select
+              id="recipient-select"
+              label="Mail recipient"
+              value={loadedScope.recipient}
+              options={mailRecipientOptions(snapshots.personas).map((value) => ({
+                value, label: value === ALL_RECIPIENTS ? 'All recipients' : value,
+              }))}
+              onChange={onChooseRecipient}
+            />
+          )}
+        </div>
+
+        <p className="sidebar-note">Local only. The daemon makes no outbound model call.</p>
       </aside>
+
       <main className="content">
         <header className="page-header">
-          <h1>Current state</h1>
-          <p>Projects, agents, worktrees and mail metadata as reported by the daemon.</p>
-        </header>
-        {error && <ErrorPanel error={error} />}
-        {loading && <p className="loading" role="status">Loading snapshot…</p>}
-        {snapshots && (
-          <div className="views">
-            <div className="selectors">
-              <ReadOnlySelect
-                id="project-select"
-                label="Project"
-                value={loadedScope.projectId}
-                options={snapshots.projects.map((project) => ({
-                  value: project.id, label: project.name,
-                }))}
-                onChange={onChooseProject}
-              />
-              <ReadOnlySelect
-                id="recipient-select"
-                label="Mail recipient"
-                value={loadedScope.recipient}
-                options={mailRecipientOptions(snapshots.personas).map((value) => ({
-                  value, label: value === ALL_RECIPIENTS ? 'All recipients' : value,
-                }))}
-                onChange={onChooseRecipient}
-              />
-              {scopeLoading && <p className="loading" role="status">Reloading snapshot…</p>}
-            </div>
-            <ProjectView rows={snapshots.projects} />
-            <PersonaView rows={snapshots.personas} scope={scope} />
-            <WorktreeView rows={snapshots.worktrees} scope={scope} />
-            <MailView rows={snapshots.mail} scope={scope} />
+          <div>
+            <h1>{selectedProject?.name ?? 'No project selected'}</h1>
+            <p>
+              {selectedProject
+                ? `Store ${selectedProject.storeDir} · ${selectedProject.status}`
+                : 'Register a project to see its state here.'}
+            </p>
           </div>
+          <div className="header-actions">
+            <Button onClick={() => setNewWorktree(true)} disabled={!projectId}>New worktree</Button>
+            <Button onClick={() => setAdopt(true)} disabled={!projectId}>Adopt</Button>
+          </div>
+        </header>
+
+        {error && <ErrorBanner code={error.code} message={error.message} onDismiss={() => onActionError({ code: '', message: '' })} />}
+        {notice && <div className="notice" role="status">{notice}</div>}
+        {loading && <Skeleton rows={4} />}
+
+        {!loading && (
+          <AnimatePresence mode="wait" initial={false}>
+            <motion.div
+              key={section}
+              className="surface"
+              initial={{ opacity: 0, y: 4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -3 }}
+              transition={transition}
+            >
+              {section === 'workspace' && (
+                <>
+                  {scopeLoading && <p className="loading" role="status">Reloading snapshot…</p>}
+                  <TabBar items={tabs} value={tab} onValueChange={(value) => setTab(value as TabValue)} label="Workspace views" />
+                  <ProjectView rows={snapshots.projects} />
+                  <PersonaView rows={snapshots.personas} />
+                  <WorktreeView rows={snapshots.worktrees} />
+                </>
+              )}
+              {section === 'chat' && (
+                <ChatView
+                  replies={replies}
+                  busy={chatBusy}
+                  onSend={(message) => {
+                    setChatBusy(true);
+                    const live = snapshots.sessions.find((session) => session.status === 'running');
+                    void api.chat(projectId, message, undefined, live?.id).then((reply) => {
+                      setReplies((current) => [...current, reply]);
+                    }).catch((err) => onActionError(typedError(err))).finally(() => setChatBusy(false));
+                  }}
+                />
+              )}
+              {section === 'approvals' && (
+                <ApprovalsView
+                  approvals={snapshots.approvals}
+                  onDecide={(id, decision) => void run(
+                    () => api.approve(id, decision, 'user'),
+                    `Approval ${decision}.`,
+                  )}
+                />
+              )}
+              {section === 'storage' && (
+                <StorageView
+                  storage={snapshots.storage}
+                  move={move}
+                  target={target}
+                  onTarget={setTarget}
+                  busy={busy}
+                  onSetRoot={(root) => void run(() => api.setStorage(root), 'Data root saved.')}
+                  onPreflight={() => void run(
+                    async () => { setMove(await api.movePreflight(projectId, target)); },
+                    'Preflight complete.',
+                  )}
+                  onMove={() => void run(
+                    async () => {
+                      setMove(await api.moveStart(projectId, target));
+                      const status = await api.moveStatus(projectId);
+                      setMove(status);
+                    },
+                    'Move finished.',
+                  )}
+                  onReconnect={() => void run(
+                    async () => {
+                      const resumeTarget = move?.target || target;
+                      setMove(await api.moveStart(projectId, resumeTarget));
+                    },
+                    'Storage reconnected; move resumed.',
+                  )}
+                  onUndo={() => void run(async () => { setMove(await api.moveUndo(projectId)); }, 'Switch undone.')}
+                  onDeleteOld={() => void run(async () => { await api.moveDeleteOld(projectId); onRefresh(); }, 'Old store deleted.')}
+                />
+              )}
+            </motion.div>
+          </AnimatePresence>
         )}
       </main>
+
+      <NewWorktreeDialog
+        open={newWorktree}
+        onOpenChange={setNewWorktree}
+        onCreate={(branch) => void run(() => api.createWorktree(projectId, branch), 'Worktree created.')}
+      />
+      <AdoptDialog
+        open={adopt}
+        onOpenChange={setAdopt}
+        onAdopt={(path) => void run(() => api.adoptWorktree(projectId, path), 'Worktree adopted.')}
+      />
+      <BlockerModal
+        open={Boolean(blocker)}
+        project={blocker?.project ?? ''}
+        worktree={blocker?.worktree ?? ''}
+        persona={blocker?.persona ?? ''}
+        action={blocker?.action ?? ''}
+        onClose={() => setBlocker(null)}
+      />
     </div>
   );
 }
 
+function approvalsPending(rows: GuiApproval[]): number {
+  return rows.filter((row) => row.status === 'pending').length;
+}
+
 export function App({ api, initial, initialError }: AppProps) {
-  const [snapshots, setSnapshots] = useState<Snapshots | undefined>(initial);
-  const [scopeState, dispatchScope] = useReducer(
-    scopeReducer,
-    initial?.projects[0]?.id ?? '',
-    initialScopeState,
-  );
+  const [snapshots, setSnapshots] = useState<Snapshots>({ ...EMPTY, ...initial });
   const [error, setError] = useState<DaemonError | null>(initialError ?? null);
   const [loading, setLoading] = useState(!initial && !initialError);
   const [scopeLoading, setScopeLoading] = useState(false);
-
+  const [section, setSection] = useState<Section>('workspace');
+  const [scopeState, dispatchScope] = useReducer(
+    scopeReducer,
+    initial?.projects?.[0]?.id ?? '',
+    initialScopeState,
+  );
   const scopeRequest = scopeState.request;
+
+  const loadAll = useCallback(async (projectId: string, recipient: string) => {
+    const [projects, personas, worktrees, mail, tasks, leases, sessions, preMerge, audit, approvals, storage] =
+      await Promise.all([
+        api.projects(), api.personas(projectId), api.worktrees(projectId),
+        api.mail(scopedMailQuery(projectId, recipient)), api.tasks(projectId),
+        api.leases(projectId), api.sessions(projectId), api.preMerge(projectId),
+        api.audit(projectId), api.approvals(projectId), api.storage(),
+      ]);
+    setSnapshots({
+      projects, personas, worktrees, mail, tasks, leases, sessions, preMerge,
+      audit, approvals, storage,
+    });
+    return projects[0]?.id ?? '';
+  }, [api]);
+
+  const activeProject = scopeState.loaded.projectId;
+  const activeRecipient = scopeState.loaded.recipient;
 
   useEffect(() => {
     if (initial || initialError) return;
@@ -187,17 +402,9 @@ export function App({ api, initial, initialError }: AppProps) {
       try {
         const projects = await api.projects();
         const projectId = projects[0]?.id ?? '';
-        const scoped = projectId
-          ? await loadScopedSnapshots(api, projectId, ALL_RECIPIENTS)
-          : { personas: [], worktrees: [], mail: [] } as Pick<
-            Snapshots, 'personas' | 'worktrees' | 'mail'
-          >;
         if (active) {
-          dispatchScope({
-            type: 'loadSucceeded',
-            scope: { projectId, recipient: ALL_RECIPIENTS },
-          });
-          setSnapshots({ projects, ...scoped });
+          await loadAll(projectId, ALL_RECIPIENTS);
+          dispatchScope({ type: 'loadSucceeded', scope: { projectId, recipient: ALL_RECIPIENTS } });
         }
       } catch (err) {
         if (active) setError(typedError(err));
@@ -206,7 +413,7 @@ export function App({ api, initial, initialError }: AppProps) {
       }
     })();
     return () => { active = false; };
-  }, [api, initial, initialError]);
+  }, [api, initial, initialError, loadAll]);
 
   useEffect(() => {
     if (!scopeRequest) return;
@@ -214,12 +421,9 @@ export function App({ api, initial, initialError }: AppProps) {
     setScopeLoading(true);
     void (async () => {
       try {
-        const scoped = await loadScopedSnapshots(
-          api, scopeRequest.projectId, scopeRequest.recipient,
-        );
+        await loadAll(scopeRequest.projectId, scopeRequest.recipient);
         if (!active) return;
         setError(null);
-        setSnapshots((current) => current && { ...current, ...scoped });
         dispatchScope({ type: 'loadSucceeded', scope: scopeRequest });
       } catch (err) {
         if (active) {
@@ -231,17 +435,30 @@ export function App({ api, initial, initialError }: AppProps) {
       }
     })();
     return () => { active = false; };
-  }, [api, scopeRequest]);
+  }, [api, scopeRequest, loadAll]);
+
+  const refresh = useCallback(() => {
+    void loadAll(activeProject, activeRecipient).catch((err) => setError(typedError(err)));
+  }, [loadAll, activeProject, activeRecipient]);
+
+  const clearError = useCallback((next: DaemonError) => {
+    setError(next.code && next.message ? next : null);
+  }, []);
 
   return (
     <AppView
+      api={api}
       snapshots={snapshots}
       loadedScope={scopeState.loaded}
       error={error}
       loading={loading}
       scopeLoading={scopeLoading}
+      section={section}
+      onSection={setSection}
       onChooseProject={(projectId) => dispatchScope({ type: 'chooseProject', projectId })}
       onChooseRecipient={(recipient) => dispatchScope({ type: 'chooseRecipient', recipient })}
+      onRefresh={refresh}
+      onActionError={clearError}
     />
   );
 }

@@ -19,9 +19,11 @@ const INSTRUCTION: Record<ArtinareyErrorCode, string> = {
   INVALID_INPUT: 'Stop. Fix the arguments and retry.',
   ALREADY_RUNNING: 'Stop. The daemon is already running.',
   INDEX_ERROR: 'Stop. Rebuild with artinarey reindex.',
+  ADAPTER_OFFLINE: 'Stop. Tell the user the model adapter is unavailable.',
 };
 
 const NEXT: Record<ArtinareyErrorCode, string> = {
+  ADAPTER_OFFLINE: 'tell the user',
   NO_PROJECT: 'run artinarey init',
   WORKTREE_UNMANAGED: 'adopt this worktree',
   DIRECTORY_BUSY: 'tell the user',

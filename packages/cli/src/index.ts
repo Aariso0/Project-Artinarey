@@ -7,9 +7,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   adoptWorktree, atomicWrite, branchChangedFiles, buildIndex, changedFiles, claimPersona,
   createWorktree, ensureExcludeBlock, findMarker, globalIgnoreCoverage, installHooks,
-  listGitWorktrees, newId, openRegistry, planWorktree, projectStore, readPersona, readTasks,
+  listGitWorktrees, loadConfig, newId, openRegistry, planWorktree, projectStore, readPersona, readTasks,
   reconcileWorktrees, rehomePersona, releasePersona, removeWorktree, resolveIdentity, resolveRepo,
-  resolveXdgPaths, roster, rollbackFailedClaim, uncoveredFiles, writeMarker,
+  resolveXdgPaths, roster, rollbackFailedClaim, saveConfig, uncoveredFiles, writeMarker,
 } from '@artinarey/core';
 import { callDaemon, daemonStatus, startDaemon, stopDaemon } from '@artinarey/daemon';
 
@@ -773,6 +773,33 @@ export async function main(
     const report = buildIndex(join(paths.cacheRoot, projectId, 'index.sqlite'), project.storeDir);
     console.log(`indexed ${report.indexed} mail, skipped ${report.skipped}`);
     return 0;
+  }
+
+  if (command === 'storage') {
+    const subcommand = args[0];
+    const paths = resolveXdgPaths(env);
+    const configFile = join(paths.configDir, 'config.json');
+    if (subcommand === 'show') {
+      console.log(loadConfig(configFile).dataRoot || paths.dataRoot);
+      return 0;
+    }
+    if (subcommand === 'set') {
+      const root = args[1];
+      if (!root) {
+        console.error('usage: artinarey storage set <absolute-path>');
+        return 2;
+      }
+      try {
+        const config = saveConfig(configFile, { dataRoot: root });
+        console.log(config.dataRoot || paths.dataRoot);
+        return 0;
+      } catch (err) {
+        console.error(`storage set failed: ${(err as Error).message}`);
+        return 1;
+      }
+    }
+    console.error('usage: artinarey storage show | set <absolute-path>');
+    return 2;
   }
 
   if (command === 'daemon') {

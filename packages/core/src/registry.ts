@@ -172,6 +172,8 @@ export type Registry = {
     create(input: ProjectInput): Project;
     get(id: string): Project | undefined;
     list(): Project[];
+    /** Move is the only reason a registered store path changes. */
+    updateStoreDir(id: string, storeDir: string): void;
   };
   worktrees: {
     upsert(input: WorktreeInput): void;
@@ -239,6 +241,10 @@ export function openRegistry(file: string): Registry {
       },
       list() {
         return (db.prepare('SELECT * FROM projects ORDER BY id').all() as ProjectRow[]).map(toProject);
+      },
+      updateStoreDir(id, storeDir) {
+        const result = db.prepare('UPDATE projects SET store_dir = ? WHERE id = ?').run(storeDir, id);
+        if (result.changes === 0) throw new ArtinareyError('NOT_FOUND', `unknown project: ${id}`);
       },
     },
     worktrees: {

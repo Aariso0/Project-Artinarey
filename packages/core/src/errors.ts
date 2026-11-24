@@ -15,7 +15,9 @@ export type ArtinareyErrorCode =
   | 'FORBIDDEN_ROLE'
   | 'LEASE_OVERLAP'
   | 'CAP_REACHED'
-  | 'PROJECT_PAUSED';
+  | 'PROJECT_PAUSED'
+  /** M8: the adapter process is unavailable; the daemon itself never calls out. */
+  | 'ADAPTER_OFFLINE';
 
 export class ArtinareyError extends Error {
   constructor(
