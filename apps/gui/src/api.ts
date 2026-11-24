@@ -119,14 +119,14 @@ function unwrap<T>(reply: unknown, shape: PayloadShape): T {
   let result: unknown;
   if (Array.isArray(reply) || (reply && typeof reply === 'object')) {
     const envelope = reply as Envelope<T> & { result?: unknown; error?: unknown };
-    if (envelope.ok === true) {
-      if (!('result' in envelope)) throw malformedReply;
-      result = envelope.result;
-    } else if (envelope.ok === false) {
+    if (envelope.ok === false) {
       const error = typedError(envelope.error);
       if (error) throw error;
       throw malformedReply;
+    } else if (envelope.ok === true && 'result' in envelope) {
+      result = envelope.result;
     } else {
+      // A bare payload may itself carry `ok: true` (for example setHomeWorktree).
       result = reply;
     }
   } else {

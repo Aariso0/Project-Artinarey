@@ -15,6 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
@@ -28,7 +29,22 @@ jobs:
       - run: pnpm build
       - run: pnpm run audit
       - run: pnpm run version:check
-      - run: git diff --check
+      - name: Check whitespace in submitted commits
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.event.base_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$BASE_SHA" ]; then
+            base="$BASE_SHA"
+          elif [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            base="$BEFORE"
+          else
+            base="origin/${BASE_REF#refs/heads/}"
+          fi
+          git diff --check "$base"...HEAD
       - run: pnpm build:gui
 
   rust:

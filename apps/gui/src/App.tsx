@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { Bell, ChatCircle, Gear, SquaresFour } from '@phosphor-icons/react';
 import type {
@@ -85,6 +85,25 @@ export function mailRecipientOptions(personas: GuiPersona[]): string[] {
   return [ALL_RECIPIENTS, ...new Set(personas.map((persona) => persona.role).filter(Boolean))];
 }
 
+/** Loads a full snapshot without writing it: callers decide whether it is still current. */
+export async function loadSnapshots(api: GuiApi, projectId: string, recipient: string): Promise<Snapshots> {
+  if (!projectId) {
+    const [projects, storage] = await Promise.all([api.projects(), api.storage()]);
+    return { ...EMPTY, projects, storage };
+  }
+  const [projects, personas, worktrees, mail, tasks, leases, sessions, preMerge, audit, approvals, storage] =
+    await Promise.all([
+      api.projects(), api.personas(projectId), api.worktrees(projectId),
+      api.mail(scopedMailQuery(projectId, recipient)), api.tasks(projectId),
+      api.leases(projectId), api.sessions(projectId), api.preMerge(projectId),
+      api.audit(projectId), api.approvals(projectId), api.storage(),
+    ]);
+  return {
+    projects, personas, worktrees, mail, tasks, leases, sessions, preMerge,
+    audit, approvals, storage,
+  };
+}
+
 type Section = 'workspace' | 'chat' | 'approvals' | 'storage';
 type TabValue = 'tasks' | 'sessions' | 'premerge' | 'audit';
 
@@ -129,6 +148,25 @@ export function AppView({
     ?? snapshots.projects[0];
   const projectId = selectedProject?.id ?? '';
   const pending = approvalsPending(snapshots.approvals);
+  const visibleMove = move && move.projectId === projectId ? move : null;
+
+  useEffect(() => {
+    setMove(null);
+    setTarget('');
+    setReplies([]);
+  }, [projectId]);
+
+  useEffect(() => {
+    if (section !== 'storage' || !projectId) return;
+    let active = true;
+    void api.moveStatus(projectId).then((status) => {
+      if (!active) return;
+      setMove((current) => current && current.projectId === projectId ? current : status);
+    }).catch((err) => {
+      if (active) onActionError(typedError(err));
+    });
+    return () => { active = false; };
+  }, [api, section, projectId, onActionError]);
 
   async function run(action: () => Promise<unknown>, success?: string) {
     setBusy(true);
@@ -152,7 +190,9 @@ export function AppView({
       content: <TasksView
         tasks={snapshots.tasks}
         leases={snapshots.leases}
+        worktrees={snapshots.worktrees}
         autoApprove={Object.fromEntries(snapshots.worktrees.map((w) => [w.id, w.autoApprove]))}
+        busy={busy}
         onAutoApprove={(worktreeId, enabled) => void run(
           () => api.autoApprove(worktreeId, enabled),
           `Auto-approve ${enabled ? 'enabled' : 'disabled'}.`,
@@ -163,6 +203,7 @@ export function AppView({
       value: 'sessions', label: 'Sessions', badge: snapshots.sessions.filter((s) => s.status === 'running').length,
       content: <SessionsView
         sessions={snapshots.sessions}
+        busy={busy}
         onStop={(id) => void run(() => api.stopSession(id), 'Session stopped.')}
       />,
     },
@@ -296,6 +337,7 @@ export function AppView({
               {section === 'approvals' && (
                 <ApprovalsView
                   approvals={snapshots.approvals}
+                  busy={busy}
                   onDecide={(id, decision) => void run(
                     () => api.approve(id, decision, 'user'),
                     `Approval ${decision}.`,
@@ -305,7 +347,7 @@ export function AppView({
               {section === 'storage' && (
                 <StorageView
                   storage={snapshots.storage}
-                  move={move}
+                  move={visibleMove}
                   target={target}
                   onTarget={setTarget}
                   busy={busy}
@@ -324,13 +366,13 @@ export function AppView({
                   )}
                   onReconnect={() => void run(
                     async () => {
-                      const resumeTarget = move?.target || target;
+                      const resumeTarget = visibleMove?.target || target;
                       setMove(await api.moveStart(projectId, resumeTarget));
                     },
                     'Storage reconnected; move resumed.',
                   )}
                   onUndo={() => void run(async () => { setMove(await api.moveUndo(projectId)); }, 'Switch undone.')}
-                  onDeleteOld={() => void run(async () => { await api.moveDeleteOld(projectId); onRefresh(); }, 'Old store deleted.')}
+                  onDeleteOld={() => void run(async () => { await api.moveDeleteOld(projectId); setMove(null); }, 'Old store deleted.')}
                 />
               )}
             </motion.div>
@@ -376,21 +418,12 @@ export function App({ api, initial, initialError }: AppProps) {
     initialScopeState,
   );
   const scopeRequest = scopeState.request;
+  const loadSeq = useRef(0);
 
-  const loadAll = useCallback(async (projectId: string, recipient: string) => {
-    const [projects, personas, worktrees, mail, tasks, leases, sessions, preMerge, audit, approvals, storage] =
-      await Promise.all([
-        api.projects(), api.personas(projectId), api.worktrees(projectId),
-        api.mail(scopedMailQuery(projectId, recipient)), api.tasks(projectId),
-        api.leases(projectId), api.sessions(projectId), api.preMerge(projectId),
-        api.audit(projectId), api.approvals(projectId), api.storage(),
-      ]);
-    setSnapshots({
-      projects, personas, worktrees, mail, tasks, leases, sessions, preMerge,
-      audit, approvals, storage,
-    });
-    return projects[0]?.id ?? '';
-  }, [api]);
+  const loadAll = useCallback(
+    (projectId: string, recipient: string) => loadSnapshots(api, projectId, recipient),
+    [api],
+  );
 
   const activeProject = scopeState.loaded.projectId;
   const activeRecipient = scopeState.loaded.recipient;
@@ -398,14 +431,16 @@ export function App({ api, initial, initialError }: AppProps) {
   useEffect(() => {
     if (initial || initialError) return;
     let active = true;
+    const seq = ++loadSeq.current;
     void (async () => {
       try {
         const projects = await api.projects();
         const projectId = projects[0]?.id ?? '';
-        if (active) {
-          await loadAll(projectId, ALL_RECIPIENTS);
-          dispatchScope({ type: 'loadSucceeded', scope: { projectId, recipient: ALL_RECIPIENTS } });
-        }
+        if (!active || seq !== loadSeq.current) return;
+        const next = await loadAll(projectId, ALL_RECIPIENTS);
+        if (!active || seq !== loadSeq.current) return;
+        setSnapshots(next);
+        dispatchScope({ type: 'loadSucceeded', scope: { projectId, recipient: ALL_RECIPIENTS } });
       } catch (err) {
         if (active) setError(typedError(err));
       } finally {
@@ -418,11 +453,13 @@ export function App({ api, initial, initialError }: AppProps) {
   useEffect(() => {
     if (!scopeRequest) return;
     let active = true;
+    const seq = ++loadSeq.current;
     setScopeLoading(true);
     void (async () => {
       try {
-        await loadAll(scopeRequest.projectId, scopeRequest.recipient);
-        if (!active) return;
+        const next = await loadAll(scopeRequest.projectId, scopeRequest.recipient);
+        if (!active || seq !== loadSeq.current) return;
+        setSnapshots(next);
         setError(null);
         dispatchScope({ type: 'loadSucceeded', scope: scopeRequest });
       } catch (err) {
@@ -438,7 +475,12 @@ export function App({ api, initial, initialError }: AppProps) {
   }, [api, scopeRequest, loadAll]);
 
   const refresh = useCallback(() => {
-    void loadAll(activeProject, activeRecipient).catch((err) => setError(typedError(err)));
+    const seq = ++loadSeq.current;
+    void loadAll(activeProject, activeRecipient).then((next) => {
+      if (seq === loadSeq.current) setSnapshots(next);
+    }).catch((err) => {
+      if (seq === loadSeq.current) setError(typedError(err));
+    });
   }, [loadAll, activeProject, activeRecipient]);
 
   const clearError = useCallback((next: DaemonError) => {

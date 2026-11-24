@@ -298,25 +298,33 @@ function preMergeRows(ctx: RpcContext, project: Project): GuiPreMerge[] {
   const worktrees = new Map(
     ctx.registry.worktrees.list(project.id).map((worktree) => [worktree.id, worktree]),
   );
+  // Diff the worktree's branch against the main checkout's HEAD: comparing it
+  // against its own checked-out branch would always fail and look "verified".
+  const repoRoot = dirname(project.repoCommonDir);
   return tasks.map((task) => {
     const worktree = worktrees.get(task.worktreeId!);
     let changed: string[] = [];
-    if (worktree) {
+    let available = true;
+    if (!worktree) {
+      available = false;
+    } else {
       try {
         changed = worktree.branch
-          ? branchChangedFiles(worktree.path, worktree.branch) : changedFiles(worktree.path, false);
+          ? branchChangedFiles(repoRoot, worktree.branch) : changedFiles(worktree.path, false);
       } catch {
-        changed = [];
+        available = false;
       }
     }
     const uncovered = changed.filter((file) => !task.scope.includes(file));
     return {
       id: task.id,
       worktreeId: task.worktreeId!,
-      status: uncovered.length === 0 ? 'verified' : 'needs-review',
-      summary: uncovered.length === 0
-        ? `${changed.length} changed files are inside the lease`
-        : `${uncovered.length} changed files are outside the lease`,
+      status: !available ? 'unavailable' : uncovered.length === 0 ? 'verified' : 'needs-review',
+      summary: !available
+        ? 'scope check unavailable: committed changes could not be compared'
+        : uncovered.length === 0
+          ? `${changed.length} changed files are inside the lease`
+          : `${uncovered.length} changed files are outside the lease`,
       checkedAt: task.updatedAt,
     };
   });

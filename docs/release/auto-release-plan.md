@@ -15,7 +15,7 @@
 - Root `package.json` is the release-version authority and starts at exactly `0.1.0`.
 - `apps/gui/package.json` and `apps/gui/src-tauri/Cargo.toml` must agree with the root version.
 - No npm publishing; all npm packages stay private.
-- Release only when CI completed with `conclusion == success` on `main`.
+- Release only when CI completed with `conclusion == success` on `main` from a push to this repository.
 - Release only when `refs/tags/v<version>` does not exist.
 - Check out `github.event.workflow_run.head_sha`; never release from a moving `main` ref.
 - Use `GITHUB_TOKEN` only; no secrets or credentials in workflow files.
@@ -24,6 +24,7 @@
 ## Review Focus
 
 - A successful CI run on a feature branch must not publish — release workflow branch guard.
+- A fork pull request whose branch is named `main` must not publish — workflow_run event and head-repository guards.
 - A failed CI run must not publish — `workflow_run` conclusion guard.
 - An existing `v<version>` tag must skip — tag check in `prepare`.
 - Mismatched manifests must fail before any build/publish — `pnpm run version:check` in CI and release `prepare`.
@@ -142,10 +143,9 @@ Replace the `pnpm test` step with `pnpm run test:ci`. Add steps after `pnpm buil
 ```yaml
       - run: pnpm run audit
       - run: pnpm run version:check
-      - run: git diff --check
 ```
 
-Keep the existing checkout, pnpm setup, Node 26 setup, typecheck, lint, build, and `build:gui` steps unchanged. Keep the Rust job unchanged.
+Also add a named whitespace step that runs `git diff --check "$base"...HEAD`, where `$base` is the pull request base SHA or the push `before` SHA (falling back to the pushed branch's base ref for a new branch). Set `fetch-depth: 0` on the checkout so that commit is available; a bare `git diff --check` on a clean checkout examines nothing. Keep the existing pnpm setup, Node 26 setup, typecheck, lint, build, and `build:gui` steps unchanged. Keep the Rust job unchanged.
 
 - [ ] **Step 3: Verify version agreement and CI scripts locally**
 
@@ -186,7 +186,7 @@ on:
     branches: [main]
 ```
 
-Top-level `permissions: contents: read`. Add workflow-level `concurrency: group: release` with `cancel-in-progress: false` so same-version release runs are serialized. Define jobs `prepare`, `bundles`, `publish` in that order.
+Top-level `permissions: contents: read`. Add workflow-level `concurrency: group: release` with `cancel-in-progress: false` and `queue: max` so same-version release runs are serialized and up to 100 runs can wait without a later run replacing an earlier pending one. Define jobs `prepare`, `bundles`, `publish` in that order.
 
 - [ ] **Step 2: Implement `prepare`**
 
@@ -195,7 +195,9 @@ Guard with:
 ```yaml
 if: >-
   github.event.workflow_run.conclusion == 'success' &&
-  github.event.workflow_run.head_branch == 'main'
+  github.event.workflow_run.head_branch == 'main' &&
+  github.event.workflow_run.event == 'push' &&
+  github.event.workflow_run.head_repository.full_name == github.repository
 ```
 
 Check out `ref: ${{ github.event.workflow_run.head_sha }}` with `persist-credentials: false`, set up pnpm/Node 26, install with `--frozen-lockfile`, run `pnpm run version:check`, and set outputs `version`, `tag`, `should_release`. Set `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` on the job and use the authenticated GitHub API for the tag check so the workflow also works for a private repository with no persisted git credentials:
@@ -268,10 +270,13 @@ grep -F -- '--bundles msi nsis --no-sign --ci' .github/workflows/release.yml
 grep -F 'zip -qr' .github/workflows/release.yml
 grep -F -- '--target "$COMMIT"' .github/workflows/release.yml
 grep -F 'group: release' .github/workflows/release.yml
+grep -F 'queue: max' .github/workflows/release.yml
+grep -F "github.event.workflow_run.event == 'push'" .github/workflows/release.yml
+grep -F 'github.event.workflow_run.head_repository.full_name == github.repository' .github/workflows/release.yml
 grep -F 'status_line' .github/workflows/release.yml
 ```
 
-Expected: all commands exit 0; the eleven greps each print at least one matching line. These pin the failed-CI, non-main, authenticated existing-tag check, manifest-agreement, bundle-format, macOS `.app` packaging, exact-commit tag, serialized release, and tag-status guards without creating a real release locally.
+Expected: all commands exit 0; the fourteen greps each print at least one matching line. These pin the failed-CI, non-main, push-only, same-repository, authenticated existing-tag check, manifest-agreement, bundle-format, macOS `.app` packaging, exact-commit tag, serialized/queued release, and tag-status guards without creating a real release locally.
 
 - [ ] **Step 6: Commit**
 

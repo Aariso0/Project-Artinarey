@@ -9,12 +9,14 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
 import {
-  buildIndex, createPersona, findMarker, listGitWorktrees, newId, openRegistry,
+  buildIndex, createPersona, createTask, findMarker, listGitWorktrees, newId, openRegistry,
   queryMail, readPersona, readTasks, releaseShared, resolveXdgPaths, serializeMail,
   updateTask, validateMail, withProjectLock, writeMarker, type Registry,
 } from '@artinarey/core';
 import { createRpcServer, type RpcResponse, type RpcServer } from './server.ts';
-import { releaseConnection, type RpcContext } from './tools.ts';
+import {
+  dispatchTool, invalidateWorktree, releaseConnection, type RpcContext,
+} from './tools.ts';
 
 type Client = {
   call(method: string, params?: Record<string, unknown>): Promise<RpcResponse>;
@@ -1491,4 +1493,109 @@ test('assign_task recovery rejects duplicate spellings that hide a committed pat
   reindex(s);
   assert.equal(taskMails().length, 1, 'reordered equivalent recovery sends one notification');
   assert.match(readFileSync(taskMails()[0]!.file, 'utf8'), new RegExp(`in_reply_to: ${taskId}`));
+});
+
+test('attached identities resolve the current store after a Move', async (t) => {
+  const s = setup();
+  track(t, s);
+  const persona = s.registry.personas.create({
+    projectId: s.project.id, role: 'dev0', name: 'Dev Zero',
+  });
+  s.registry.bindings.bind(persona.id, s.ids[0]!);
+  mkdirSync(s.project.storeDir, { recursive: true });
+  const moved = join(s.root, 'moved-store');
+  mkdirSync(moved, { recursive: true });
+  s.registry.projects.updateStoreDir(s.project.id, moved);
+
+  const ctx: RpcContext = {
+    registry: s.registry, paths: s.paths,
+    identity: {
+      projectId: s.project.id, worktreeId: s.ids[0]!, markerDir: s.worktrees[0]!,
+      storeDir: s.project.storeDir, personaId: persona.id, role: 'dev0',
+    },
+  };
+  const response = await dispatchTool({
+    id: '1', method: 'report', params: { now: 'now', done: 'done', next: 'next', blocked: '' },
+  }, ctx);
+  assert.equal(response.ok, true, response.ok ? '' : response.error.message);
+  assert.ok(existsSync(join(moved, 'personas', persona.id, 'status.md')));
+  assert.equal(existsSync(join(s.project.storeDir, 'personas', persona.id, 'status.md')), false);
+  invalidateWorktree(ctx, s.ids[0]!);
+  assert.equal(ctx.identity?.storeDir, moved);
+});
+
+test('run_task rejects an unclaimed connection before dispatch', async (t) => {
+  const s = setup();
+  track(t, s);
+  let prompts = 0;
+  const ctx: RpcContext = {
+    registry: s.registry, paths: s.paths,
+    identity: {
+      projectId: s.project.id, worktreeId: s.ids[0]!, markerDir: s.worktrees[0]!,
+      storeDir: s.project.storeDir,
+    },
+    model: {
+      prompt: async () => {
+        prompts += 1;
+        return { text: 'should not run', done: true };
+      },
+    } as unknown as RpcContext['model'],
+  };
+  const response = await dispatchTool(
+    { id: '1', method: 'run_task', params: { task_id: 'any-task' } }, ctx,
+  );
+  assert.equal(response.ok, false);
+  if (!response.ok) assert.equal(response.error.code, 'INVALID_INPUT');
+  assert.equal(prompts, 0);
+});
+
+test('run_task authorises by persona role, not persona id', async (t) => {
+  const s = setup();
+  track(t, s);
+  const dev = s.registry.personas.create({
+    projectId: s.project.id, role: 'dev0', name: 'Dev Zero',
+  });
+  const senior = s.registry.personas.create({
+    projectId: s.project.id, role: 'senior-dev', name: 'Senior Dev',
+  });
+  s.registry.bindings.bind(dev.id, s.ids[0]!);
+  s.registry.bindings.bind(senior.id, s.ids[1]!);
+  mkdirSync(s.project.storeDir, { recursive: true });
+  const taskId = newId();
+  createTask(s.project.storeDir, {
+    id: taskId, projectId: s.project.id, title: 'Assigned work',
+    scope: ['src/a.ts'], assignee: 'dev0', status: 'in_progress',
+    branch: null, worktreeId: null, createdAt: new Date().toISOString(),
+  });
+
+  let prompts = 0;
+  const model = {
+    prompt: async () => {
+      prompts += 1;
+      return { text: 'done', done: true };
+    },
+  } as unknown as RpcContext['model'];
+  const context = (worktreeIndex: number, personaId: string, role: string): RpcContext => ({
+    registry: s.registry, paths: s.paths, model,
+    identity: {
+      projectId: s.project.id, worktreeId: s.ids[worktreeIndex]!,
+      markerDir: s.worktrees[worktreeIndex]!, storeDir: s.project.storeDir,
+      personaId, role,
+    },
+  });
+
+  const assigned = await dispatchTool(
+    { id: '1', method: 'run_task', params: { task_id: taskId } },
+    context(0, dev.id, 'dev0'),
+  );
+  assert.equal(assigned.ok, true, assigned.ok ? '' : assigned.error.message);
+  assert.equal(prompts, 1);
+
+  const other = await dispatchTool(
+    { id: '2', method: 'run_task', params: { task_id: taskId } },
+    context(1, senior.id, 'senior-dev'),
+  );
+  assert.equal(other.ok, false);
+  if (!other.ok) assert.equal(other.error.code, 'FORBIDDEN_ROLE');
+  assert.equal(prompts, 1, 'another role must never reach the model');
 });

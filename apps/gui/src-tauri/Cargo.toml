@@ -19,9 +19,9 @@ name = "artinarey-gui"
 path = "src/main.rs"
 
 [dependencies]
-tauri = { version = "=2.9.5", features = [] }
+tauri = { version = "=2.12.7", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [build-dependencies]
-tauri-build = { version = "=2.5.3", features = [] }
+tauri-build = { version = "=2.7.6", features = [] }

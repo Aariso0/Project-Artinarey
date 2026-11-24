@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -86,6 +86,32 @@ test('artinarey storage show and set validate the data root', async () => {
   }
   assert.equal(code, 1);
   assert.match(error, /must be an absolute path/);
+});
+
+test('init places new projects under the saved storage root', async () => {
+  const { env, paths } = tempEnv();
+  const customRoot = join(env.HOME!, 'large-volume');
+  mkdirSync(customRoot, { recursive: true });
+  const restore = capture(() => {});
+  try {
+    assert.equal(await main(['storage', 'set', customRoot], env), 0);
+    const repo = join(env.HOME!, 'repo');
+    mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repo, stdio: 'ignore' });
+    assert.equal(await main(['init'], env, repo), 0);
+  } finally {
+    restore();
+  }
+
+  const registry = openRegistry(paths.registryFile);
+  try {
+    const project = registry.projects.list()[0];
+    assert.ok(project, 'init must register a project');
+    assert.equal(dirname(project.storeDir), customRoot);
+    assert.notEqual(dirname(project.storeDir), paths.dataRoot);
+  } finally {
+    registry.close();
+  }
 });
 
 test('artinarey reindex builds a cache index from the registered store', async () => {

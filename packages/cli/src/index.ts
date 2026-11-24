@@ -158,7 +158,10 @@ export async function main(
           project = registry.projects.create({
             name: basename(root),
             repoCommonDir: commonDir,
-            storeDir: projectStore(paths.dataRoot, newId()),
+            storeDir: projectStore(
+              loadConfig(join(paths.configDir, 'config.json')).dataRoot || paths.dataRoot,
+              newId(),
+            ),
           });
           mkdirSync(project.storeDir, { recursive: true });
         }

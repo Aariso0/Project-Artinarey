@@ -519,12 +519,12 @@ code {
 .modal {
   position: fixed;
   z-index: 41;
-  top: 50%;
-  left: 50%;
+  inset: 0;
+  margin: auto;
+  height: fit-content;
   width: min(30rem, calc(100vw - 2rem));
   max-height: calc(100vh - 3rem);
   overflow: auto;
-  transform: translate(-50%, -50%);
   border: 1px solid var(--border-strong);
   border-radius: 12px;
   background: var(--surface-1);

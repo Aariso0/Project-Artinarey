@@ -9,6 +9,7 @@ import {
 import {
   OpencodeAdapter, type FetchFn, type HttpResponse, type SpawnFn, type SpawnedProcess,
 } from './opencode.ts';
+import { MODEL_KEY_ENV } from './model-wire.ts';
 
 type Call = {
   url: string;
@@ -354,6 +355,26 @@ test('concurrent ensureServe calls share one start and the guard clears', async 
     });
     await serve.ensureServe();
     assert.equal(spawns.length, 2);
+  } finally {
+    rmSync(s.root, { recursive: true, force: true });
+  }
+});
+
+test('opencode serve never inherits ARTINAREY_MODEL_KEY', async () => {
+  const s = setup();
+  try {
+    const { fetchImpl } = fakeFetch(() => ({ ok: true, status: 200, body: {} }));
+    const { spawnImpl, calls: spawns } = fakeSpawn(process.pid);
+    const serve = new OpencodeAdapter({
+      stateFile: s.stateFile, logDir: s.logDir, fetchImpl, spawnImpl,
+      env: { PATH: process.env.PATH ?? '', [MODEL_KEY_ENV]: 'secret-in-adapter-only' },
+      pickPort: async () => 45687, password: () => 'pw', readyTimeoutMs: 100,
+    });
+    await withoutKill(() => serve.ensureServe());
+    const env = spawns[0]?.options.env as Record<string, string | undefined>;
+    assert.equal(env[MODEL_KEY_ENV], undefined);
+    assert.equal(env.OPENCODE_PASSWORD, 'pw');
+    assert.equal(env.PATH, process.env.PATH ?? '');
   } finally {
     rmSync(s.root, { recursive: true, force: true });
   }

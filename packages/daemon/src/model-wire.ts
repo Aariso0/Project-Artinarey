@@ -25,6 +25,9 @@ const configSchema = z.object({
 /** The adapter reads this from its own environment; the daemon never reads it. */
 export const MODEL_KEY_ENV = 'ARTINAREY_MODEL_KEY';
 
+/** Finite bound on a partial SSE line or multi-line event from an external provider. */
+export const MAX_SSE_BUFFER_SIZE = 1024 * 1024;
+
 export function parseAdapterConfig(env: Record<string, string | undefined>): AdapterConfig {
   const baseUrl = env.ARTINAREY_MODEL_BASE_URL?.trim() ?? '';
   let origin = '';
@@ -52,6 +55,10 @@ export function parseAdapterConfig(env: Record<string, string | undefined>): Ada
       model: env.ARTINAREY_MODEL_MODEL?.trim() || 'default',
       key: env[MODEL_KEY_ENV]?.trim() ? env[MODEL_KEY_ENV] : null,
     });
+    // A bearer key must never be sent over cleartext, even to a loopback URL.
+    if (config.key !== null && new URL(config.baseUrl).protocol !== 'https:') {
+      throw new Error(`${MODEL_KEY_ENV} requires an https model base URL`);
+    }
     return config as AdapterConfig;
   } catch (err) {
     throw Object.assign(new Error(`invalid model adapter config: ${String(err)}`), {
@@ -109,16 +116,53 @@ export function completionUrl(baseUrl: string): string {
   return new URL('chat/completions', `${baseUrl.replace(/\/+$/, '')}/`).toString();
 }
 
+export type CompletionRequest = {
+  url: string;
+  init: {
+    method: 'POST';
+    headers: Record<string, string>;
+    body: string;
+    redirect: 'error' | 'follow';
+    signal: AbortSignal;
+  };
+};
+
+/** Only this adapter-side request ever attaches the key or chooses redirects. */
+export function completionRequest(
+  config: AdapterConfig,
+  input: ModelPromptInput,
+  signal: AbortSignal,
+): CompletionRequest {
+  return {
+    url: completionUrl(config.baseUrl),
+    init: {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(config.key ? { Authorization: `Bearer ${config.key}` } : {}),
+      },
+      body: JSON.stringify(completionBody(config, input)),
+      // A keyed request must never be replayed at another URL by fetch.
+      redirect: config.key ? 'error' : 'follow',
+      signal,
+    },
+  };
+}
+
 /** Accumulates delta content from SSE frames; ignores keep-alives and `[DONE]`. */
 export class CompletionCollector {
   private readonly parser = createParser({
+    maxBufferSize: MAX_SSE_BUFFER_SIZE,
+    onError: (error) => {
+      if (error.type === 'max-buffer-size-exceeded') this.parseFailure = error.message;
+    },
     onEvent: (event) => {
       if (event.data === '[DONE]') {
         this.done = true;
         return;
       }
       if (event.event === 'error') {
-        this.error = event.data.slice(0, 300);
+        this.streamError = event.data.slice(0, 300);
         return;
       }
       let payload: unknown;
@@ -136,21 +180,66 @@ export class CompletionCollector {
   });
   private readonly parts: string[] = [];
   private done = false;
-  private error: string | null = null;
+  private streamError: string | null = null;
+  private parseFailure: string | null = null;
 
   feed(chunk: string): void {
     this.parser.feed(chunk);
+    if (this.parseFailure) throw this.failure();
   }
 
   get finished(): boolean {
     return this.done;
   }
 
+  private failure(): Error & { code: string } {
+    return Object.assign(
+      new Error(this.streamError ?? this.parseFailure ?? 'model stream failed'),
+      { code: 'ADAPTER_OFFLINE' },
+    );
+  }
+
   result(): { text: string; done: boolean } {
-    if (this.error) {
-      throw Object.assign(new Error(this.error), { code: 'ADAPTER_OFFLINE' });
+    if (this.streamError || this.parseFailure) throw this.failure();
+    if (!this.done) {
+      throw Object.assign(new Error('model stream ended before [DONE]'), {
+        code: 'ADAPTER_OFFLINE',
+      });
     }
-    return { text: this.parts.join(''), done: this.done };
+    return { text: this.parts.join(''), done: true };
+  }
+}
+
+/** Reads an SSE response to completion, cancelling the reader on `[DONE]` or failure. */
+export async function collectCompletion(
+  body: ReadableStream<Uint8Array> | null,
+): Promise<{ text: string; done: boolean }> {
+  if (!body) {
+    throw Object.assign(new Error('model API returned no body'), { code: 'ADAPTER_OFFLINE' });
+  }
+  const collector = new CompletionCollector();
+  const decoder = new TextDecoder();
+  const reader = body.getReader();
+  const cancel = async () => {
+    try { await reader.cancel(); } catch { /* the stream may already be closed */ }
+  };
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      collector.feed(decoder.decode(value, { stream: true }));
+      if (collector.finished) {
+        await cancel();
+        return collector.result();
+      }
+    }
+    collector.feed(decoder.decode());
+    return collector.result();
+  } catch (err) {
+    await cancel();
+    throw err;
+  } finally {
+    reader.releaseLock();
   }
 }
 

@@ -123,13 +123,15 @@ export function WorktreeView({ rows }: { rows: GuiWorktree[] }) {
   );
 }
 
-export function TasksView({ tasks, leases, autoApprove, onAutoApprove }: {
+export function TasksView({ tasks, leases, worktrees, autoApprove, onAutoApprove, busy = false }: {
   tasks: GuiTask[];
   leases: GuiLease[];
+  worktrees: GuiWorktree[];
   autoApprove: Record<string, boolean>;
   onAutoApprove: (worktreeId: string, enabled: boolean) => void;
+  busy?: boolean;
 }) {
-  const worktreeIds = [...new Set(leases.map((lease) => lease.worktreeId))];
+  const worktreeIds = [...new Set(worktrees.map((worktree) => worktree.id))];
   return (
     <div className="stack">
       <Panel id="tasks" title="Tasks and leases" meta={`${tasks.length} tasks`}>
@@ -175,6 +177,7 @@ export function TasksView({ tasks, leases, autoApprove, onAutoApprove }: {
                   checked={Boolean(autoApprove[id])}
                   onChange={(next) => onAutoApprove(id, next)}
                   label={`Auto-approve worktree ${id}`}
+                  disabled={busy}
                 />
               </div>
             ))}
@@ -185,9 +188,10 @@ export function TasksView({ tasks, leases, autoApprove, onAutoApprove }: {
   );
 }
 
-export function SessionsView({ sessions, onStop }: {
+export function SessionsView({ sessions, onStop, busy = false }: {
   sessions: GuiSession[];
   onStop: (id: string) => void;
+  busy?: boolean;
 }) {
   return (
     <Panel id="sessions" title="Sessions" meta={`${sessions.length} sessions`}>
@@ -204,7 +208,7 @@ export function SessionsView({ sessions, onStop }: {
                 <td className="numeric">{session.startedAt}</td>
                 <td>
                   {session.status === 'running' && (
-                    <IconButton label={`Stop session ${session.id}`} onClick={() => onStop(session.id)}>
+                    <IconButton label={`Stop session ${session.id}`} onClick={() => onStop(session.id)} disabled={busy}>
                       <span className="stop-icon" aria-hidden="true" />
                     </IconButton>
                   )}
@@ -258,9 +262,10 @@ export function AuditView({ rows }: { rows: GuiAudit[] }) {
   );
 }
 
-export function ApprovalsView({ approvals, onDecide }: {
+export function ApprovalsView({ approvals, onDecide, busy = false }: {
   approvals: GuiApproval[];
   onDecide: (id: string, decision: 'approved' | 'rejected') => void;
+  busy?: boolean;
 }) {
   const open = approvals.filter((item) => item.status === 'pending');
   return (
@@ -280,8 +285,8 @@ export function ApprovalsView({ approvals, onDecide }: {
                   </p>
                 </div>
                 <div className="approval-actions">
-                  <Button variant="secondary" onClick={() => onDecide(item.id, 'rejected')}>Reject</Button>
-                  <Button variant="primary" onClick={() => onDecide(item.id, 'approved')}>Approve</Button>
+                  <Button variant="secondary" onClick={() => onDecide(item.id, 'rejected')} disabled={busy}>Reject</Button>
+                  <Button variant="primary" onClick={() => onDecide(item.id, 'approved')} disabled={busy}>Approve</Button>
                 </div>
               </li>
             ))}
@@ -444,15 +449,19 @@ export function NewWorktreeDialog({ open, onOpenChange, onCreate }: {
   onCreate: (branch: string) => void;
 }) {
   const [branch, setBranch] = useState('');
+  function close() {
+    setBranch('');
+    onOpenChange(false);
+  }
   return (
     <Modal
       open={open}
-      onOpenChange={onOpenChange}
+      onOpenChange={(next) => { if (next) onOpenChange(true); else close(); }}
       title="New worktree"
       description="Create a managed worktree for a persona to work in."
       footer={<>
-        <Button onClick={() => onOpenChange(false)}>Cancel</Button>
-        <Button variant="primary" disabled={!branch.trim()} onClick={() => { onCreate(branch.trim()); onOpenChange(false); }}>
+        <Button onClick={close}>Cancel</Button>
+        <Button variant="primary" disabled={!branch.trim()} onClick={() => { onCreate(branch.trim()); close(); }}>
           Create worktree
         </Button>
       </>}
@@ -474,15 +483,19 @@ export function AdoptDialog({ open, onOpenChange, onAdopt }: {
   onAdopt: (path: string) => void;
 }) {
   const [path, setPath] = useState('');
+  function close() {
+    setPath('');
+    onOpenChange(false);
+  }
   return (
     <Modal
       open={open}
-      onOpenChange={onOpenChange}
+      onOpenChange={(next) => { if (next) onOpenChange(true); else close(); }}
       title="Adopt worktree"
       tone="warning"
       footer={<>
-        <Button onClick={() => onOpenChange(false)}>Cancel</Button>
-        <Button variant="danger" disabled={!path.trim()} onClick={() => { onAdopt(path.trim()); onOpenChange(false); }}>
+        <Button onClick={close}>Cancel</Button>
+        <Button variant="danger" disabled={!path.trim()} onClick={() => { onAdopt(path.trim()); close(); }}>
           Adopt anyway
         </Button>
       </>}

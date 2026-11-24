@@ -6,8 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import {
-  App, AppView, initialScopeState, mailRecipientOptions, scopeReducer, scopedMailQuery,
-  typedError, type ScopeState, type Snapshots,
+  App, AppView, initialScopeState, loadSnapshots, mailRecipientOptions, scopeReducer,
+  scopedMailQuery, typedError, type ScopeState, type Snapshots,
 } from './App.tsx';
 import { createApi, type DaemonError, type GuiApi, type InvokeFn } from './api.ts';
 import {
@@ -130,7 +130,7 @@ test('dialogs are closed by default and do not leak warning text into the window
 
 test('view components render their own empty and loaded states', () => {
   const tasks = renderView(createElement(TasksView, {
-    tasks: [], leases: [], autoApprove: {}, onAutoApprove: () => {},
+    tasks: [], leases: [], worktrees: [], autoApprove: {}, onAutoApprove: () => {},
   }));
   assert.match(tasks, /No tasks/);
   assert.match(tasks, /No active leases/);
@@ -162,6 +162,36 @@ test('view components render their own empty and loaded states', () => {
   assert.match(storage, /Storage settings/);
   assert.match(storage, /Move store/);
   assert.match(storage, /\/tmp\/artinarey/);
+});
+
+test('every worktree gets an auto-approve toggle, including worktrees without a lease', () => {
+  const html = renderView(createElement(TasksView, {
+    tasks: [], leases: [], worktrees: snapshots.worktrees,
+    autoApprove: {}, onAutoApprove: () => {},
+  }));
+  assert.equal(html.match(/role="switch"/g)?.length, snapshots.worktrees.length);
+  for (const worktree of snapshots.worktrees) {
+    assert.ok(html.includes(`Auto-approve worktree ${worktree.id}`));
+  }
+});
+
+test('approval, session and auto-approve controls are disabled while an action is pending', () => {
+  const approvals = renderView(createElement(ApprovalsView, {
+    approvals: snapshots.approvals, onDecide: () => {}, busy: true,
+  }));
+  assert.equal(approvals.match(/disabled=""/g)?.length, 2);
+  assert.match(approvals, /Reject<\/span><\/button>/);
+
+  const sessions = renderView(createElement(SessionsView, {
+    sessions: snapshots.sessions, onStop: () => {}, busy: true,
+  }));
+  assert.match(sessions, /class="icon-btn" disabled="" aria-label="Stop session session-1"/);
+
+  const tasks = renderView(createElement(TasksView, {
+    tasks: [], leases: [], worktrees: snapshots.worktrees,
+    autoApprove: {}, onAutoApprove: () => {}, busy: true,
+  }));
+  assert.equal(tasks.match(/role="switch"[^>]*disabled=""/g)?.length, snapshots.worktrees.length);
 });
 
 test('a typed daemon error renders visibly instead of an empty window', () => {
@@ -250,6 +280,55 @@ test('createApi accepts a bare object or array result from the native command', 
   assert.deepEqual(await createApi(async () => []).tasks('project-1'), []);
 });
 
+test('createApi resolves a bare ok payload but still throws typed failure envelopes', async () => {
+  const ok = createApi(async () => ({ ok: true }));
+  assert.deepEqual(
+    await ok.setHomeWorktree('project-1', 'agent-1', 'worktree-1'),
+    { ok: true },
+  );
+  const bare = createApi(async () => ({ ok: true, extra: 'kept' }));
+  assert.deepEqual(await bare.approve('approval-1', 'approved', 'user'), { ok: true, extra: 'kept' });
+
+  const error: DaemonError = { code: 'WORKTREE_BLOCKED', message: 'blocked' };
+  const failed = createApi(async () => ({ ok: false, error }));
+  await assert.rejects(failed.setHomeWorktree('project-1', 'agent-1', 'worktree-1'),
+    (rejected: unknown) => {
+      assert.deepEqual(rejected, error);
+      return true;
+    });
+});
+
+function recordingApi(calls: string[]): GuiApi {
+  return new Proxy({} as GuiApi, {
+    get(_target, property) {
+      return async () => {
+        calls.push(String(property));
+        if (property === 'projects') return snapshots.projects;
+        if (property === 'storage') return snapshots.storage;
+        return [];
+      };
+    },
+  });
+}
+
+test('loadSnapshots returns data and skips scoped calls without a project', async () => {
+  const emptyCalls: string[] = [];
+  const empty = await loadSnapshots(recordingApi(emptyCalls), '', 'all');
+  assert.deepEqual(emptyCalls, ['projects', 'storage']);
+  assert.deepEqual(empty.projects, snapshots.projects);
+  assert.deepEqual(empty.storage, snapshots.storage);
+  assert.deepEqual(empty.mail, []);
+  assert.deepEqual(empty.approvals, []);
+
+  const scopedCalls: string[] = [];
+  const scoped = await loadSnapshots(recordingApi(scopedCalls), 'project-1', 'dev0');
+  assert.equal(scopedCalls.length, 11);
+  assert.ok(scopedCalls.includes('mail'));
+  assert.ok(scopedCalls.includes('tasks'));
+  assert.deepEqual(scoped.projects, snapshots.projects);
+  assert.deepEqual(scoped.personas, []);
+});
+
 test('createApi rejects every malformed reply with BAD_RESPONSE', async () => {
   for (const reply of [{ nested: ['v'] }, { ok: true, result: { nested: true } }, { ok: true, result: null }, 42, null]) {
     const api = createApi(async () => reply);
@@ -293,6 +372,14 @@ test('scope helpers derive mail recipients and typed errors', () => {
   assert.deepEqual(scopedMailQuery('project-1', 'dev0'), { projectId: 'project-1', recipient: 'dev0' });
   assert.deepEqual(typedError({ code: 'X', message: 'y' }), { code: 'X', message: 'y' });
   assert.deepEqual(typedError('bad'), { code: 'INTERNAL_ERROR', message: 'bad' });
+});
+
+test('modal centering does not rely on a transform that motion overwrites', () => {
+  const css = readFileSync(join(here, 'styles.css'), 'utf8');
+  const modal = css.slice(css.indexOf('.modal {'), css.indexOf('.modal-warning'));
+  assert.match(modal, /inset: 0/);
+  assert.match(modal, /margin: auto/);
+  assert.doesNotMatch(modal, /transform:/);
 });
 
 test('frontend sources keep the webview free of credentials, ports and HTTP', () => {

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import {
   ArtinareyError, isProcessAlive, readServeState, writeServeState, type ServeState,
 } from '@artinarey/core';
+import { MODEL_KEY_ENV } from './model-wire.ts';
 
 /**
  * One `opencode serve` per daemon, reached over REST with fetch and Basic auth
@@ -163,6 +164,9 @@ export class OpencodeAdapter {
     const log = join(this.logDir, 'opencode-serve.log');
     const logFd = openSync(log, 'a');
     const deadline = deadlineSignal(this.readyTimeoutMs);
+    // The model key belongs to the adapter only; never pass it to `opencode serve`.
+    const serveEnv: NodeJS.ProcessEnv = { ...this.env };
+    delete serveEnv[MODEL_KEY_ENV];
     let child: SpawnedProcess | undefined;
     let childError: unknown;
     try {
@@ -171,7 +175,7 @@ export class OpencodeAdapter {
           ['serve', '--hostname', '127.0.0.1', '--port', String(port)],
           {
             cwd: this.logDir,
-            env: { ...this.env, OPENCODE_PASSWORD: password },
+            env: { ...serveEnv, OPENCODE_PASSWORD: password },
             stdio: ['ignore', logFd, logFd],
             detached: true,
           });

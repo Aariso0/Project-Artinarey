@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 import {
-  accessSync, closeSync, constants, existsSync, fsyncSync, openSync,
-  readFileSync, readdirSync, rmSync, statSync, statfsSync,
+  accessSync, closeSync, constants, existsSync, fsyncSync, mkdirSync, openSync,
+  readFileSync, readdirSync, rmSync, statSync, statfsSync, writeFileSync,
 } from 'node:fs';
 import { cp, rename, rm } from 'node:fs/promises';
-import { dirname, join, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import {
   atomicWrite, buildIndex, type XdgPaths,
 } from '@artinarey/core';
@@ -27,6 +27,8 @@ export type MoveStatus = {
   startedAt: string | null;
   updatedAt: string | null;
   oldDeleted?: boolean;
+  /** Last durable phase before an offline failure, so a resumed move never restarts a finished switch. */
+  checkpoint?: MovePhase;
 };
 
 export function movePaths(target: string, projectId: string) {
@@ -60,7 +62,7 @@ function asMoveError(error: unknown): { code: string; message: string } {
 }
 
 function absolute(value: unknown, field: string): string {
-  if (typeof value !== 'string' || value.trim() === '' || !resolve(value).startsWith(sep)) {
+  if (typeof value !== 'string' || value.trim() === '' || !isAbsolute(value)) {
     throw moveError('INVALID_INPUT', `${field} must be an absolute path`);
   }
   return resolve(value);
@@ -96,8 +98,14 @@ export function readMove(ctx: RpcContext, projectId: string): MoveStatus {
   }
 }
 
-function writeMove(ctx: RpcContext, status: MoveStatus): MoveStatus {
-  const updated: MoveStatus = { ...status, updatedAt: new Date().toISOString() };
+function writeMove(
+  ctx: RpcContext, status: MoveStatus, checkpoint?: MovePhase,
+): MoveStatus {
+  const updated: MoveStatus = {
+    ...status,
+    checkpoint: status.phase === 'offline' ? status.checkpoint : checkpoint ?? status.phase,
+    updatedAt: new Date().toISOString(),
+  };
   // Do not append to the source store here: an audit write after the copy
   // starts would change the bytes being verified. The registry move record and
   // this durable journal are the move's authority; stores keep their own audit.
@@ -133,6 +141,46 @@ function filesUnder(root: string): string[] {
 
 function sha256(file: string): string {
   return createHash('sha256').update(readFileSync(file)).digest('hex');
+}
+
+type MoveManifest = { schema: number; files: Record<string, string> };
+
+/** The manifest is written into the verified copy before it becomes the live store. */
+function readManifest(storeDir: string): MoveManifest | undefined {
+  const file = join(storeDir, 'manifest.json');
+  if (!existsSync(file)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as Partial<MoveManifest>;
+    return parsed.files && typeof parsed.files === 'object'
+      ? { schema: 1, files: parsed.files as Record<string, string> }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Mail accepted between verification and the registry switch still lives in the
+ * old store. Copy those late bytes into the moved store after the switch; bytes
+ * already written to the moved store win, so a fresh reply is never overwritten.
+ */
+function syncLateWrites(source: string, final: string): void {
+  const manifest = readManifest(final);
+  if (!manifest) return;
+  for (const file of filesUnder(source)) {
+    const relative = file.slice(source.length + 1);
+    const expected = manifest.files[relative];
+    const actual = sha256(file);
+    if (expected === actual) continue;
+    const destination = join(final, relative);
+    if (existsSync(destination) && (!expected || sha256(destination) !== expected)) continue;
+    mkdirSync(dirname(destination), { recursive: true });
+    writeFileSync(destination, readFileSync(file));
+    manifest.files[relative] = actual;
+  }
+  atomicWrite(join(final, 'manifest.json'), `${JSON.stringify({
+    schema: 1, files: manifest.files,
+  })}\n`);
 }
 
 /** Best-effort durability: not every filesystem permits fsync on a read-only fd. */
@@ -184,6 +232,8 @@ export function preflightMove(ctx: RpcContext, projectId: string, targetInput: s
     phase: 'preflight', projectId, source: project.storeDir, target, bytesTotal,
     bytesCopied: 0, fileCount: sourceFiles.length, verified: false, error: null,
     startedAt: previous.startedAt ?? new Date().toISOString(),
+    // A new move starts fresh; a resumed one keeps its durable flag and checkpoint.
+    oldDeleted: false, checkpoint: undefined,
   };
 }
 
@@ -228,6 +278,12 @@ async function switchAndFinish(ctx: RpcContext, status: MoveStatus): Promise<Mov
     await rename(paths.incoming, paths.final);
   }
   ctx.registry.projects.updateStoreDir(status.projectId, paths.final);
+  try {
+    syncLateWrites(status.source, paths.final);
+  } catch {
+    // If late writes cannot be copied, delete-old must keep the old store: the
+    // manifest no longer matches it, so its unchanged-store guard refuses.
+  }
   current = writeMove(ctx, { ...current, phase: 'rebuilding' });
   buildIndex(join(ctx.paths.cacheRoot, status.projectId, 'index.sqlite'), paths.final);
   current = writeMove(ctx, { ...current, phase: 'resuming' });
@@ -244,8 +300,15 @@ async function switchAndFinish(ctx: RpcContext, status: MoveStatus): Promise<Mov
 
 function toOffline(ctx: RpcContext, status: MoveStatus, error: unknown): MoveStatus {
   const { code, message } = asMoveError(error);
+  // The journal is the durable authority: a caller's snapshot may predate a
+  // successful switch, so never let it erase the phase actually reached.
+  const latest = readMove(ctx, status.projectId);
+  const base = latest.phase !== 'idle' || latest.target ? latest : status;
+  const checkpoint = latest.checkpoint && latest.checkpoint !== 'offline'
+    ? latest.checkpoint
+    : status.checkpoint && status.checkpoint !== 'offline' ? status.checkpoint : undefined;
   return writeMove(ctx, {
-    ...status, phase: 'offline', error: `${code}: ${message}`,
+    ...base, phase: 'offline', checkpoint, error: `${code}: ${message}`,
   });
 }
 
@@ -274,6 +337,12 @@ async function runMove(ctx: RpcContext, status: MoveStatus): Promise<MoveStatus>
   }
   if (!status.target) throw moveError('INVALID_INPUT', 'no move target is journaled');
 
+  // Once the registry points at the destination, a resumed move must never
+  // recopy from the original source: only the finalisation steps remain.
+  const checkpoint = status.checkpoint ?? status.phase;
+  if (['switching', 'rebuilding', 'resuming'].includes(checkpoint)) {
+    return switchAndFinish(ctx, status);
+  }
   if (status.phase === 'paused' || status.phase === 'copying' || status.phase === 'offline') {
     return switchAndFinish(ctx, await copyAndVerify(ctx, status));
   }
@@ -307,7 +376,11 @@ export async function startMove(
     );
   }
   const preview = active ? existing : preflightMove(ctx, projectId, target);
-  const paused = writeMove(ctx, { ...preview, phase: 'paused', target, error: null });
+  // An active move may have switched already; restart it from its checkpoint.
+  const paused = writeMove(
+    ctx, { ...preview, phase: 'paused', target, error: null },
+    active ? existing.checkpoint : undefined,
+  );
   try {
     return await runMove(ctx, paused);
   } catch (err) {
@@ -325,12 +398,25 @@ export function undoMove(ctx: RpcContext, projectId: string): MoveStatus {
   writableDirectory(status.source, 'original store');
   writableDirectory(paths.final, 'moved store');
   const originals = new Set(
-    filesUnder(status.source).map((file) => file.slice(status.source.length + 1)),
+    filesUnder(status.source)
+      .map((file) => file.slice(status.source.length + 1))
+      .filter((relative) => relative !== 'manifest.json'),
   );
+  const moved = new Set(
+    filesUnder(paths.final)
+      .map((file) => file.slice(paths.final.length + 1))
+      .filter((relative) => relative !== 'manifest.json'),
+  );
+  if (moved.size !== originals.size
+      || [...moved].some((relative) => !originals.has(relative))) {
+    throw moveError(
+      'MOVE_CHANGED', 'the moved store changed after the switch; copy new mail back before undoing',
+    );
+  }
   for (const file of filesUnder(paths.final)) {
     const relative = file.slice(paths.final.length + 1);
     if (relative === 'manifest.json') continue;
-    if (!originals.has(relative) || sha256(file) !== sha256(join(status.source, relative))) {
+    if (sha256(file) !== sha256(join(status.source, relative))) {
       throw moveError(
         'MOVE_CHANGED', 'the moved store changed after the switch; copy new mail back before undoing',
       );
@@ -357,6 +443,17 @@ export function deleteOldStore(ctx: RpcContext, projectId: string): { deleted: b
   }
   if (resolve(ctx.registry.projects.get(projectId)?.storeDir ?? '') === source) {
     throw moveError('INVALID_INPUT', 'the project still points at the old store');
+  }
+  const manifest = readManifest(paths.final);
+  if (!manifest) {
+    throw moveError('MOVE_CHANGED', 'the moved store has no copy manifest; refusing to delete the old store');
+  }
+  const expected = Object.keys(manifest.files).sort();
+  const actual = filesUnder(source).map((file) => file.slice(source.length + 1)).sort();
+  if (actual.length !== expected.length
+      || actual.some((relative, i) => relative !== expected[i]
+        || sha256(join(source, relative)) !== manifest.files[relative])) {
+    throw moveError('MOVE_CHANGED', 'the old store changed after the move; refusing to delete it');
   }
   rmSync(source, { recursive: true, force: true });
   writeMove(ctx, { ...status, oldDeleted: true });

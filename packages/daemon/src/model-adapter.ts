@@ -2,8 +2,8 @@ import { chmodSync, unlinkSync } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
 import { z } from 'zod';
 import {
-  CompletionCollector, completionBody, completionUrl, parseAdapterConfig,
-  parsePromptInput, publicAdapterConfig, textFromCompletion,
+  collectCompletion, completionRequest, parseAdapterConfig, parsePromptInput,
+  publicAdapterConfig, textFromCompletion,
 } from './model-wire.ts';
 
 type AdapterReply =
@@ -22,7 +22,6 @@ const requestSchema = z.object({
  */
 export async function runAdapter(env: Record<string, string | undefined> = process.env): Promise<void> {
   const config = parseAdapterConfig(env);
-  const key = config.key;
   const socketPath = env.ARTINAREY_MODEL_SOCKET;
   if (!socketPath) throw new Error('ARTINAREY_MODEL_SOCKET is required');
 
@@ -43,15 +42,8 @@ export async function runAdapter(env: Record<string, string | undefined> = proce
   process.once('SIGINT', shutdown);
 
   async function callModel(input: ReturnType<typeof parsePromptInput>): Promise<unknown> {
-    const response = await fetch(completionUrl(config.baseUrl), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${key ?? ''}`,
-      },
-      body: JSON.stringify(completionBody(config, input)),
-      signal: AbortSignal.timeout(120_000),
-    });
+    const { url, init } = completionRequest(config, input, AbortSignal.timeout(120_000));
+    const response = await fetch(url, init);
     if (!response.ok) {
       throw Object.assign(new Error(`model API returned HTTP ${response.status}`), {
         code: 'ADAPTER_OFFLINE',
@@ -64,21 +56,7 @@ export async function runAdapter(env: Record<string, string | undefined> = proce
       const payload = await response.json() as unknown;
       return { text: textFromCompletion(payload), done: true };
     }
-
-    const collector = new CompletionCollector();
-    const decoder = new TextDecoder();
-    const reader = response.body.getReader();
-    try {
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        collector.feed(decoder.decode(value, { stream: true }));
-      }
-      collector.feed(decoder.decode());
-    } finally {
-      reader.releaseLock();
-    }
-    return collector.result();
+    return collectCompletion(response.body);
   }
 
   server.on('connection', (socket) => {

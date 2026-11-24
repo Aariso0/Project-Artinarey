@@ -180,7 +180,7 @@ Artinarey is a small office for your AI agents. Each gets a private desk (a work
 
 <br>
 
-The model adapter is optional. To point Chat at an OpenAI-compatible endpoint, set these in the environment before you start the daemon:
+The model adapter is optional and handles daemon-side prompts such as `run_task` against an OpenAI-compatible endpoint. Set these in the environment before you start the daemon:
 
 ```bash
 export ARTINAREY_MODEL_BASE_URL="https://your-endpoint.example/v1"
@@ -188,28 +188,49 @@ export ARTINAREY_MODEL_MODEL="your-model"
 export ARTINAREY_MODEL_KEY="your-key"   # omit when the endpoint needs no key
 ```
 
-`ARTINAREY_MODEL_KEY` stays in the adapter process. The daemon and the webview never receive it; adapter status only says whether a key is present.
+Window Chat is separate from the adapter: `gui.chat` sends a message to a running OpenCode session when one is available, and otherwise queues durable mail for the chosen persona (senior dev by default, also copied to senior dev when addressed elsewhere). These variables do not route Chat to the endpoint. `ARTINAREY_MODEL_KEY` stays in the adapter process and is not exposed to the `opencode serve` process it starts; the webview never receives it, and adapter status reports only whether a key is present.
 
-From the repository root:
+Install dependencies from the Artinarey repository root:
 
 ```bash
 pnpm install
-node packages/cli/bin/artinarey init
-node packages/cli/bin/artinarey daemon start
-cd apps/gui
+```
+
+Register your own project from that project's directory, using the absolute path to the CLI:
+
+```bash
+cd /path/to/your-project
+node /path/to/Project-Artinarey/packages/cli/bin/artinarey init
+```
+
+Start the daemon in its own terminal (it runs in the foreground and does not return):
+
+```bash
+node /path/to/Project-Artinarey/packages/cli/bin/artinarey daemon start
+```
+
+In a second terminal, start the webview from `apps/gui`:
+
+```bash
+cd /path/to/Project-Artinarey/apps/gui
 pnpm exec vite
-# second terminal, from apps/gui
+```
+
+In a third terminal, also from `apps/gui`, start the native shell:
+
+```bash
+cd /path/to/Project-Artinarey/apps/gui
 pnpm exec tauri dev
 ```
 
-Check or stop the daemon from the repository root:
+Check or stop the daemon from another terminal:
 
 ```bash
-node packages/cli/bin/artinarey daemon status
-node packages/cli/bin/artinarey daemon stop
+node /path/to/Project-Artinarey/packages/cli/bin/artinarey daemon status
+node /path/to/Project-Artinarey/packages/cli/bin/artinarey daemon stop
 ```
 
-`pnpm exec vite` alone serves only the webview. `invoke('daemon_call', ...)` needs the Tauri shell, so run `pnpm exec tauri dev` in the second terminal too.
+`pnpm exec vite` alone serves only the webview. `invoke('daemon_call', ...)` needs the Tauri shell, so run `pnpm exec tauri dev` in the third terminal too.
 
 </details>
 

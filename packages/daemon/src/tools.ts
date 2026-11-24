@@ -50,6 +50,8 @@ export function isToolMethod(method: string): boolean {
 
 type ClaimedBinding = {
   personaId: string;
+  /** Older bindings may predate this field; fall back to the captured store path. */
+  projectId?: string;
   storeDir: string;
   worktreeId: string;
   /** Audit line of the claim that gave this connection ownership. */
@@ -175,7 +177,7 @@ function countUnread(mails: IndexedMail[], seen: Set<string>, role: string): num
 function unread(ctx: RpcContext, identity: Identity): number {
   if (!identity.role) return 0;
   const mails = queryMail(indexFile(ctx, identity.projectId));
-  return countUnread(mails, readIds(identity.storeDir, identity.role), identity.role);
+  return countUnread(mails, readIds(liveIdentity(ctx, identity).storeDir, identity.role), identity.role);
 }
 
 /** Read only top-level frontmatter scalars, honouring serializeMail's JSON quoting. */
@@ -247,6 +249,15 @@ function rosterText(entries: ReturnType<typeof roster>): string {
   }).join('\n')}`;
 }
 
+/**
+ * A store path captured at attach time goes stale after a Move. The registry is
+ * the authority for every store write, so refresh before handlers use identity.
+ */
+function liveIdentity(ctx: RpcContext, identity: Identity): Identity {
+  const storeDir = ctx.registry.projects.get(identity.projectId)?.storeDir;
+  return storeDir && storeDir !== identity.storeDir ? { ...identity, storeDir } : identity;
+}
+
 /** Forget a worktree's persona and cleanup ownership, keeping its attachment. */
 export function invalidateWorktree(ctx: RpcContext, worktreeId: string): void {
   if (ctx.claimedBindings) {
@@ -254,12 +265,12 @@ export function invalidateWorktree(ctx: RpcContext, worktreeId: string): void {
   }
   if (ctx.identity?.worktreeId === worktreeId) {
     // Replace rather than mutate: the daemon shares identity with other contexts.
-    ctx.identity = {
+    ctx.identity = liveIdentity(ctx, {
       projectId: ctx.identity.projectId,
       worktreeId: ctx.identity.worktreeId,
       markerDir: ctx.identity.markerDir,
       storeDir: ctx.identity.storeDir,
-    };
+    });
   }
 }
 
@@ -280,7 +291,7 @@ function requireIdentity(
     invalidateWorktree(ctx, ctx.identity.worktreeId);
     return { response: toolFail(id, 'NO_PROJECT', 'binding was released; call claim_persona') };
   }
-  return { identity: ctx.identity };
+  return { identity: liveIdentity(ctx, ctx.identity) };
 }
 
 function storeDirForWorktree(ctx: RpcContext, worktreeId: string): string | undefined {
@@ -341,7 +352,7 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
 
   if (request.method === 'check_in') {
     if (!ctx.identity) return toolFail(id, 'NO_PROJECT', 'call attach before check_in');
-    const identity = ctx.identity;
+    const identity = liveIdentity(ctx, ctx.identity);
     const people = roster(ctx.registry, identity.storeDir, identity.projectId);
     const count = unread(ctx, identity);
     const who = identity.role
@@ -355,9 +366,12 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
 
   /** M8: a task's prompt goes to the adapter over the local socket, never to the daemon's network. */
   if (request.method === 'run_task') {
-    if (!ctx.identity) return toolFail(id, 'NO_PROJECT', 'call attach before run_task');
+    // A bound persona is required before dispatch: an unclaimed connection must
+    // never reach the model with an arbitrary task's prompt.
+    const auth = requireIdentity(id, ctx);
+    if ('response' in auth) return auth.response;
+    const { identity } = auth;
     if (!ctx.model) return toolFail(id, 'ADAPTER_OFFLINE', 'model adapter is not available');
-    const identity = ctx.identity;
     const taskId = str(params.task_id) ?? str(params.taskId);
     if (!taskId) return toolFail(id, 'INVALID_INPUT', 'run_task needs a task_id');
     const task = readTasks(identity.storeDir).find((entry) => entry.id === taskId);
@@ -367,7 +381,8 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
     if (task.worktreeId && task.worktreeId !== identity.worktreeId) {
       return toolFail(id, 'FORBIDDEN_ROLE', 'this task belongs to another worktree');
     }
-    if (task.assignee && identity.personaId && task.assignee !== identity.personaId) {
+    // assign_task stores the persona's role, not its id.
+    if (task.assignee && task.assignee !== identity.role) {
       return toolFail(id, 'FORBIDDEN_ROLE', 'this task is assigned to another persona');
     }
     const system = `Work on task ${task.id} in worktree ${identity.worktreeId}. `
@@ -390,7 +405,7 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
 
   if (request.method === 'claim_persona') {
     if (!ctx.identity) return toolFail(id, 'NO_PROJECT', 'call attach before claim_persona');
-    const identity = ctx.identity;
+    const identity = liveIdentity(ctx, ctx.identity);
     const requestedId = str(params.persona_id);
     const newRole = str(params.new_role);
     const name = str(params.name);
@@ -436,6 +451,7 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
       // A repeat claim of another owner's binding must not transfer ownership.
       bindings.push({
         personaId: result.personaId,
+        projectId: identity.projectId,
         storeDir: result.identity.storeDir,
         worktreeId: result.identity.worktreeId,
         claimLine: claimLine(result.identity.storeDir, result.personaId),
@@ -617,7 +633,7 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
 
   if (request.method === 'worktrees') {
     if (!ctx.identity) return toolFail(id, 'NO_PROJECT', 'call attach before worktrees');
-    const { identity } = ctx;
+    const identity = liveIdentity(ctx, ctx.identity);
     const current = identity.worktreeId;
     const lines = ctx.registry.worktrees.list(identity.projectId).map((wt) => {
       const bound = ctx.registry.bindings.forWorktree(wt.id);
@@ -812,10 +828,12 @@ export function releaseConnection(ctx: RpcContext): void {
     try {
       const bound = ctx.registry.bindings.forWorktree(binding.worktreeId);
       if (bound?.id !== binding.personaId) continue;
+      const storeDir = (binding.projectId
+        ? ctx.registry.projects.get(binding.projectId)?.storeDir : undefined) ?? binding.storeDir;
       // A later claim of the same persona is a new binding instance, not ours to release.
       if (binding.claimLine !== undefined
-          && claimLine(binding.storeDir, binding.personaId) !== binding.claimLine) continue;
-      releasePersona(ctx.registry, binding.storeDir, binding.personaId);
+          && claimLine(storeDir, binding.personaId) !== binding.claimLine) continue;
+      releasePersona(ctx.registry, storeDir, binding.personaId);
     } catch (err) {
       console.error(`persona release failed: ${(err as Error).message ?? String(err)}`);
     }

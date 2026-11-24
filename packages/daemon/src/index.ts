@@ -31,6 +31,23 @@ export function daemonPaths(paths: XdgPaths): { socketPath: string; lockFile: st
   };
 }
 
+/** Lock and registry cleanup must wait until the adapter has released its socket. */
+export async function shutdownModelAdapter(
+  model: { stop(): Promise<void> } | undefined,
+  cleanup: () => void,
+): Promise<void> {
+  try {
+    await model?.stop();
+  } catch (err) {
+    console.error(`Model adapter shutdown failed: ${(err as Error).message ?? String(err)}`);
+  }
+  try {
+    cleanup();
+  } catch (err) {
+    console.error(`Daemon cleanup failed: ${(err as Error).message ?? String(err)}`);
+  }
+}
+
 export async function startDaemon(paths: XdgPaths): Promise<{ socketPath: string }> {
   const { socketPath, lockFile } = daemonPaths(paths);
   mkdirSync(dirname(socketPath), { recursive: true });
@@ -74,10 +91,7 @@ export async function startDaemon(paths: XdgPaths): Promise<{ socketPath: string
           console.error(`GUI server shutdown failed: ${(err as Error).message ?? String(err)}`);
         });
       }
-      void model?.stop().catch((err) => {
-        console.error(`Model adapter shutdown failed: ${(err as Error).message ?? String(err)}`);
-      });
-      cleanup();
+      void shutdownModelAdapter(model, cleanup);
     }, ctx, undefined, operatorToken);
     await server.start();
     gui = await startGuiHttpServer(paths, ctx);
