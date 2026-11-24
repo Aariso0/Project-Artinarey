@@ -26,25 +26,49 @@ jobs:
     permissions:
       contents: read
       checks: read
+      actions: read
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SHA: ${{ github.event.workflow_run.head_sha }}
-      RUN_URL: /actions/runs/${{ github.run_id }}/
+      RUN_ID: ${{ github.run_id }}
     steps:
-      - name: Require every other check on the release commit to pass
+      - name: Require every other CI check on the release commit to pass
         shell: bash
         run: |
           set -euo pipefail
           passed=false
           for attempt in $(seq 1 60); do
+            # Dependabot updater runs are maintenance jobs, not code-quality
+            # checks. They can fail for reasons unrelated to this commit (for
+            # example an impossible security update), so they do not gate a
+            # release. Everything else on the commit still must be green.
+            bot_runs="$(
+              gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${SHA}&per_page=100" \
+                --paginate \
+                --jq '.workflow_runs[] | select(.triggering_actor.login == "dependabot[bot]") | .id' \
+                | paste -sd, - || true
+            )"
             pending=0
             failed=0
             seen=0
             while IFS=$'\t' read -r status conclusion name url; do
-              # Ignore checks from this release run so it cannot gate on itself.
+              run_id=""
               case "$url" in
-                *"$RUN_URL"*) continue ;;
+                */actions/runs/*)
+                  run_id="${url#*/actions/runs/}"
+                  run_id="${run_id%%/*}"
+                  ;;
               esac
+              # Ignore this release run so the gate cannot gate on itself.
+              if [ "$run_id" = "$RUN_ID" ]; then
+                continue
+              fi
+              # Ignore Dependabot updater runs.
+              if [ -n "$run_id" ] && [ -n "$bot_runs" ]; then
+                case ",${bot_runs}," in
+                  *",${run_id},"*) continue ;;
+                esac
+              fi
               seen=$((seen + 1))
               case "$status" in
                 completed)
@@ -80,7 +104,7 @@ jobs:
             echo "Timed out waiting for other checks on ${SHA}." >&2
             exit 1
           fi
-          echo "All ${seen} other checks passed for ${SHA}."
+          echo "All ${seen} other CI checks passed for ${SHA}."
 
   prepare:
     needs: verify

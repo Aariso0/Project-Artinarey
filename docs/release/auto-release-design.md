@@ -50,7 +50,7 @@ The README should describe the shipped M7/M8 app and how to run it. CI should en
 
 ### Check gate
 
-`verify` runs before `prepare` and lists all check-runs for `github.event.workflow_run.head_sha`, excluding check-runs from the current release run so the workflow cannot gate on itself. It waits while any other check is queued or in progress, then fails on any conclusion other than `success`, `skipped`, or `neutral`. `prepare`, `bundles`, and `publish` are downstream of this gate, so no version work, build, or upload happens until every other check passes. A timeout stops a release whose checks never settle.
+`verify` runs before `prepare` and lists all check-runs for `github.event.workflow_run.head_sha`, excluding check-runs from the current release run so the workflow cannot gate on itself. It also excludes workflow runs triggered by `dependabot[bot]`: those are dependency-update maintenance jobs that can fail for reasons unrelated to the commit (for example `security_update_not_possible`) and must not block a release. Every other check counts: the gate waits while any is queued or in progress, then fails on any conclusion other than `success`, `skipped`, or `neutral`. `prepare`, `bundles`, and `publish` are downstream of this gate, so no version work, build, or upload happens until all CI checks pass. A timeout stops a release whose checks never settle.
 
 ### Builder calls made here
 
