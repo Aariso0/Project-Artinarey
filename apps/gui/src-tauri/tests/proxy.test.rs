@@ -1,7 +1,9 @@
 use artinarey_gui_lib::{
-    build_request, config_dir_from, map_status, parse_body_cap, parse_envelope,
-    parse_http_response, platform_origin, read_port, read_token, validate_gui_method,
+    blocking_daemon_call, build_request, config_dir_from, daemon_command, map_status,
+    parse_body_cap, parse_envelope, parse_http_response, platform_origin, read_port, read_token,
+    validate_gui_method,
 };
+use serde_json::json;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -167,6 +169,29 @@ fn only_the_allowlisted_read_only_methods_are_accepted_locally() {
     for method in ["gui.projects", "gui.personas", "gui.worktrees", "gui.mail"] {
         assert!(validate_gui_method(method).is_ok(), "{method}");
     }
+}
+
+#[test]
+fn blocking_call_keeps_the_method_allowlist_before_any_io() {
+    for method in ["send_mail", "gui.approve", "gui.nope"] {
+        let error = blocking_daemon_call(method.to_string(), json!({})).unwrap_err();
+        assert_eq!(error.code, "FORBIDDEN_METHOD", "{method}");
+    }
+}
+
+#[test]
+fn async_daemon_command_awaits_blocking_work_off_the_window_thread() {
+    let caller = std::thread::current().id();
+    let worker = tauri::async_runtime::block_on(async {
+        tauri::async_runtime::spawn_blocking(|| std::thread::current().id())
+            .await
+            .expect("blocking task completed")
+    });
+    assert_ne!(worker, caller, "blocking work must not run on the caller thread");
+
+    let error = tauri::async_runtime::block_on(daemon_command("send_mail".to_string(), json!({})))
+        .unwrap_err();
+    assert_eq!(error.code, "FORBIDDEN_METHOD");
 }
 
 #[test]

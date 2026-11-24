@@ -40,6 +40,36 @@ export function ErrorPanel({ error }: { error: DaemonError }) {
   );
 }
 
+/**
+ * A selection changes only which read-only snapshot is displayed. The marker
+ * attribute distinguishes it from any control that could mutate daemon state.
+ */
+export function ReadOnlySelect({
+  id, label, value, options, onChange,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  options: Array<{ value: string; label: string }>;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="selector" htmlFor={id}>
+      <span>{label}</span>
+      <select
+        id={id}
+        data-readonly-select="true"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+      >
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>{option.label}</option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 function Table({ headers, children }: { headers: string[]; children: ReactNode }) {
   return (
     <div className="table-scroll">

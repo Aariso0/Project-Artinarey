@@ -81,7 +81,7 @@ For a debug binary:
 
 ```bash
 pnpm run build:gui
-cargo build --manifest-path apps/gui/src-tauri/Cargo.toml
+cargo build --manifest-path apps/gui/src-tauri/Cargo.toml --features tauri/custom-protocol
 ./apps/gui/src-tauri/target/debug/artinarey-gui
 ```
 

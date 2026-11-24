@@ -334,11 +334,10 @@ pub fn build_request(
     Ok(request_bytes)
 }
 
-/// The single native command exposed to the webview. Connection settings and
+/// The blocking half of the native command. Connection settings and
 /// credentials are derived only from the local config directory, never from
-/// `method` or `params`.
-#[tauri::command]
-fn daemon_call(method: String, params: Value) -> Result<Value, GuiError> {
+/// `method` or `params`. This runs on a blocking executor, never the window thread.
+pub fn blocking_daemon_call(method: String, params: Value) -> Result<Value, GuiError> {
     validate_gui_method(&method)?;
 
     let dir = config_dir_from(&process_env())?;
@@ -371,6 +370,20 @@ fn daemon_call(method: String, params: Value) -> Result<Value, GuiError> {
 
     let response_body = parse_http_response(&response)?;
     parse_envelope(&response_body)
+}
+
+/// Awaits the blocking socket work off the window thread; the typed error
+/// shape is unchanged. Public so the async behavior can be tested directly.
+pub async fn daemon_command(method: String, params: Value) -> Result<Value, GuiError> {
+    tauri::async_runtime::spawn_blocking(move || blocking_daemon_call(method, params))
+        .await
+        .map_err(|_| GuiError::new("INTERNAL_ERROR", "daemon call task failed"))?
+}
+
+/// The single native command exposed to the webview.
+#[tauri::command]
+async fn daemon_call(method: String, params: Value) -> Result<Value, GuiError> {
+    daemon_command(method, params).await
 }
 
 pub fn run() {

@@ -35,20 +35,27 @@ function typedError(value: unknown): DaemonError | undefined {
   return { code: error.code, message: error.message };
 }
 
-/** The native command resolves to a bare result; envelopes are accepted defensively. */
+/** Every GUI method returns a row array; anything else is a malformed reply. */
 function unwrap<T>(reply: unknown): T {
-  if (Array.isArray(reply)) return reply as T;
-  if (!reply || typeof reply !== 'object') throw malformedReply;
-
-  const envelope = reply as Envelope<T> & { result?: unknown; error?: unknown };
-  if (envelope.ok === true) {
-    if (!('result' in envelope)) throw malformedReply;
-    return envelope.result as T;
+  let result: unknown;
+  if (Array.isArray(reply)) {
+    result = reply;
+  } else if (!reply || typeof reply !== 'object') {
+    throw malformedReply;
+  } else {
+    const envelope = reply as Envelope<T> & { result?: unknown; error?: unknown };
+    if (envelope.ok === true) {
+      if (!('result' in envelope)) throw malformedReply;
+      result = envelope.result;
+    } else {
+      const error = typedError(envelope.error);
+      if (error) throw error;
+      if (envelope.ok === false) throw malformedReply;
+      result = reply;
+    }
   }
-  const error = typedError(envelope.error);
-  if (error) throw error;
-  if (envelope.ok === false) throw malformedReply;
-  return reply as T;
+  if (!Array.isArray(result)) throw malformedReply;
+  return result as T;
 }
 
 /** The webview knows exactly one command and four read-only methods. */

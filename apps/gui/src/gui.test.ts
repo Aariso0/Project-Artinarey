@@ -5,7 +5,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { App, type Snapshots } from './App.tsx';
+import {
+  App, loadScopedSnapshots, mailRecipientOptions, scopedMailQuery, type Snapshots,
+} from './App.tsx';
 import { createApi, type DaemonError, type GuiApi, type InvokeFn } from './api.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -78,8 +80,14 @@ test('renders one senior dev, two developers and read-only mail metadata', () =>
   assert.match(html, /&#x2F;logo\.svg|\/logo\.svg/);
   assert.equal(html.match(/Scoped to Artinarey/g)?.length, 3);
 
+  assert.equal(html.match(/<select\b/g)?.length, 2);
+  assert.equal(html.match(/data-readonly-select="true"/g)?.length, 2);
+  assert.match(html, /value="all"/);
+  for (const role of ['senior-dev', 'dev0', 'dev1']) {
+    assert.ok(html.includes(`>${role}<`), `${role} is a selectable mail recipient`);
+  }
   assert.doesNotMatch(html, /data-mutating-action/);
-  assert.doesNotMatch(html, /<(input|textarea|select|button)\b/);
+  assert.doesNotMatch(html, /<(input|textarea|button|form)\b/i);
   assert.doesNotMatch(html, /private body/i);
   assert.doesNotMatch(html, /read state/i);
 });
@@ -153,7 +161,10 @@ test('acceptance fixture renders three agents, three mail rows and no mutating c
     assert.ok(html.includes(`>${recipient}<`), `${recipient} is a visible mail recipient`);
   }
   assert.equal(html.match(/Scoped to Gui/g)?.length, 3);
-  assert.doesNotMatch(html, /<(input|textarea|select|button|form)\b/i);
+  assert.equal(html.match(/<select\b/g)?.length, 2);
+  assert.equal(html.match(/data-readonly-select="true"/g)?.length, 2);
+  assert.match(html, /value="all"/);
+  assert.doesNotMatch(html, /<(input|textarea|button|form)\b/i);
   assert.doesNotMatch(html, /\son(click|change|input|submit)=/i);
   assert.doesNotMatch(html, /data-mutating-action/i);
   assert.doesNotMatch(html, /private body/i);
@@ -223,13 +234,68 @@ test('createApi rejects with the daemon error object, not a blank result', async
   }
 });
 
-test('createApi accepts a bare result returned by the native command', async () => {
+test('createApi accepts a bare array result returned by the native command', async () => {
   const api = createApi(async () => snapshots.projects);
   assert.deepEqual(await api.projects(), snapshots.projects);
+  assert.deepEqual(await createApi(async () => []).mail({ projectId: 'project-1' }), []);
+});
 
-  const bareObject = { nested: ['value'] };
-  const objectApi = createApi(async () => bareObject);
-  assert.deepEqual(await objectApi.mail({ projectId: 'project-1' }), bareObject);
+test('createApi rejects every non-array result with BAD_RESPONSE', async () => {
+  const invalidReplies: unknown[] = [
+    { nested: ['value'] },
+    { ok: true, result: { nested: ['value'] } },
+    { ok: true, result: null },
+    42,
+  ];
+  for (const reply of invalidReplies) {
+    const api = createApi(async () => reply);
+    for (const call of [
+      () => api.projects(),
+      () => api.personas('project-1'),
+      () => api.worktrees('project-1'),
+      () => api.mail({ projectId: 'project-1' }),
+    ]) {
+      await assert.rejects(call(), (rejected: unknown) => {
+        assert.deepEqual(rejected, { code: 'BAD_RESPONSE', message: 'malformed daemon reply' });
+        return true;
+      });
+    }
+  }
+});
+
+test('a selected project and mail recipient reload only the scoped snapshots', async () => {
+  const calls: Array<{ command: string; args: Record<string, unknown> }> = [];
+  const api = createApi(async (command, args) => {
+    calls.push({ command, args });
+    return [];
+  });
+
+  await loadScopedSnapshots(api, 'project-1', 'all');
+  await loadScopedSnapshots(api, 'project-2', 'dev0');
+
+  assert.deepEqual(calls, [
+    { command: 'daemon_call', args: { method: 'gui.personas', params: { projectId: 'project-1' } } },
+    { command: 'daemon_call', args: { method: 'gui.worktrees', params: { projectId: 'project-1' } } },
+    { command: 'daemon_call', args: { method: 'gui.mail', params: { projectId: 'project-1' } } },
+    { command: 'daemon_call', args: { method: 'gui.personas', params: { projectId: 'project-2' } } },
+    { command: 'daemon_call', args: { method: 'gui.worktrees', params: { projectId: 'project-2' } } },
+    {
+      command: 'daemon_call',
+      args: { method: 'gui.mail', params: { projectId: 'project-2', recipient: 'dev0' } },
+    },
+  ]);
+});
+
+test('mail recipients are derived from persona roles with an unfiltered option', async () => {
+  assert.deepEqual(mailRecipientOptions(snapshots.personas), ['all', 'senior-dev', 'dev0', 'dev1']);
+  assert.deepEqual(
+    mailRecipientOptions([snapshots.personas[1], snapshots.personas[1]]),
+    ['all', 'dev0'],
+  );
+  assert.deepEqual(scopedMailQuery('project-1', 'all'), { projectId: 'project-1' });
+  assert.deepEqual(scopedMailQuery('project-1', 'dev0'), {
+    projectId: 'project-1', recipient: 'dev0',
+  });
 });
 
 test('createApi normalizes a rejected native error object', async () => {
