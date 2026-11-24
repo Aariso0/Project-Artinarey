@@ -8,7 +8,7 @@
 
 *Many agents. Many lanes. One project. You still do the merging.*
 
-![status](https://img.shields.io/badge/status-M0-M3%20implemented-2ea043?labelColor=0d1117)
+![status](https://img.shields.io/badge/status-M0--M3%20implemented-2ea043?labelColor=0d1117)
 ![local first](https://img.shields.io/badge/local--first-no%20cloud-2ea043?labelColor=0d1117)
 ![first](https://img.shields.io/badge/works%20with-OpenCode%20first-58a6ff?labelColor=0d1117)
 ![license](https://img.shields.io/badge/license-GPL--3.0-2ea043?labelColor=0d1117)
