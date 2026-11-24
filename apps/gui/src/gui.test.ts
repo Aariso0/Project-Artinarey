@@ -466,9 +466,10 @@ test('a refresh started in one scope does not write snapshots or errors after th
     'a refresh error in the current scope is still reported');
 });
 
-test('a refresh completing during a pending scope load does not drop that successful load', async () => {
+test('a mutation refresh during a pending scope load preserves the scope change and reloads its full snapshot', async () => {
   const guard = createScopeGuard();
   const scopeResult = deferred<Snapshots>();
+  const retryResult = deferred<Snapshots>();
   const scope = liveScope('project-1');
   const refreshResult = deferred<Snapshots>();
   const written: Snapshots[] = [];
@@ -479,21 +480,29 @@ test('a refresh completing during a pending scope load does not drop that succes
     () => {},
   );
 
+  const scopeResults = [scopeResult, retryResult];
   const load = guard.loadRequested(
-    guard.next(), () => true, () => scopeResult.promise,
-    async () => snapshots.worktrees.map((worktree) => ({ ...worktree, autoApprove: true })),
+    guard.next(), () => true, () => scopeResults.shift()!.promise,
     (next) => { written.push(next); },
   );
-  guard.worktreesChanged();
+  guard.snapshotsChanged();
   refresh();
   refreshResult.resolve({ ...snapshots, tasks: [] });
   await flush();
   assert.equal(written.length, 1, 'the refresh applies when the loaded scope is unchanged');
 
-  const scopeSnapshots: Snapshots = { ...snapshots, storage: null };
-  scopeResult.resolve(scopeSnapshots);
+  scopeResult.resolve({ ...snapshots, mail: [] });
+  await flush();
+  assert.equal(written.length, 1, 'the stale requested snapshot is never published');
+
+  const latest: Snapshots = {
+    ...snapshots,
+    mail: [],
+    worktrees: snapshots.worktrees.map((worktree) => ({ ...worktree, autoApprove: true })),
+    tasks: [],
+    sessions: snapshots.sessions.map((session) => ({ ...session, status: 'stopped' })),
+  };
+  retryResult.resolve(latest);
   await load;
-  assert.equal(written.length, 2, 'the requested scope still publishes');
-  assert.equal(written[1].storage, null, 'the requested scope keeps its own snapshot');
-  assert.equal(written[1].worktrees[0].autoApprove, true, 'stale settings are replaced before publication');
+  assert.deepEqual(written.slice(1), [latest], 'the requested scope publishes all updated collections');
 });

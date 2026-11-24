@@ -109,29 +109,25 @@ type LiveScope = { scope: Scope; version: number };
 /** Only the newest scope load may publish snapshots; refresh never claims this guard. */
 export function createScopeGuard() {
   let seq = 0;
-  let worktreeVersion = 0;
+  let mutationVersion = 0;
   return {
     next: () => ++seq,
     isCurrent: (claimed: number) => claimed === seq,
-    worktreesChanged: () => { worktreeVersion++; },
+    snapshotsChanged: () => { mutationVersion++; },
     async loadRequested(
       claimed: number,
       isActive: () => boolean,
       load: () => Promise<Snapshots>,
-      readWorktrees: () => Promise<GuiWorktree[]>,
       publish: (next: Snapshots) => void,
     ) {
-      let version = worktreeVersion;
-      let next = await load();
       while (isActive() && claimed === seq) {
-        if (version === worktreeVersion) {
-          publish(next);
-          return;
-        }
-        // The scope is still requested, but a successful action may have
-        // changed its worktrees while the snapshot was being loaded.
-        version = worktreeVersion;
-        next = { ...next, worktrees: await readWorktrees() };
+        const version = mutationVersion;
+        const next = await load();
+        if (!isActive() || claimed !== seq) return;
+        // A successful action can invalidate any collection in the snapshot.
+        if (version !== mutationVersion) continue;
+        publish(next);
+        return;
       }
     },
   };
@@ -518,7 +514,6 @@ export function App({ api, initial, initialError }: AppProps) {
       seq,
       () => active,
       () => loadAll(scopeRequest.projectId, scopeRequest.recipient),
-      () => api.worktrees(scopeRequest.projectId),
       (next) => {
         setScopeLoading(false);
         setError(null);
@@ -531,13 +526,13 @@ export function App({ api, initial, initialError }: AppProps) {
       dispatchScope({ type: 'requestFailed' });
     });
     return () => { active = false; };
-  }, [api, scopeRequest, loadAll, publishScope]);
+  }, [scopeRequest, loadAll, publishScope]);
 
   const refresh = useMemo(
     () => {
       const refreshLoaded = refreshLoadedScope(loadAll, liveScope, setSnapshots, setError);
       return () => {
-        scopeGuard.current.worktreesChanged();
+        scopeGuard.current.snapshotsChanged();
         refreshLoaded();
       };
     },
