@@ -24,8 +24,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm lint
-      - run: pnpm test
+      - run: pnpm run test:ci
       - run: pnpm build
+      - run: pnpm run audit
+      - run: pnpm run version:check
+      - run: git diff --check
       - run: pnpm build:gui
 
   rust:
