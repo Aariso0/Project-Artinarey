@@ -4,20 +4,28 @@ import {
   appendJournal,
   ArtinareyError,
   atomicWrite,
+  assertScopeAvailable,
   buildIndex,
   claimPersona,
+  claimShared,
+  createTask,
   DEFAULT_PERSONA,
   fail,
+  newId,
   ok,
   queryMail,
   readPersona,
+  readTasks,
+  releaseShared,
   releasePersona,
   releaseWorktreeForce,
   resolveIdentity,
   rollbackFailedClaim,
   roster,
   sendMail,
+  updateTask,
   type ArtinareyErrorCode,
+  type TaskStatus,
   type Identity,
   type IndexedMail,
   type PersonaState,
@@ -26,10 +34,12 @@ import {
   type XdgPaths,
 } from '@artinarey/core';
 import type { RpcRequest, RpcResponse } from './server.ts';
+import type { SessionSupervisor } from './sessions.ts';
 
 export const TOOL_METHODS = new Set([
   'attach', 'release_force', 'check_in', 'claim_persona', 'inbox',
   'read_mail', 'send_mail', 'mark_done', 'report', 'worktrees',
+  'task_update', 'request_scope', 'assign_task', 'request_session',
 ]);
 
 export function isToolMethod(method: string): boolean {
@@ -54,6 +64,8 @@ export type RpcContext = {
   claimedBindings?: ClaimedBinding[];
   /** Installed by the daemon so a force release reaches other connections. */
   invalidateWorktree?: (worktreeId: string) => void;
+  /** The only component allowed to spawn processes or resolve approvals. */
+  supervisor?: SessionSupervisor;
 };
 
 function toolOk(id: string, reply: ToolReply): RpcResponse {
@@ -545,6 +557,129 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
       return `- ${wt.id === current ? '* ' : '  '}${wt.path} (${wt.branch ?? 'detached'})${bound ? ` ← ${bound.role}` : ''}`;
     });
     return toolOk(id, ok(lines.join('\n') || 'No worktrees registered.', unread(ctx, identity), 'check_in'));
+  }
+
+  if (request.method === 'assign_task') {
+    const auth = requireIdentity(id, ctx);
+    if ('response' in auth) return auth.response;
+    const { identity } = auth;
+    if (identity.role !== 'senior-dev') {
+      return toolFail(id, 'FORBIDDEN_ROLE', 'only the senior dev may assign tasks');
+    }
+    const assignee = str(params.persona_id);
+    const title = str(params.title);
+    const body = str(params.body);
+    const scope = Array.isArray(params.scope)
+      ? params.scope.filter((v): v is string => typeof v === 'string') : [];
+    if (!assignee || !title || !body || scope.length === 0) {
+      return toolFail(id, 'INVALID_INPUT', 'assign_task needs persona_id, title, scope[] and body');
+    }
+    const persona = ctx.registry.personas.list(identity.projectId).find((p) => p.id === assignee);
+    if (!persona) return toolFail(id, 'NOT_FOUND', `unknown persona: ${assignee}`);
+    try {
+      assertScopeAvailable(identity.storeDir, scope);
+    } catch (err) {
+      const e = err as { code?: ArtinareyErrorCode; message?: string };
+      return toolFail(id, e.code ?? 'LEASE_OVERLAP', e.message ?? 'scope overlaps a lease');
+    }
+    const taskId = newId();
+    const worktree = ctx.registry.worktrees.list(identity.projectId)
+      .find((wt) => ctx.registry.bindings.forWorktree(wt.id)?.id === assignee);
+    createTask(identity.storeDir, {
+      id: taskId, projectId: identity.projectId, title, scope, assignee: persona.role,
+      status: 'in_progress', worktreeId: worktree?.id ?? null,
+      branch: worktree?.branch ?? null, createdAt: new Date().toISOString(),
+    });
+    claimShared(identity.storeDir, taskId, scope);
+    try {
+      await sendMail(identity.storeDir, {
+        from: identity.role!, to: [persona.role], subject: `Task: ${title}`,
+        kind: 'task', action: body, body,
+      }, { knownPersonas: knownRoles(ctx, identity.projectId), role: identity.role!, sharedTasks: [] });
+      buildIndex(indexFile(ctx, identity.projectId), identity.storeDir);
+    } catch (err) {
+      return toolFail(id, 'MAIL_REJECTED', (err as Error).message);
+    }
+    return toolOk(id, ok(`Assigned ${taskId} to ${persona.role}.`, unread(ctx, identity), 'inbox'));
+  }
+
+  if (request.method === 'request_scope') {
+    const auth = requireIdentity(id, ctx);
+    if ('response' in auth) return auth.response;
+    const { identity } = auth;
+    const taskId = str(params.task_id);
+    const reason = str(params.reason);
+    const added = Array.isArray(params.paths)
+      ? params.paths.filter((v): v is string => typeof v === 'string') : [];
+    if (!taskId || !reason || added.length === 0) {
+      return toolFail(id, 'INVALID_INPUT', 'request_scope needs task_id, paths[] and reason');
+    }
+    const task = readTasks(identity.storeDir).find((t) => t.id === taskId);
+    if (!task) return toolFail(id, 'NOT_FOUND', `no task with id ${taskId}`);
+    if (task.assignee !== identity.role) {
+      return toolFail(id, 'FORBIDDEN_ROLE', 'only the assignee may request more scope');
+    }
+    try {
+      assertScopeAvailable(identity.storeDir, [...task.scope, ...added], taskId);
+    } catch (err) {
+      const e = err as { code?: ArtinareyErrorCode; message?: string };
+      return toolFail(id, e.code ?? 'LEASE_OVERLAP', e.message ?? 'scope overlaps a lease');
+    }
+    try {
+      await sendMail(identity.storeDir, {
+        from: identity.role!, to: ['senior-dev'], subject: `Scope request: ${task.title}`,
+        kind: 'question', action: `approve scope for ${taskId}`,
+        body: `Task ${taskId} requests: ${added.join(', ')}\nReason: ${reason}`,
+        in_reply_to: taskId,
+      }, { knownPersonas: knownRoles(ctx, identity.projectId), role: identity.role!, sharedTasks: [] });
+      buildIndex(indexFile(ctx, identity.projectId), identity.storeDir);
+    } catch (err) {
+      return toolFail(id, 'MAIL_REJECTED', (err as Error).message);
+    }
+    return toolOk(id, ok(`Scope request for ${taskId} sent to the senior dev.`,
+      unread(ctx, identity), 'inbox'));
+  }
+
+  if (request.method === 'request_session') {
+    const auth = requireIdentity(id, ctx);
+    if ('response' in auth) return auth.response;
+    const { identity } = auth;
+    if (!ctx.supervisor) {
+      return toolFail(id, 'STORE_OFFLINE', 'session supervisor is unavailable');
+    }
+    const result = await ctx.supervisor.requestSession(identity, {
+      role: str(params.role),
+      persona_id: str(params.persona_id),
+      task_id: str(params.task_id) ?? '',
+      vendor: str(params.vendor),
+      worktree_id: str(params.worktree_id),
+    });
+    if (!result.ok) {
+      const suffix = result.approvalId ? ` (approval ${result.approvalId})` : '';
+      return toolFail(id, result.code, `${result.message}${suffix}`);
+    }
+    return toolOk(id, ok(result.message, unread(ctx, identity), 'check_in'));
+  }
+
+  if (request.method === 'task_update') {
+    const auth = requireIdentity(id, ctx);
+    if ('response' in auth) return auth.response;
+    const { identity } = auth;
+    const taskId = str(params.task_id);
+    const status = str(params.status) as TaskStatus;
+    const note = str(params.note);
+    const allowed: TaskStatus[] = ['in_progress', 'blocked', 'ready_for_review', 'done'];
+    if (!taskId || !allowed.includes(status)) {
+      return toolFail(id, 'INVALID_INPUT', 'task_update needs task_id and a valid status');
+    }
+    const task = readTasks(identity.storeDir).find((t) => t.id === taskId);
+    if (!task) return toolFail(id, 'NOT_FOUND', `no task with id ${taskId}`);
+    if (task.assignee !== identity.role) {
+      return toolFail(id, 'FORBIDDEN_ROLE', 'only the assignee may update a task');
+    }
+    updateTask(identity.storeDir, taskId, { status, note });
+    if (status === 'done') releaseShared(identity.storeDir, taskId);
+    return toolOk(id, ok(`Task ${taskId} is ${status}.`, unread(ctx, identity), 'inbox'));
   }
 
   return toolFail(id, 'NOT_FOUND', `unknown method: ${request.method}`);

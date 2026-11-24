@@ -11,7 +11,7 @@ import {
   claimPersona, createPersona, findMarker, isUlid, lockGitWorktree, newId, openRegistry,
   readPersona, releasePersona, resolveIdentity, resolveXdgPaths, writeMarker, writePersona,
 } from '@artinarey/core';
-import { createRpcServer } from '@artinarey/daemon';
+import { createRpcServer, loadOrCreateOperatorToken } from '@artinarey/daemon';
 import { main } from './index.ts';
 
 function root(): string {
@@ -132,6 +132,7 @@ test('connect opencode writes an MCP entry and allow rules without clobbering co
   for (const tool of [
     'check_in', 'claim_persona', 'inbox', 'read_mail',
     'send_mail', 'mark_done', 'report', 'worktrees',
+    'task_update', 'request_scope', 'assign_task',
   ]) {
     assert.ok(allowed.includes(`artinarey_${tool}`), `missing allow rule for ${tool}`);
   }
@@ -277,7 +278,8 @@ test('release <worktree> --force frees a binding through the daemon', async () =
   const persona = createPersona(registry, project.storeDir, project.id, 'dev-a', 'Dev A');
   registry.bindings.bind(persona, worktreeId);
 
-  const server = createRpcServer(paths.socketPath, undefined, { registry, paths });
+  const server = createRpcServer(paths.socketPath, undefined, { registry, paths },
+    undefined, loadOrCreateOperatorToken(paths));
   await server.start();
 
   const original = console.log;

@@ -5,6 +5,7 @@
   "main": "src/index.ts",
   "dependencies": {
     "better-sqlite3": "13.2.0",
+    "picomatch": "^4.0.7",
     "ulid": "^3.0.2"
   }
 }

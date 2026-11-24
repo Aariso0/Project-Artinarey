@@ -10,3 +10,6 @@ export * from './identity.ts';
 export * from './persona-store.ts';
 export * from './reply.ts';
 export * from './worktree.ts';
+export * from './lease.ts';
+export * from './hooks.ts';
+export * from './session.ts';

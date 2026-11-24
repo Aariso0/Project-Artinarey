@@ -7,6 +7,8 @@ import { join } from 'node:path';
 import type { Registry, XdgPaths } from '@artinarey/core';
 import { createRpcServer, handleRequest, type RpcResponse } from './server.ts';
 
+const OPERATOR_TOKEN = 'test-operator-token';
+
 function socketPath(): string {
   return join(tmpdir(), `artinarey-sock-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`);
 }
@@ -99,7 +101,7 @@ test('handleRequest answers ping, status, and unknown methods', () => {
 
 test('server answers over a unix socket with mode 0600 and shutdown closes it', async () => {
   const path = socketPath();
-  const server = createRpcServer(path);
+  const server = createRpcServer(path, undefined, undefined, undefined, OPERATOR_TOKEN);
   try {
     await server.start();
     assert.equal(existsSync(path), true);
@@ -114,7 +116,9 @@ test('server answers over a unix socket with mode 0600 and shutdown closes it', 
     assert.equal(unknown.ok, false);
     if (!unknown.ok) assert.equal(unknown.error.code, 'NOT_FOUND');
 
-    const shutdown = await rpc(path, { id: '3', method: 'shutdown' });
+    const shutdown = await rpc(path, {
+      id: '3', method: 'shutdown', operatorToken: OPERATOR_TOKEN,
+    });
     assert.equal(shutdown.ok, true);
     await waitFor(() => !existsSync(path));
     assert.equal(existsSync(path), false, 'shutdown RPC actually closes the listener');
@@ -125,10 +129,10 @@ test('server answers over a unix socket with mode 0600 and shutdown closes it', 
 
 test('an invalid shutdown request leaves the listener running', async () => {
   const path = socketPath();
-  const server = createRpcServer(path);
+  const server = createRpcServer(path, undefined, undefined, undefined, OPERATOR_TOKEN);
   try {
     await server.start();
-    const response = await rpc(path, { method: 'shutdown' });
+    const response = await rpc(path, { method: 'shutdown', operatorToken: OPERATOR_TOKEN });
     assert.equal(response.ok, false);
     if (!response.ok) assert.equal(response.error.code, 'INVALID_INPUT');
 

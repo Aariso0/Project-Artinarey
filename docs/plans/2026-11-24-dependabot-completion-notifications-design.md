@@ -25,7 +25,7 @@ Notify `@Aariso0` with a readable, deterministic PR comment whenever a Dependabo
 - Repository default branch is `main`.
 - Existing CI: `.github/workflows/ci.yml`, name `CI`, single job `node`, steps typecheck → lint → test, triggered by `push` and `pull_request` on `main`/`MO/**`.
 - Dependabot config: `.github/dependabot.yml`, ecosystems `github-actions` and `npm`, weekly.
-- Existing docs live under `docs/plans/`; do not create `docs/superpowers/`.
+- Existing docs live under `docs/plans/`; do not create a separate helper-doc folder.
 - Treat GitHub-provided text as untrusted data; parse it deterministically and cap its size in the comment.
 
 ## Approaches considered

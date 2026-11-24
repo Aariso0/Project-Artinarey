@@ -5,17 +5,18 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
-  adoptWorktree, atomicWrite, buildIndex, claimPersona, createWorktree, ensureExcludeBlock,
-  findMarker, globalIgnoreCoverage, listGitWorktrees, newId, openRegistry,
-  planWorktree, projectStore, readPersona, reconcileWorktrees, rehomePersona, releasePersona,
-  removeWorktree, resolveIdentity, resolveRepo, resolveXdgPaths, roster, rollbackFailedClaim,
-  writeMarker,
+  adoptWorktree, atomicWrite, branchChangedFiles, buildIndex, changedFiles, claimPersona,
+  createWorktree, ensureExcludeBlock, findMarker, globalIgnoreCoverage, installHooks,
+  listGitWorktrees, newId, openRegistry, planWorktree, projectStore, readPersona, readTasks,
+  reconcileWorktrees, rehomePersona, releasePersona, removeWorktree, resolveIdentity, resolveRepo,
+  resolveXdgPaths, roster, rollbackFailedClaim, uncoveredFiles, writeMarker,
 } from '@artinarey/core';
 import { callDaemon, daemonStatus, startDaemon, stopDaemon } from '@artinarey/daemon';
 
 const MCP_TOOLS = [
   'check_in', 'claim_persona', 'inbox', 'read_mail',
   'send_mail', 'mark_done', 'report', 'worktrees',
+  'task_update', 'request_scope', 'assign_task', 'request_session',
 ] as const;
 
 const VENDOR_COMMANDS: Record<string, string> = { opencode: 'opencode' };
@@ -146,6 +147,8 @@ export async function main(
     try {
       const { root, commonDir } = resolveRepo(cwd);
       ensureExcludeBlock(commonDir);
+      const hooks = installHooks(root, commonDir);
+      console.log(`hooks: ${hooks.note}`);
       const coverage = globalIgnoreCoverage(root);
       const paths = resolveXdgPaths(env);
       const registry = openRegistry(paths.registryFile);
@@ -574,6 +577,180 @@ export async function main(
       return 0;
     } catch (err) {
       console.error(`release failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
+  if (command === 'lease-check') {
+    try {
+      const { root } = resolveRepo(cwd);
+      const marker = findMarker(root);
+      if (!marker) {
+        console.error('lease-check failed: run artinarey init first');
+        return 1;
+      }
+      const paths = resolveXdgPaths(env);
+      const registry = openRegistry(paths.registryFile);
+      const project = registry.projects.get(marker.marker.project_id);
+      registry.close();
+      if (!project) {
+        console.error(`lease-check failed: unknown project ${marker.marker.project_id}`);
+        return 1;
+      }
+      const files = changedFiles(root, args.includes('--staged'));
+      const tasks = readTasks(project.storeDir)
+        .filter((t) => t.worktreeId === marker.marker.worktree_id && t.status !== 'done');
+      const outside = uncoveredFiles(tasks, files);
+      if (outside.length > 0) {
+        console.error(`lease-check: files outside your lease: ${outside.join(', ')}`);
+        return 1;
+      }
+      console.log(`lease-check ok (${files.length} files checked)`);
+      return 0;
+    } catch (err) {
+      console.error(`lease-check failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
+  if (command === 'verify') {
+    const branch = args[0];
+    if (!branch) {
+      console.error('usage: artinarey verify <branch>');
+      return 2;
+    }
+    try {
+      const { root } = resolveRepo(cwd);
+      const marker = findMarker(root);
+      if (!marker) {
+        console.error('verify failed: run artinarey init first');
+        return 1;
+      }
+      const paths = resolveXdgPaths(env);
+      const registry = openRegistry(paths.registryFile);
+      const project = registry.projects.get(marker.marker.project_id);
+      registry.close();
+      if (!project) {
+        console.error(`verify failed: unknown project ${marker.marker.project_id}`);
+        return 1;
+      }
+      const files = branchChangedFiles(root, branch);
+      const tasks = readTasks(project.storeDir)
+        .filter((t) => t.branch === branch && t.status !== 'done');
+      const outside = uncoveredFiles(tasks, files);
+      if (outside.length > 0) {
+        console.error(`verify ${branch}: files outside the lease: ${outside.join(', ')}`);
+        return 1;
+      }
+      console.log(`verify ${branch} ok (${files.length} files checked)`);
+      return 0;
+    } catch (err) {
+      console.error(`verify failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
+  if (command === 'approvals') {
+    const paths = resolveXdgPaths(env);
+    const projectId = args[0];
+    try {
+      const response = await callDaemon(paths, 'approvals', projectId ? { projectId } : {});
+      if (!response.ok) {
+        console.error(`approvals failed: ${response.error.message}`);
+        return 1;
+      }
+      const approvals = (response.result as {
+        approvals: Array<{ id: string; kind: string; summary: string; status: string }>;
+      }).approvals;
+      if (approvals.length === 0) {
+        console.log('no approvals');
+      } else {
+        for (const approval of approvals) {
+          console.log(`${approval.id}\t${approval.status}\t${approval.kind}\t${approval.summary}`);
+        }
+      }
+      return 0;
+    } catch (err) {
+      console.error(`approvals failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
+  if (command === 'approve') {
+    const id = args[0];
+    const decision = args.includes('--reject') ? 'rejected' : 'approved';
+    if (!id) {
+      console.error('usage: artinarey approve <id> [--reject]');
+      return 2;
+    }
+    const paths = resolveXdgPaths(env);
+    try {
+      const response = await callDaemon(paths, 'approve', { id, decision, by: 'user' });
+      if (!response.ok) {
+        console.error(`approve failed: ${response.error.message}`);
+        return 1;
+      }
+      const result = response.result as { approval: { id: string; status: string }; spawn?: unknown };
+      console.log(`${result.approval.id}: ${result.approval.status}`);
+      if (result.spawn && typeof result.spawn === 'object' && 'message' in result.spawn) {
+        console.log(String((result.spawn as { message: string }).message));
+      }
+      return 0;
+    } catch (err) {
+      console.error(`approve failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
+  if (command === 'auto-approve') {
+    const [worktreeId, value] = args;
+    if (!worktreeId || (value !== 'on' && value !== 'off')) {
+      console.error('usage: artinarey auto-approve <worktree> <on|off>');
+      return 2;
+    }
+    const paths = resolveXdgPaths(env);
+    try {
+      const response = await callDaemon(paths, 'auto_approve', {
+        worktreeId, enabled: value === 'on',
+      });
+      if (!response.ok) {
+        console.error(`auto-approve failed: ${response.error.message}`);
+        return 1;
+      }
+      console.log(`auto-approve ${worktreeId}: ${value}`);
+      return 0;
+    } catch (err) {
+      console.error(`auto-approve failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
+  if (command === 'sessions') {
+    const projectId = args[0];
+    if (!projectId) {
+      console.error('usage: artinarey sessions <project>');
+      return 2;
+    }
+    const paths = resolveXdgPaths(env);
+    try {
+      const response = await callDaemon(paths, 'sessions', { projectId });
+      if (!response.ok) {
+        console.error(`sessions failed: ${response.error.message}`);
+        return 1;
+      }
+      const sessions = (response.result as {
+        sessions: Array<{ id: string; personaId: string; status: string; vendorSessionId: string | null }>;
+      }).sessions;
+      if (sessions.length === 0) {
+        console.log('no sessions');
+      } else {
+        for (const session of sessions) {
+          console.log(`${session.id}\t${session.status}\t${session.personaId}\t${session.vendorSessionId ?? '-'}`);
+        }
+      }
+      return 0;
+    } catch (err) {
+      console.error(`sessions failed: ${(err as Error).message}`);
       return 1;
     }
   }

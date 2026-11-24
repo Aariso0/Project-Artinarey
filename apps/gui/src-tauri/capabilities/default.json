@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Core defaults only. No HTTP, filesystem or shell plugin permissions.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

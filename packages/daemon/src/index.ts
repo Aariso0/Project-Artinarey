@@ -2,14 +2,25 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { connect } from 'node:net';
 import { dirname, join } from 'node:path';
 import {
-  ArtinareyError, newId, openRegistry, type Registry, type XdgPaths,
+  ArtinareyError, loadConfig, newId, openRegistry, serveStateFile,
+  type Registry, type XdgPaths,
 } from '@artinarey/core';
+import { startGuiHttpServer, type GuiHttpServer } from './http.ts';
 import { acquireLock } from './lock.ts';
-import { createRpcServer, type RpcResponse } from './server.ts';
+import { isOperatorMethod, loadOrCreateOperatorToken } from './operator.ts';
+import { OpencodeAdapter } from './opencode.ts';
+import { createRpcServer, type RpcResponse, type RpcServer } from './server.ts';
+import { SessionSupervisor } from './sessions.ts';
+import type { RpcContext } from './tools.ts';
 
 export * from './lock.ts';
+export * from './operator.ts';
 export * from './server.ts';
 export * from './tools.ts';
+export * from './gui.ts';
+export * from './http.ts';
+export * from './opencode.ts';
+export * from './sessions.ts';
 
 export function daemonPaths(paths: XdgPaths): { socketPath: string; lockFile: string } {
   return {
@@ -23,18 +34,51 @@ export async function startDaemon(paths: XdgPaths): Promise<{ socketPath: string
   mkdirSync(dirname(socketPath), { recursive: true });
   const lock = await acquireLock(lockFile);
   let registry: Registry | undefined;
+  let server: RpcServer | undefined;
+  let gui: GuiHttpServer | undefined;
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    lock.release();
+    registry?.close();
+  };
   try {
     registry = openRegistry(paths.registryFile);
     const opened = registry;
-    const server = createRpcServer(socketPath, () => {
-      lock.release();
-      opened.close();
-    }, { registry: opened, paths });
+    const logDir = join(paths.cacheRoot, 'logs');
+    mkdirSync(logDir, { recursive: true });
+    const adapter = new OpencodeAdapter({
+      stateFile: serveStateFile(paths.configDir),
+      logDir,
+      env: process.env,
+    });
+    const supervisor = new SessionSupervisor({
+      registry: opened,
+      paths,
+      adapter,
+      rolesDir: process.env.ARTINAREY_ROLES_DIR ?? join(paths.configDir, 'roles'),
+      spawnCap: loadConfig(join(paths.configDir, 'config.json')).spawnCap,
+    });
+    supervisor.adopt();
+    const ctx: RpcContext = { registry: opened, paths, supervisor };
+    const operatorToken = loadOrCreateOperatorToken(paths);
+    server = createRpcServer(socketPath, () => {
+      const guiClose = gui?.close();
+      if (guiClose) {
+        void guiClose.catch((err) => {
+          console.error(`GUI server shutdown failed: ${(err as Error).message ?? String(err)}`);
+        });
+      }
+      cleanup();
+    }, ctx, undefined, operatorToken);
     await server.start();
+    gui = await startGuiHttpServer(paths, ctx);
     return { socketPath };
   } catch (err) {
-    lock.release();
-    registry?.close();
+    await gui?.close();
+    if (server) await server.close();
+    cleanup();
     throw err;
   }
 }
@@ -56,6 +100,7 @@ function rpcCall(
   method: string,
   params: Record<string, unknown> = {},
   timeoutMs = 2000,
+  operatorToken?: string,
 ): Promise<RpcResponse> {
   return new Promise((resolve, reject) => {
     const socket = connect(socketPath);
@@ -66,7 +111,9 @@ function rpcCall(
       reject(new ArtinareyError('STORE_OFFLINE', 'daemon request timed out'));
     }, timeoutMs);
 
-    socket.on('connect', () => socket.write(`${JSON.stringify({ id: newId(), method, params })}\n`));
+    socket.on('connect', () => socket.write(`${JSON.stringify({
+      id: newId(), method, params, operatorToken,
+    })}\n`));
     socket.on('data', (chunk: string) => {
       buffer += chunk;
       const end = buffer.indexOf('\n');
@@ -99,7 +146,9 @@ export function callDaemon(
   method: string,
   params: Record<string, unknown> = {},
 ): Promise<RpcResponse> {
-  return rpcCall(daemonPaths(paths).socketPath, method, params);
+  const operatorToken = isOperatorMethod(method)
+    ? loadOrCreateOperatorToken(paths) : undefined;
+  return rpcCall(daemonPaths(paths).socketPath, method, params, 2000, operatorToken);
 }
 
 export async function daemonStatus(paths: XdgPaths): Promise<unknown | undefined> {
@@ -114,7 +163,9 @@ export async function daemonStatus(paths: XdgPaths): Promise<unknown | undefined
 
 export async function stopDaemon(paths: XdgPaths): Promise<void> {
   const { socketPath } = daemonPaths(paths);
-  const response = await rpcCall(socketPath, 'shutdown');
+  const response = await rpcCall(
+    socketPath, 'shutdown', {}, 2000, loadOrCreateOperatorToken(paths),
+  );
   if (!response.ok) throw new ArtinareyError('STORE_OFFLINE', response.error.message);
   for (let i = 0; i < 50 && existsSync(socketPath); i++) {
     await new Promise((resolve) => setTimeout(resolve, 10));

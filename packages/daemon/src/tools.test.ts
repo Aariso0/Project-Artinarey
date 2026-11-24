@@ -10,7 +10,7 @@ import { dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
 import {
   buildIndex, createPersona, findMarker, listGitWorktrees, newId, openRegistry,
-  queryMail, readPersona, resolveXdgPaths, serializeMail, validateMail,
+  queryMail, readPersona, readTasks, resolveXdgPaths, serializeMail, validateMail,
   withProjectLock, writeMarker, type Registry,
 } from '@artinarey/core';
 import { createRpcServer, type RpcResponse, type RpcServer } from './server.ts';
@@ -20,6 +20,8 @@ type Client = {
   call(method: string, params?: Record<string, unknown>): Promise<RpcResponse>;
   close(): void;
 };
+
+const TEST_OPERATOR_TOKEN = 'test-operator-token';
 
 async function waitUntil(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -72,7 +74,9 @@ async function openClient(path: string): Promise<Client> {
     call(method, params) {
       return new Promise<RpcResponse>((resolve, reject) => {
         pending.push({ resolve, reject });
-        socket.write(`${JSON.stringify({ id: String(++seq), method, params })}\n`);
+        socket.write(`${JSON.stringify({
+          id: String(++seq), method, params, operatorToken: TEST_OPERATOR_TOKEN,
+        })}\n`);
       });
     },
     close() {
@@ -167,7 +171,7 @@ async function serve(
   const socketPath = join(s.paths.socketPath);
   mkdirSync(join(s.paths.socketPath, '..'), { recursive: true });
   const server = createRpcServer(socketPath, undefined, { registry: s.registry, paths: s.paths },
-    onConnectionClosed);
+    onConnectionClosed, TEST_OPERATOR_TOKEN);
   await server.start();
   return { server, socketPath };
 }
@@ -1141,4 +1145,69 @@ test('a failed claim audit rolls back binding, persona state and worktree lock',
   await waitUntil(() => disconnects > beforeClose);
   assert.equal(s.registry.bindings.forWorktree(worktreeId), undefined,
     'disconnect must not have an unowned binding to release');
+});
+
+test('assign_task rejects overlapping scopes and creates disjoint tasks', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev', 'Dev');
+  const lead = createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, lead);
+
+  const first = await client.call('assign_task', {
+    persona_id: dev, title: 'one', scope: ['src/a.ts'], body: 'do it',
+  });
+  assert.equal(first.ok, true, JSON.stringify(first));
+  const overlap = await client.call('assign_task', {
+    persona_id: dev, title: 'two', scope: ['src'], body: 'do it',
+  });
+  assert.equal(overlap.ok, false, JSON.stringify(overlap));
+  assert.equal(overlap.error.code, 'LEASE_OVERLAP');
+  const disjoint = await client.call('assign_task', {
+    persona_id: dev, title: 'three', scope: ['docs/x.md'], body: 'do it',
+  });
+  assert.equal(disjoint.ok, true, JSON.stringify(disjoint));
+  assert.equal(readTasks(s.project.storeDir).length, 2);
+});
+
+test('only the senior dev may assign; only the assignee may update or request scope', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev', 'Dev');
+  const lead = createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const leadClient = await openClient(started.socketPath);
+  const worker = await openClient(started.socketPath);
+  cleanup.clients.push(leadClient, worker);
+
+  await attach(leadClient, s.worktrees[0]!);
+  await claim(leadClient, lead);
+  const created = await leadClient.call('assign_task', {
+    persona_id: dev, title: 'one', scope: ['src/a.ts'], body: 'do it',
+  });
+  assert.equal(created.ok, true, JSON.stringify(created));
+  const taskId = readTasks(s.project.storeDir)[0]!.id;
+
+  await attach(worker, s.worktrees[1]!);
+  await claim(worker, dev);
+  const forbiddenAssign = await worker.call('assign_task', {
+    persona_id: dev, title: 'nope', scope: ['other'], body: 'do it',
+  });
+  assert.equal(forbiddenAssign.ok, false);
+  assert.equal(forbiddenAssign.error.code, 'FORBIDDEN_ROLE');
+
+  const updated = await worker.call('task_update', { task_id: taskId, status: 'blocked', note: 'stuck' });
+  assert.equal(updated.ok, true, JSON.stringify(updated));
+  assert.equal(readTasks(s.project.storeDir)[0]!.status, 'blocked');
+
+  const scoped = await worker.call('request_scope', {
+    task_id: taskId, paths: ['docs/x.md'], reason: 'need docs',
+  });
+  assert.equal(scoped.ok, true, JSON.stringify(scoped));
 });

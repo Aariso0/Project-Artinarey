@@ -8,14 +8,14 @@
 
 *Many agents. Many lanes. One project. You still do the merging.*
 
-![status](https://img.shields.io/badge/status-M0--M3%20implemented-2ea043?labelColor=0d1117)
+![status](https://img.shields.io/badge/status-M0--M6%20implemented-2ea043?labelColor=0d1117)
 ![local first](https://img.shields.io/badge/local--first-no%20cloud-2ea043?labelColor=0d1117)
 ![first](https://img.shields.io/badge/works%20with-OpenCode%20first-58a6ff?labelColor=0d1117)
 ![license](https://img.shields.io/badge/license-GPL--3.0-2ea043?labelColor=0d1117)
 
 </div>
 
-> **Design settled. Foundation, MCP shim and worktree manager implemented and tested; two-agent mail exchange verified in OpenCode and the worktree lifecycle smoke-tested.** Nothing is installable yet. The full design, the evidence behind every decision, and the progress tracker live in [`plan.md`](plan.md).
+> **Design settled. M0–M6 implemented and tested; two-agent mail exchange verified in OpenCode, the worktree lifecycle smoke-tested, and the read-only desktop window shipped in M6.** CLI approvals already shipped; Chat, window approvals, dialogs, Move and storage settings are M7/later. The full design, the evidence behind every decision, and the progress tracker live in [`plan.md`](plan.md).
 
 ---
 
@@ -57,7 +57,7 @@ Artinarey is the office that fixes that. Each agent gets a private desk, an inte
 | **Talking** | You copy and paste between tools | Agents mail each other through one local MCP server |
 | **Planning** | You juggle it in your head | One senior dev splits the work; code checks that scopes don't overlap |
 | **Overview** | A dozen terminal tabs | One calm window with every project, agent, branch and thread |
-| **Storage** | Chat logs scattered everywhere | One folder per project, on the drive **you** choose, with a **Move** button |
+| **Storage** | Chat logs scattered everywhere | One folder per project, on the drive **you** choose, with a **Move** button (M7) |
 | **Privacy** | Depends on the tool | Mail stays on your machine; only a separate API adapter calls a model API |
 
 ---
@@ -94,7 +94,7 @@ Artinarey is the office that fixes that. Each agent gets a private desk, an inte
 > **09:02**  It splits the job into three tasks with three separate sets of paths. The daemon checks that none overlap.
 > **09:03**  Developers start in their own worktrees. The senior dev wants one more than your cap allows, so a warning appears and the extra session waits for your approval.
 > **09:40**  A tester mails a developer: *"Login returns 500 on empty password."* You didn't copy-paste anything.
-> **10:05**  A developer runs `git push`. Its session stops and waits; your desktop notifies you immediately. You approve in the window.
+> **10:05**  A developer runs `git push`. Its session stops and waits; your desktop notifies you immediately. You approve in the CLI (the window approvals tray arrives in M7).
 > **10:15**  One developer touches a file outside its lease. The pre-merge panel lights up red.
 > **10:30**  Three branches are ready. You read the diffs, merge them in the order you like, and go get lunch.
 
@@ -122,10 +122,10 @@ New sessions are completely independent and keep running even when the senior de
 <td width="50%" valign="top">
 
 ### Worktree-native
-Every working agent gets its own worktree and branch under `.worktrees/`. Create new worktrees from the window, adopt existing ones, and see which persona lives where.
+Every working agent gets its own worktree and branch under `.worktrees/`. Create and adopt worktrees in the CLI today; the window shows the current worktrees and which persona lives where.
 
 ### Home worktrees
-Start a persona somewhere other than where it last worked and you get a warning in both the CLI and the window. Edit a persona's home worktree any time, within the same project.
+Start a persona somewhere other than where it last worked and you get a warning in the CLI. Editing a persona's home worktree is an M7 window feature.
 
 ### Path leases
 Each task owns its paths. Overlaps are rejected up front. A git hook and a pre-merge check flag edits outside the lease. Shared hot files are handed to one task at a time.
@@ -137,10 +137,10 @@ Each task owns its paths. Overlaps are rejected up front. A git hook and a pre-m
 Addressed messages only. No broadcast. Everything is logged. Mail is immutable plain Markdown you can read with any editor.
 
 ### Storage you control
-Choose where records live. When a drive fills up, use **Move**: pause, copy, verify checksums, switch, and delete the old copy only when you say so.
+Choose where records live. The **Move** wizard (pause, copy, verify checksums, switch, delete the old copy only when you say so) and storage settings are M7/later.
 
-### One minimal window
-Projects, personas, worktrees, mail, tasks, sessions, audit. Talk to one persona at a time.
+### One read-only window
+M6 ships Projects, Personas, Worktrees and Mail as read-only snapshots. Chat, window approvals, dialogs, Move and storage settings are M7/later; CLI approvals work today. See [Running and testing Artinarey](docs/running-and-testing.md) for the daemon and window commands.
 
 </td>
 </tr>
@@ -151,13 +151,15 @@ Projects, personas, worktrees, mail, tasks, sessions, audit. Talk to one persona
 ## Safety and control
 
 - **Your boundary is the agent's assigned worktree** — not the whole project, and not another worktree of the same project. Network access, other worktrees, and global git operations such as `git push` and `git tag` need your approval. Local commands, including a Python script that only writes inside the worktree, proceed.
-- **An obvious auto-approve toggle** lives in the worktree view. It is user-only, per worktree, and OFF by default. When ON, risky worktree-confined calls proceed automatically; out-of-worktree calls still ask.
-- **Blocked agents wait indefinitely.** You get an OS desktop notification immediately, again at 5 minutes, again at 15 minutes, then silence. No timeout auto-fail. A blocked session still counts toward the cap. Approve in the GUI or the CLI, depending on how the agent was launched.
+- **An obvious auto-approve switch** is user-only, per worktree, and OFF by default. When ON, risky worktree-confined calls proceed automatically; out-of-worktree calls still ask. The shim enforces it today; the worktree-view switch is M7.
+- **Blocked agents wait indefinitely.** You get an OS desktop notification immediately, again at 5 minutes, again at 15 minutes, then silence. No timeout auto-fail. A blocked session still counts toward the cap. Approve in the CLI today; the GUI approvals tray is M7.
 - **Spawn cap:** 3 running sessions per project, soft. Going over it shows a warning phrased around token consumption. Artinarey does not measure tokens or cost; a cost estimate would be misleading for people on free models. A senior-dev request over the cap waits for your approval.
 - **Overlap checks are plain code**, not an LLM. An append-only audit log records mail, launches, approvals and every toggle flip.
 - **You merge by hand.** A pre-merge check compares changed files with the task's lease and shows red flags.
 
 **Known risk, accepted:** out-of-worktree detection uses command and path heuristics. It can be bypassed — for example, `curl` launched inside the worktree reaches the network, and a Python script can open a file outside the worktree without naming an outside path in the command. This is **not an OS sandbox**. Docs describe out-of-worktree use as *detected and approval-gated*, never impossible. See [`plan.md`](plan.md), section 13.
+
+Operator-only daemon actions (shutdown, approvals, forced release) require a 0600 token held by the CLI. This prevents accidental or raw-socket agent escalation, but an agent running as the same OS user can still read user-owned files; a true user-versus-agent boundary needs an OS credential prompt.
 
 ---
 
@@ -201,17 +203,18 @@ artinarey verify artinarey/auth-api         # pre-merge check against the task's
 </details>
 
 <details>
-<summary><b>The window (planned)</b></summary>
+<summary><b>The window (M6, read-only)</b></summary>
 
 <br>
 
-- **Projects:** where each project's records live, size, free space, online or offline.
-- **Personas:** who is active, what each last did, home worktree (editable), Start / Resume / Release.
-- **Worktrees:** create, adopt, see branches and what changed. The auto-approve switch sits here, per worktree.
-- **Mail:** every thread, by project and persona.
-- **Chat:** one persona at a time. Anything you tell a persona is copied to the senior dev.
-- **Approvals:** blocked risky calls, spawn over the cap, scope requests, takeovers.
-- **Pre-merge:** changed files versus the task's lease, red flags first.
+M6 ships four read-only screens. The native shell holds the daemon token; the webview receives only snapshots.
+
+- **Projects:** where each project's records live, size, free space, active or offline.
+- **Personas:** role, name, bound worktree, last session id and running state.
+- **Worktrees:** path, branch, binding, lock and prune state.
+- **Mail:** indexed metadata only — no bodies and no read state.
+
+**M7/later:** Chat, window approval controls, dialogs (including new/adopt worktree, home-worktree edits and the active-worktree blocker), Move, storage settings, and the Tasks, Sessions, Pre-merge and Audit tabs. CLI approvals are available now.
 
 </details>
 
@@ -221,7 +224,7 @@ artinarey verify artinarey/auth-api         # pre-merge check against the task's
 
 | Tool | Status | What Artinarey can do |
 |---|---|---|
-| **OpenCode** | First | Launch sessions in a chosen worktree, send messages from the window, watch status |
+| **OpenCode** | First | Launch sessions in a chosen worktree, approve from the CLI, watch read-only status in the window; window chat is M7 |
 | **Model API adapter** | Next | A separate process that calls a model API through a configurable base URL; the daemon passes prompts and results over a local socket |
 | **Claude Code** | Postponed | Project `.mcp.json` is verified, but a cloned repository can't approve its own servers |
 | **Codex** | Postponed | `cwd` and static headers exist, but project config loads only in trusted projects |
@@ -233,7 +236,7 @@ Any tool you start by hand with `artinarey run` still gets mail and tasks, as lo
 
 ## Progress
 
-`████░░░░░░░░░░░░░░` **4 of 9 milestones. Design settled, M3 implemented and tested; two-agent mail exchange verified in OpenCode and the worktree lifecycle smoke-tested.** The M0 spike passed on 2026-11-23, M1 added the store, mail, registry and daemon, M2 added the MCP shim, folder-based identity and eight tools, and M3 added worktree create/adopt/list/remove, home-worktree warnings and `run`; no adapter or window exists yet.
+`███████░░░░░░░░░░░` **7 of 9 milestones. M0–M6 implemented and tested; two-agent mail exchange verified in OpenCode, the worktree lifecycle smoke-tested, and the M6 read-only desktop window shipped.** M4 added leases and the pre-merge check, M5 added the OpenCode adapter, spawning and approvals, and M6 added the read-only window (Projects, Personas, Worktrees and Mail). Chat, window approvals, dialogs, Move and storage settings are M7/later.
 
 | | Milestone | Status |
 |---|---|---|
@@ -241,10 +244,10 @@ Any tool you start by hand with `artinarey run` still gets mail and tasks, as lo
 | M1 | Store, mail files, daemon | ✅ |
 | M2 | MCP shim and identity by folder | ✅ |
 | M3 | Worktree manager and home-worktree warnings | ✅ create/list/remove and `run` smoke-tested |
-| M4 | Leases and pre-merge check | — |
-| M5 | OpenCode adapter, spawning and approvals | — |
-| M6 | Read-only window *(first usable slice)* | — |
-| M7 | Chat, dialogs, approvals, **Move** | — |
+| M4 | Leases and pre-merge check | ✅ |
+| M5 | OpenCode adapter, spawning and approvals | ✅ |
+| M6 | Read-only window *(first usable slice)* | ✅ |
+| M7 | Chat, dialogs, window approval controls, **Move** | — |
 | M8 | Model API adapter *(other vendors postponed)* | — |
 
 All 14 assumptions were checked and all 3 open decisions were closed on 2026-11-23. M0 then confirmed the worktree-identity and shared-git-metadata assumptions against real tools; results are in [`plan.md`](plan.md), section 0. Section 17 holds the research evidence — the source of truth for task checklists and estimates.
@@ -315,7 +318,7 @@ Artinarey is licensed under the **GNU General Public License, version 3 (GPL-3.0
 
 `SPDX-License-Identifier: GPL-3.0-only`
 
-This is a strong copyleft license: if you distribute a derivative work, you must make its source available under the same terms. Dependencies are pinned in the workspace manifests; GPL compatibility has not been audited — check before publishing.
+This is a strong copyleft license: if you distribute a derivative work, you must make its source available under the same terms. Dependencies are pinned in the workspace manifests, and the direct dependencies with their declared MIT or Apache-2.0 licenses are listed in [`NOTICE`](NOTICE). Security trackers and release cadence have not been audited — check before publishing.
 
 ---
 

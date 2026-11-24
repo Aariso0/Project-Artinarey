@@ -10,6 +10,7 @@ export type ToolInvoker = (
 export const TOOL_NAMES = [
   'check_in', 'claim_persona', 'inbox', 'read_mail',
   'send_mail', 'mark_done', 'report', 'worktrees',
+  'task_update', 'request_scope', 'assign_task', 'request_session',
 ] as const;
 
 const mailKinds = [
@@ -94,6 +95,47 @@ export function createShimServer(invoke: ToolInvoker): McpServer {
     description: 'List this project\'s worktrees read-only.',
     inputSchema: z.object({}),
   }, async () => toMcp(await invoke('worktrees', {})));
+
+  server.registerTool('assign_task', {
+    description: 'Senior dev only: create a task with a scope and mail the assignee.',
+    inputSchema: z.object({
+      persona_id: z.string().min(1),
+      title: z.string().min(1),
+      scope: z.array(z.string().min(1)).min(1),
+      body: z.string().min(1),
+    }),
+  }, async (params) => toMcp(await invoke('assign_task', params)));
+
+  server.registerTool('request_scope', {
+    description: 'Ask the senior dev for more scope on your task (overlap is checked).',
+    inputSchema: z.object({
+      task_id: z.string().min(1),
+      paths: z.array(z.string().min(1)).min(1),
+      reason: z.string().min(1),
+    }),
+  }, async (params) => toMcp(await invoke('request_scope', params)));
+
+  server.registerTool('task_update', {
+    description: 'Update the status of a task assigned to you.',
+    inputSchema: z.object({
+      task_id: z.string().min(1),
+      status: z.enum(['in_progress', 'blocked', 'ready_for_review', 'done']),
+      note: z.string(),
+    }),
+  }, async (params) => toMcp(await invoke('task_update', params)));
+
+  server.registerTool('request_session', {
+    description: 'Senior dev only: spawn a persona in a worktree for a leased task.',
+    inputSchema: z.object({
+      role: z.string().min(1).optional(),
+      persona_id: z.string().min(1).optional(),
+      task_id: z.string().min(1),
+      vendor: z.string().min(1).optional(),
+      worktree_id: z.string().min(1).optional(),
+    }).refine((v) => Boolean(v.role || v.persona_id), {
+      message: 'provide role or persona_id',
+    }),
+  }, async (params) => toMcp(await invoke('request_session', params)));
 
   return server;
 }

@@ -1,0 +1,24 @@
+{
+  "identifier": "com.artinarey.gui",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Artinarey",
+        "width": 1280,
+        "height": 800
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": ["icons/icon.png"]
+  }
+}

@@ -1,7 +1,7 @@
 # Project-Artinarey: Plan
 
-> **Next action:** start **M4, leases and enforcement** (section 15, M4). M0–M3 are implemented and verified; no M4+ work is started here.
-> **Status:** design settled; M0–M3 built and verified, M4+ not started. Plan date: 2026-11-23. All 15 design questions, the 3 open questions and the 14 unverified assumptions were resolved on 2026-11-23; several answers changed the design (section 17).
+> **Next action:** start **M7, full window and Move** (section 15, M7). M0–M6 are implemented and verified; no M7+ work is started here.
+> **Status:** design settled; M0–M6 built and verified, M7+ not started. Plan date: 2026-11-23. All 15 design questions, the 3 open questions and the 14 unverified assumptions were resolved on 2026-11-23; several answers changed the design (section 17).
 > **Estimates** are my guesses, not measurements. Treat them as ±50%.
 > **Evidence** for every checked assumption is in section 17. Where evidence contradicted the design, the decision log (section 2) records what replaced it.
 
@@ -11,7 +11,7 @@
 
 Legend: ⬜ not started · 🟨 in progress · ✅ done · 🟥 blocked
 
-**Overall:** `████░░░░░░░░░░░░░░` 4 of 9 milestones done · **Slice 1 (M0–M6):** 4 of 7 done
+**Overall:** `███████░░░░░░░░░░░` 7 of 9 milestones done · **Slice 1 (M0–M6):** 7 of 7 done
 
 | M | Goal | Estimate | Status | Part of |
 |---|---|---|---|---|
@@ -19,9 +19,9 @@ Legend: ⬜ not started · 🟨 in progress · ✅ done · 🟥 blocked
 | M1 | Store, mail files, registry, daemon skeleton | 1–1.5 d | ✅ | Slice 1 |
 | M2 | MCP shim, tools, identity by folder | 1 d | ✅ | Slice 1 |
 | M3 | Worktree manager, home-worktree warnings, `run` | 1 d | ✅ | Slice 1 |
-| M4 | Leases, git hook, pre-merge check | 1 d | ⬜ | Slice 1 |
-| M5 | OpenCode adapter, spawn cap, role cards | 2 d | ⬜ | Slice 1 |
-| M6 | Read-only desktop window | 1.5 d | ⬜ | Slice 1 |
+| M4 | Leases, git hook, pre-merge check | 1 d | ✅ | Slice 1 |
+| M5 | OpenCode adapter, spawn cap, approvals | 2 d | ✅ | Slice 1 |
+| M6 | Read-only desktop window | 1.5 d | ✅ | Slice 1 |
 | M7 | Full window: chat, dialogs, approvals, **Move** | 4–5 d | ⬜ | Slice 2 |
 | M8 | Model API adapter (other vendors postponed) | 2 d | ⬜ | Slice 2 |
 
@@ -30,7 +30,7 @@ How to use this board: when you finish a task inside a milestone (section 15), t
 ### Decision tracker
 - **Made:** 15 of 15 questions (section 2), plus the 3 open questions and the follow-up decisions below, all on 2026-11-23.
 - **Open questions resolved:** cap = 3 running sessions **per project** (soft; over-cap needs your approval); marker = `.artinarey.json`; senior dev spawns under the cap without asking, and may also assign work directly to an idle persona on the same branch.
-- **Follow-up decisions:** containment is worktree-only with user-approved exceptions; the auto-approve toggle is user-only, per worktree, OFF by default, enforced in Artinarey's shim; blocked sessions wait indefinitely with desktop notifications at 0/5/15 minutes; approval happens in the GUI or CLI depending on how the agent was launched; the native Tauri shell proxies daemon calls; pidfd replaces parent-pid liveness; OpenCode is the only vendor for now, with a separate model-API adapter using a configurable base URL.
+- **Follow-up decisions:** containment is worktree-only with user-approved exceptions; the auto-approve toggle is user-only, per worktree, OFF by default, enforced in Artinarey's shim; blocked sessions wait indefinitely with desktop notifications at 0/5/15 minutes; approval happens in the GUI or CLI depending on how the agent was launched; the native Tauri shell proxies daemon calls; socket-close with a pid cross-check replaces parent-pid liveness (Node 26 has no pidfd API); OpenCode is the only vendor for now, with a separate model-API adapter using a configurable base URL.
 
 ### Verification tracker
 Each row flips to ✅ verified, or 🟥 failed (then the fallback in the last column applies). Details in section 17.
@@ -50,7 +50,7 @@ Each row flips to ✅ verified, or 🟥 failed (then the fallback in the last co
 | U11 | Which MCP clients use the 2026-07-28 revision | M2 | ✅ | OpenCode probes or opts in; Claude Code needs the v2 runtime; Codex unconfirmed. The stateless shim supports both revisions. |
 | U12 | Name "Artinarey" is free | before publishing | ✅ | No footprint in npm, PyPI, crates.io, GitHub or `.com` RDAP on 2026-11-23. Negative evidence, not proof. |
 | U13 | OS is Linux | M1 | ✅ | User confirmed on 2026-11-23: Linux for now. |
-| U14 | Parent-pid liveness as release signal | M2 | 🟥 | `ppid` changes on reparenting and PIDs are reused. Use pidfd (section 6). Node 26 has no pidfd API yet; M2 releases on shim socket close with a pid liveness cross-check (section 15). |
+| U14 | Parent-pid liveness as release signal | M2 | 🟥 | `ppid` changes on reparenting and PIDs are reused. Use socket-close plus a pid cross-check (section 6). Node 26 has no pidfd API; M2/M5 release on shim socket close with a `process.kill(pid, 0)` liveness cross-check (section 15). |
 
 ### Spike results (fill in during M0)
 
@@ -132,7 +132,7 @@ Why it exists:
 | Persona | Assignment | The senior dev may spawn new independent sessions or assign work to an idle persona on the same branch (priority). It must be active to assign, or you assign directly. Direct assignments still get lease checks. The senior dev cannot delete personas. |
 | API | Model access | OpenCode only for now. A separate adapter process calls a model API through a configurable base URL; the daemon still has no LLM and no outbound calls. |
 | GUI | Daemon auth | The webview holds no secret. The native Tauri shell proxies daemon calls, and the daemon checks a per-platform Origin allowlist. |
-| Liveness | Session release | A pidfd-based process handle, not the parent PID. Manual force-release stays. |
+| Liveness | Session release | Shim socket close plus a pid cross-check, not the parent PID. Manual force-release stays. |
 | Trust | Socket role | **Coordination, not authorization.** Agents are cooperative peers under one OS user; the socket stops them overwriting each other. An agent acts only as the persona bound to its directory. Starting another persona in a worktree with an active agent or pending work requires your approval. An active agent holds an exclusive worktree lock until it is stopped or you force-release it. |
 
 ### Interactions between decisions (read these)
@@ -204,7 +204,6 @@ project-artinarey/
       api/           M8  model API via configurable base URL
     opencode-plugin/ lease guard (M4/M5)
   apps/gui/          Tauri + React
-  assets/roles/      role cards (senior-dev, developer, researcher, tester)
   docs/
   README.md  plan.md  logo.py
 ```
@@ -278,7 +277,7 @@ Rules the daemon enforces (`MAIL_REJECTED` with the reason):
 3. Secret-pattern tripwire (keys, tokens, `.env` lines). A tripwire, not a scanner.
 4. Recipients must exist and the sender must be allowed to mail them (section 10).
 5. No pasted source over 40 lines; link to the path instead.
-Style (shared with chatter): ACTION first, numbered steps, time estimates, no preamble.
+Style: ACTION first, numbered steps, time estimates, no preamble.
 
 ### Write protocol (crash safety)
 1. Daemon takes the project write lock (in-process; one daemon).
@@ -300,7 +299,7 @@ Style (shared with chatter): ACTION first, numbered steps, time estimates, no pr
 - Naming note: you first called this `persona.json`. The per-persona file with that name now lives in the store. The marker keeps a different name so the two are never confused. Renaming it is a one-line change if you prefer.
 
 ### Resolving "who is calling" (every MCP call)
-1. Shim reads `process.cwd()` and opens a stable process handle (pidfd) for liveness. OpenCode docs say the MCP `cwd` defaults to the workspace/project folder; M0 confirms it with real worktrees.
+1. Shim reads `process.cwd()` and holds one long-lived socket; the daemon cross-checks the forwarded pid with `process.kill(pid, 0)` (no pidfd API in Node 26). OpenCode docs say the MCP `cwd` defaults to the workspace/project folder; M0 confirms it with real worktrees.
 2. Shim walks up from `cwd` to find `.artinarey.json`. None: `NO_PROJECT`.
 3. Daemon looks up `worktree_id`. It checks that the marker directory's realpath equals the registered path and the branch matches. Else `WORKTREE_UNMANAGED`.
 4. Daemon finds the persona bound to that worktree. None: the caller must `check_in` and `claim_persona`.
@@ -309,7 +308,7 @@ Style (shared with chatter): ACTION first, numbered steps, time estimates, no pr
 ### Persona lifecycle
 `new` → `idle` ⇄ `active (bound to one directory)` → `retired`.
 - **One active persona per directory.** A second claim returns `DIRECTORY_BUSY`.
-- **Release** happens when: the shim disconnects and a pidfd reports the process is gone, the `artinarey run` wrapper exits, the GUI session ends, or the user force-releases in GUI or CLI. Parent PID is not used: it changes on reparenting and can be reused.
+- **Release** happens when: the shim socket closes and the pid is gone, the `artinarey run` wrapper exits, the GUI session ends, or the user force-releases in GUI or CLI. Parent PID is not used: it changes on reparenting and can be reused.
 - **Take over** (user only): GUI or `artinarey release <worktree> --force`.
 
 ### Several personas, one worktree
@@ -472,7 +471,7 @@ Claude Code, Codex and Antigravity are postponed, not cancelled. Verified blocke
 Revisit after M8 with explicit trust and credential provisioning.
 
 ### Supervision
-- The daemon records a pidfd-based process handle, start time, vendor, worktree, persona for each session in `sessions.jsonl` and the registry. Parent PID is not used: reparenting changes it and PIDs are reused.
+- The daemon records the serve pid, start time, vendor, worktree and persona for each session in `sessions.jsonl` and the registry. Liveness is socket-close plus `process.kill(pid, 0)`; parent PID is not used because reparenting changes it and PIDs are reused. No pidfd/native binding.
 - Spawned processes are detached so a daemon restart does not kill them; on startup the daemon re-adopts live handles and marks dead ones `failed`. Manual force-release stays.
 - Full session logs go under `~/.cache/artinarey/logs/` (large, disposable, not part of the moved store). Only summaries go in the store.
 
@@ -572,7 +571,7 @@ Slice 1 has a read-only window: Projects, Personas, Worktrees, Mail list. Chat, 
 3. Secret-pattern tripwire on mail.
 4. Append-only audit of mail, spawns, approvals, toggle flips, takeovers, mismatches, and moves.
 5. Shim permission hook (`permission.evaluate` can `deny`) gates edit calls and calls that reach outside the assigned worktree. The per-worktree toggle is user-only and defaults to OFF.
-6. Spawn cap, role-based tool permissions, deterministic overlap check, pidfd-based liveness.
+6. Spawn cap, role-based tool permissions, deterministic overlap check, socket-close plus pid liveness.
 7. No network client in the daemon except to localhost (enforced by a lint rule and review); the separate API adapter is the only outbound caller.
 
 ### Accepted risks (you chose these)
@@ -678,48 +677,52 @@ Implementation deviation (no decision changes): Node 26 exposes no pidfd API. Th
 **Notes / blockers:** 116 tests pass; `pnpm test`, `pnpm typecheck`, `pnpm lint`, `pnpm build` all green. Real CLI smoke check in a fresh temp git repo with isolated XDG roots: `init` → `worktree list` → `worktree new smoke --yes` → `worktree list` → `worktree remove smoke` → `worktree list` all exited 0; two managed rows appeared and list returned to one after removal. Tracked files and `.gitignore` were unchanged, no generated `opencode.json`, `.env*` or registry artifacts landed in the checkout, and the temp repo was removed.
 
 ### M4 · Leases and enforcement
-**Status:** ⬜ · **Estimate:** 1 d · **Depends on:** M3 · **Checks:** U3
+**Status:** ✅ · **Estimate:** 1 d · **Depends on:** M3 · **Checks:** U3
 
-- [ ] Task journal; tools 8, 9, 11 (`task_update`, `request_scope`, `assign_task`)
-- [ ] Overlap checker, including undecidable globs treated as overlap, with tests
-- [ ] `shared_files` serialisation
-- [ ] Pre-commit hook in the shared hooks directory; `core.hooksPath` detection; `artinarey lease-check`
-- [ ] `artinarey verify <branch>`
-- [ ] OpenCode plugin lease guard using `permission.evaluate` (U3 confirmed)
+- [x] Task journal; tools 8, 9, 11 (`task_update`, `request_scope`, `assign_task`)
+- [x] Overlap checker, including undecidable globs treated as overlap, with tests
+- [x] `shared_files` serialisation
+- [x] Pre-commit hook in the shared hooks directory; `core.hooksPath` detection; `artinarey lease-check`
+- [x] `artinarey verify <branch>`
+- [x] OpenCode plugin lease guard using `permission.evaluate` (U3 confirmed)
 
 **Done when:** overlap is rejected and a `--no-verify` commit is caught by `verify`.
-**Notes / blockers:**
+**Notes / blockers:** 245 tests pass and all four gates green. Integration test commits a file outside the lease and confirms `verify` rejects the branch. The OpenCode V2 plugin exports a plain `{ id, setup }` object (`Plugin.define` is an identity helper), so no plugin SDK dependency was added; picomatch is the only new dependency.
 
 ### M5 · OpenCode adapter and spawning
-**Status:** ⬜ · **Estimate:** 2 d · **Depends on:** M4 · **Checks:** U4, U9
+**Status:** ✅ · **Estimate:** 2 d · **Depends on:** M4 · **Checks:** U4, U9
 
-- [ ] Manage one `opencode serve` instance
-- [ ] Create a session scoped to a worktree directory; capture the session id (A2 a)
-- [ ] First prompt built from role card, handoff note, task, scope
-- [ ] Shim permission hook: risky-call detection, per-worktree toggle, pending approvals
-- [ ] Tool 12 `request_session`; cap 3 per project; over-cap warning and CLI approval path
-- [ ] CLI approval commands (`approvals`, `approve`) and OS desktop notifications at 0/5/15 minutes
-- [ ] Supervision: pidfd handles, re-adopt after daemon restart, logs under the cache folder
-- [ ] Refuse to spawn into a worktree with an active persona or pending work unless the user approves; the card shows project, worktree, persona and pending item
-- [ ] Durable claim generations and conditional ownership updates across CLI and daemon, with reconciliation for interrupted Git lock transfers; keep `release_force` and shutdown behind operator authorization
-- [ ] Role cards: senior dev, developer, researcher, tester
-- [ ] **Record the accepted risk:** section 13 containment limits documented in the README; an OS sandbox stays out of scope unless you reopen it
+- [x] Manage one `opencode serve` instance
+- [x] Create a session scoped to a worktree directory; capture the session id (A2 a)
+- [x] First prompt built from role card, handoff note, task, scope
+- [x] Shim permission hook: risky-call detection, per-worktree toggle, pending approvals
+- [x] Tool 12 `request_session`; cap 3 per project; over-cap warning and CLI approval path
+- [x] CLI approval commands (`approvals`, `approve`) and OS desktop notifications at 0/5/15 minutes
+- [x] Supervision: socket-close plus pid liveness (no pidfd API), re-adopt after daemon restart, logs under the cache folder
+- [x] Refuse to spawn into a worktree with an active persona or pending work unless the user approves; the card shows project, worktree, persona and pending item
+- [x] Durable claim generations and conditional ownership updates across CLI and daemon, with reconciliation for interrupted Git lock transfers; keep operator-only daemon actions (`shutdown`, approvals, `stop_session`, `release_force`) behind operator authorization
+- [x] Role instructions are read from the user config directory at runtime, not committed here
+- [x] **Record the accepted risk:** section 13 containment limits documented in the README; an OS sandbox stays out of scope unless you reopen it
 
 **Done when:** a senior dev spawns a developer in a worktree and the cap holds.
-**Notes / blockers:**
+**Notes / blockers:** 287 tests pass and all four gates green (`pnpm run typecheck`, `pnpm test`, `pnpm run lint`, `pnpm build`). A senior dev spawns a developer in a worktree with the role card, handoff, task and lease in the first prompt; the fourth concurrent spawn returns `CAP_REACHED` with an approval id, and `artinarey approve <id>` resumes it (rejecting leaves the cap intact). Risky shell calls and out-of-worktree directories create a pending approval and block until the user decides; the toggle is user-only, per worktree, OFF by default, and never auto-allows out-of-worktree calls. Notifications fire at 0/5/15 minutes via `/usr/bin/notify-send`. The daemon owns all approval state; the plugin mirrors the decision into OpenCode's `permission.evaluate`. Direct REST with `fetch` and `location.directory` replaces the SDK; one `opencode serve` handles many worktrees, and the registry is the truth. No SDK, notifier library, native pidfd binding or extra plugin dependency was added. Role instructions are supplied at runtime from `ARTINAREY_ROLES_DIR` or the user config directory; no role-card files are committed here. Durable claim lines, conditional release and interrupted Git-lock reconciliation were already shipped in M2–M4. NOTICE lists the direct dependencies and their declared licenses; security trackers and release cadence remain unverified.
 
 ### M6 · Read-only window (Slice 1 complete)
-**Status:** ⬜ · **Estimate:** 1.5 d · **Depends on:** M5 · **Checks:** U10
+**Status:** ✅ · **Estimate:** 1.5 d · **Depends on:** M5 · **Checks:** U10
 
-- [ ] Tauri v2 scaffold with React and Vite
-- [ ] Native Tauri command proxy; no token in the webview; daemon Host and Origin allowlist checks
-- [ ] Projects screen: store path, size, free space, status chip
-- [ ] Personas, Worktrees, Mail list (read-only)
-- [ ] Theme (GitHub-dark plus Claude orange) and the logo
-- [ ] Slice 1 acceptance run: senior dev and two developers on one project, seen in the window
+- [x] Tauri v2 scaffold with React and Vite
+- [x] Native Tauri command proxy; no token in the webview; daemon Host and Origin allowlist checks
+- [x] Projects screen: store path, size, free space, status chip
+- [x] Personas, Worktrees, Mail list (read-only)
+- [x] Theme (GitHub-dark plus Claude orange) and the logo
+- [x] Slice 1 acceptance run: senior dev and two developers on one project, seen in the window
 
 **Done when:** the acceptance run works end to end.
-**Notes / blockers:**
+**Notes / blockers:** Acceptance used a seeded fixture in the two GUI test files, not a live spawn. M5 already proved live spawning. Fixture: one project `Gui`; worktrees `main`, `artinarey/dev0`, `artinarey/dev1`; agents `Senior Dev` (`senior-dev`), `Dev Zero` (`dev0`) and `Dev One` (`dev1`); mail `Subject 1` → `senior-dev` at `2026-11-24T12:00:00.000Z`, `Subject 2` → `dev0` at `12:00:01.000Z`, `Subject 3` → `dev1` at `12:00:02.000Z`. Focused run `node --import tsx --test packages/daemon/src/gui.test.ts apps/gui/src/gui.test.ts`: `ℹ tests 19`, `ℹ pass 19`, `ℹ fail 0`, `ℹ cancelled 0`, `ℹ skipped 0`, `ℹ todo 0`, `ℹ duration_ms 264.307145`. All four `gui.*` methods returned `ok: true` with exactly the seeded rows; the recursive field check found no `body`, `token`, `secret`, `read`, `unread`, `isRead`, `readAt`, `readState` or `hasRead` key, and the serialized results did not contain the seeded body text `private body`. The frontend render showed all three names, all three subjects and all three recipients, with no `input`, `textarea`, `select`, `button`, `form`, inline event handler or mutating-action marker.
+
+Final gate outputs (all exit 0): `pnpm run typecheck` — no diagnostics; `pnpm test` — `ℹ tests 318`, `ℹ pass 318`, `ℹ fail 0`, `ℹ cancelled 0`, `ℹ skipped 0`, `ℹ todo 0`, `ℹ duration_ms 2256.324711`; `pnpm run lint` — no diagnostics; `pnpm build` — no diagnostics; `pnpm run test:gui` — three `test result: ok` summaries (lib 0, main 0, doc-tests 0) and `proxy_test` `test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`; `pnpm run build:gui` — `vite v8.3.8`, `✓ 20 modules transformed.`, `dist/index.html 0.39 kB`, `dist/assets/index-iUTc6blO.css 3.28 kB`, `dist/assets/index-WBFLG6RW.js 226.15 kB`, `✓ built in 189ms`; `cargo build --manifest-path apps/gui/src-tauri/Cargo.toml` — ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.46s``; privacy check — clean (`PRIVACY: clean. No private agent files or references found.`)
+
+Native window launch was possible in this environment: `DISPLAY=:0`, `WAYLAND_DISPLAY=wayland-1`, `XDG_SESSION_TYPE=wayland`, `/tmp/.X11-unix/X0` and `/run/user/1000/wayland-1` exist, and `command -v Xvfb` found nothing. `timeout 15s` on the built binary exited 124 (still running, no stderr). With `WAYLAND_DISPLAY` unset, launching on `DISPLAY=:0` added `0x1200003` to `_NET_CLIENT_LIST` while the process ran; that id returned `BadWindow` after the process was stopped. No screenshot was captured, so visual rendering was not independently inspected. Security trackers and release cadence remain unverified. Dependency notices were verified against installed npm metadata and Cargo metadata before updating `NOTICE`. Implementation plan: `docs/plans/2026-11-24-m6-read-only-window.md`.
 
 ### M7 · Full window and Move
 **Status:** ⬜ · **Estimate:** 4–5 d · **Depends on:** M6
@@ -784,7 +787,7 @@ All 14 assumptions and all 3 open questions were resolved on **2026-11-23** agai
 11. **U11 — VERIFIED.** OpenCode probes or opts into the 2026-07-28 revision; Claude Code needs the v2 runtime; Codex is unconfirmed. Roots are deprecated, not removed. The stateless shim supports both revisions. Evidence: `modelcontextprotocol.io/specification/2026-07-28/changelog`, `opencode.ai/docs/mcp-servers`, `code.claude.com/docs/en/mcp`, `developers.openai.com/codex/mcp`.
 12. **U12 — NO FOOTPRINT FOUND.** 0 npm, PyPI, crates.io and GitHub results and no `.com` RDAP record on 2026-11-23. Negative evidence, not proof of global nonexistence.
 13. **U13 — VERIFIED.** User confirmed Linux for now; XDG paths and a unix socket are valid. Revisit for macOS/Windows.
-14. **U14 — CONTRADICTED.** On reparenting, `ppid` changes to init or a subreaper, and PIDs are reused. Use a pidfd-based handle; manual force-release stays. Evidence: `man7.org/linux/man-pages/man2/getppid.2.html`, `PR_SET_CHILD_SUBREAPER.2const.html`, `pidfd_send_signal.2.html`.
+14. **U14 — CONTRADICTED.** On reparenting, `ppid` changes to init or a subreaper, and PIDs are reused. Use socket-close plus a pid cross-check; manual force-release stays. Node 26 has no pidfd API and the user confirmed this fallback governs M5. Evidence: `man7.org/linux/man-pages/man2/getppid.2.html`, `PR_SET_CHILD_SUBREAPER.2const.html`, `pidfd_send_signal.2.html`, and the settled M4–M6 evidence record.
 
 ### Resolved open questions
 1. **Spawn cap:** 3 running sessions **per project**, soft. Over the cap, show a warning phrased around token consumption (not measured); you may proceed, the senior dev waits for your approval.
@@ -830,3 +833,4 @@ Add one line per working session: date, what moved, what is next.
 | 2026-11-23 | M1 foundation implemented: pnpm monorepo, core store/mail/registry/index, daemon socket API, CLI reindex and daemon commands. 41 tests pass including the 50-way concurrency and kill -9 recovery gates. | M2 MCP shim and identity by folder |
 | 2026-11-24 | M2 MCP shim implemented: stdio MCP server, folder-based identity, tools 1–7 and 13, roster and release rules, `connect opencode`. 69 tests pass and all four gates are green; two real OpenCode sessions in separate directories exchanged mail both ways. | M3 worktree manager |
 | 2026-11-24 | M3 worktree manager implemented: porcelain parser and reconciliation, `init`, `worktree new/adopt/list/remove` with port offsets and binding locks, home-worktree warnings, `run <vendor>` and `persona rehome`. 116 tests pass and all four gates are green; six-command CLI smoke check passed in a fresh temp repo with isolated XDG roots. | M4 leases and enforcement |
+| 2026-11-24 | M4–M6 complete: leases and pre-merge check, OpenCode adapter with spawning and approvals, and the M6 read-only Tauri window. Acceptance fixture (one senior dev, two developers, three worktrees, three mail rows) passes; 318 tests pass, 17 Rust tests pass, all eight gates green, and the native binary launched on the available display. | M7 full window and Move |

@@ -1,7 +1,5 @@
 # M3 — Worktree Manager and Home-Worktree Rule Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Make worktrees first-class: parse and reconcile git's view, create/adopt/list/remove them from the CLI, and enforce the home-worktree rule from the terminal.
 
 **Architecture:** Pure parsing and reconciliation live in `core`, git mutations live in a small `core` action module, and the CLI is a thin shell over both. The daemon keeps its M2 binding rules; M3 adds git lock/unlock and a user-facing rehome command without changing the settled identity model.
