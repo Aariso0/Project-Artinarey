@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { Bell, ChatCircle, Gear, SquaresFour } from '@phosphor-icons/react';
 import type {
@@ -101,6 +101,45 @@ export async function loadSnapshots(api: GuiApi, projectId: string, recipient: s
   return {
     projects, personas, worktrees, mail, tasks, leases, sessions, preMerge,
     audit, approvals, storage,
+  };
+}
+
+type LiveScope = { scope: Scope; version: number };
+
+/** Only the newest scope load may publish snapshots; refresh never claims this guard. */
+export function createScopeGuard() {
+  let seq = 0;
+  return {
+    next: () => ++seq,
+    isCurrent: (claimed: number) => claimed === seq,
+    apply(claimed: number, active: boolean, next: Snapshots, setSnapshots: (value: Snapshots) => void) {
+      if (!active || claimed !== seq) return false;
+      setSnapshots(next);
+      return true;
+    },
+  };
+}
+
+/**
+ * Refresh reads the live loaded scope and drops replies whose scope changed while
+ * the request was in flight, so a late action cannot overwrite a newer scope.
+ */
+export function refreshLoadedScope(
+  loadAll: (projectId: string, recipient: string) => Promise<Snapshots>,
+  liveScope: { current: LiveScope },
+  setSnapshots: (next: Snapshots) => void,
+  setError: (error: DaemonError) => void,
+): () => void {
+  let seq = 0;
+  return () => {
+    const started = liveScope.current;
+    const claimed = ++seq;
+    void loadAll(started.scope.projectId, started.scope.recipient).then((next) => {
+      if (claimed !== seq || liveScope.current.version !== started.version) return;
+      setSnapshots(next);
+    }).catch((err) => {
+      if (claimed === seq && liveScope.current.version === started.version) setError(typedError(err));
+    });
   };
 }
 
@@ -418,28 +457,33 @@ export function App({ api, initial, initialError }: AppProps) {
     initialScopeState,
   );
   const scopeRequest = scopeState.request;
-  const loadSeq = useRef(0);
+  const scopeGuard = useRef(createScopeGuard());
+  const liveScope = useRef<LiveScope>({ scope: scopeState.loaded, version: 0 });
 
   const loadAll = useCallback(
     (projectId: string, recipient: string) => loadSnapshots(api, projectId, recipient),
     [api],
   );
 
-  const activeProject = scopeState.loaded.projectId;
-  const activeRecipient = scopeState.loaded.recipient;
+  useEffect(() => {
+    const current = liveScope.current.scope;
+    if (current.projectId !== scopeState.loaded.projectId
+      || current.recipient !== scopeState.loaded.recipient) {
+      liveScope.current = { scope: scopeState.loaded, version: liveScope.current.version + 1 };
+    }
+  }, [scopeState.loaded]);
 
   useEffect(() => {
     if (initial || initialError) return;
     let active = true;
-    const seq = ++loadSeq.current;
+    const seq = scopeGuard.current.next();
     void (async () => {
       try {
         const projects = await api.projects();
         const projectId = projects[0]?.id ?? '';
-        if (!active || seq !== loadSeq.current) return;
+        if (!active || !scopeGuard.current.isCurrent(seq)) return;
         const next = await loadAll(projectId, ALL_RECIPIENTS);
-        if (!active || seq !== loadSeq.current) return;
-        setSnapshots(next);
+        if (!scopeGuard.current.apply(seq, active, next, setSnapshots)) return;
         dispatchScope({ type: 'loadSucceeded', scope: { projectId, recipient: ALL_RECIPIENTS } });
       } catch (err) {
         if (active) setError(typedError(err));
@@ -453,13 +497,12 @@ export function App({ api, initial, initialError }: AppProps) {
   useEffect(() => {
     if (!scopeRequest) return;
     let active = true;
-    const seq = ++loadSeq.current;
+    const seq = scopeGuard.current.next();
     setScopeLoading(true);
     void (async () => {
       try {
         const next = await loadAll(scopeRequest.projectId, scopeRequest.recipient);
-        if (!active || seq !== loadSeq.current) return;
-        setSnapshots(next);
+        if (!scopeGuard.current.apply(seq, active, next, setSnapshots)) return;
         setError(null);
         dispatchScope({ type: 'loadSucceeded', scope: scopeRequest });
       } catch (err) {
@@ -474,14 +517,10 @@ export function App({ api, initial, initialError }: AppProps) {
     return () => { active = false; };
   }, [api, scopeRequest, loadAll]);
 
-  const refresh = useCallback(() => {
-    const seq = ++loadSeq.current;
-    void loadAll(activeProject, activeRecipient).then((next) => {
-      if (seq === loadSeq.current) setSnapshots(next);
-    }).catch((err) => {
-      if (seq === loadSeq.current) setError(typedError(err));
-    });
-  }, [loadAll, activeProject, activeRecipient]);
+  const refresh = useMemo(
+    () => refreshLoadedScope(loadAll, liveScope, setSnapshots, setError),
+    [loadAll],
+  );
 
   const clearError = useCallback((next: DaemonError) => {
     setError(next.code && next.message ? next : null);

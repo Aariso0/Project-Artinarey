@@ -6,8 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import {
-  App, AppView, initialScopeState, loadSnapshots, mailRecipientOptions, scopeReducer,
-  scopedMailQuery, typedError, type ScopeState, type Snapshots,
+  App, AppView, createScopeGuard, initialScopeState, loadSnapshots, mailRecipientOptions,
+  refreshLoadedScope, scopeReducer, scopedMailQuery, typedError, type ScopeState, type Snapshots,
 } from './App.tsx';
 import { createApi, type DaemonError, type GuiApi, type InvokeFn } from './api.ts';
 import {
@@ -403,4 +403,89 @@ test('mail metadata never renders a private body or read-state field', () => {
   const html = renderApp();
   assert.doesNotMatch(html, /private body/i);
   assert.doesNotMatch(html, /\b(readAt|readState|hasRead|isRead)\b/i);
+});
+
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+};
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((accept, fail) => { resolve = accept; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+function liveScope(projectId: string, version = 0) {
+  return { current: { scope: { projectId, recipient: 'all' }, version } };
+}
+
+test('a refresh started in one scope does not write snapshots or errors after the loaded scope switches', async () => {
+  const scope = liveScope('project-1');
+  const requests: Array<{ scope: string; result: Deferred<Snapshots> }> = [];
+  const written: Snapshots[] = [];
+  const errors: DaemonError[] = [];
+  const refresh = refreshLoadedScope(
+    (projectId, recipient) => {
+      const result = deferred<Snapshots>();
+      requests.push({ scope: `${projectId}:${recipient}`, result });
+      return result.promise;
+    },
+    scope,
+    (next) => { written.push(next); },
+    (error) => { errors.push(error); },
+  );
+
+  refresh();
+  refresh();
+  assert.deepEqual(requests.map((request) => request.scope), ['project-1:all', 'project-1:all']);
+
+  scope.current = { scope: { projectId: 'project-2', recipient: 'all' }, version: 1 };
+  requests[0].result.resolve({ ...snapshots, tasks: [] });
+  requests[1].result.reject({ code: 'STALE_SCOPE', message: 'old scope' });
+  await flush();
+  assert.equal(written.length, 0, 'a late reply from the old scope must not overwrite the new one');
+  assert.deepEqual(errors, [], 'a late error from the old scope must not be reported');
+
+  refresh();
+  assert.deepEqual(requests.map((request) => request.scope),
+    ['project-1:all', 'project-1:all', 'project-2:all']);
+  requests[2].result.resolve({ ...snapshots, storage: null });
+  await flush();
+  assert.equal(written.length, 1, 'a refresh in the current scope still writes');
+  assert.equal(written[0].storage, null);
+
+  refresh();
+  requests[3].result.reject({ code: 'CURRENT_SCOPE', message: 'new scope' });
+  await flush();
+  assert.deepEqual(errors, [{ code: 'CURRENT_SCOPE', message: 'new scope' }],
+    'a refresh error in the current scope is still reported');
+});
+
+test('a refresh completing during a pending scope load does not drop that successful load', async () => {
+  const guard = createScopeGuard();
+  const scopeLoad = guard.next();
+  const scope = liveScope('project-1');
+  const refreshResult = deferred<Snapshots>();
+  const written: Snapshots[] = [];
+  const refresh = refreshLoadedScope(
+    () => refreshResult.promise,
+    scope,
+    (next) => { written.push(next); },
+    () => {},
+  );
+
+  refresh();
+  refreshResult.resolve({ ...snapshots, tasks: [] });
+  await flush();
+  assert.equal(written.length, 1, 'the refresh applies when the loaded scope is unchanged');
+
+  const scopeSnapshots: Snapshots = { ...snapshots, storage: null };
+  assert.ok(guard.apply(scopeLoad, true, scopeSnapshots, (next) => { written.push(next); }),
+    'the pending scope load is still current after the refresh');
+  assert.equal(written[1], scopeSnapshots, 'the successful scope load is applied, not discarded');
 });
