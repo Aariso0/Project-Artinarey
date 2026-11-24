@@ -460,7 +460,7 @@ test('GUI actions validate input and keep user decisions on the daemon side', as
   if (!relativeMove.ok) assert.equal(relativeMove.error.code, 'INVALID_INPUT');
 });
 
-test('pre-merge compares a checked-out branch against an independent base', async (t) => {
+test('pre-merge compares a branch against main and applies lease coverage', async (t) => {
   const s = setupAcceptance(t);
   const repo = join(s.root, 'repo');
   mkdirSync(repo, { recursive: true });
@@ -479,26 +479,34 @@ test('pre-merge compares a checked-out branch against an independent base', asyn
   const worktreePath = join(s.root, 'branch-wt');
   git(['worktree', 'add', '-q', '-b', branch, worktreePath]);
   writeFileSync(join(worktreePath, 'outside.ts'), 'outside the lease\n');
-  git(['add', 'outside.ts'], worktreePath);
+  mkdirSync(join(worktreePath, 'src', 'nested'), { recursive: true });
+  writeFileSync(join(worktreePath, 'src', 'nested', 'gate.ts'), 'nested file\n');
+  git(['add', 'outside.ts', 'src/nested/gate.ts'], worktreePath);
   commit(worktreePath);
   s.registry.worktrees.upsert({
     id: s.worktreeIds[1]!, projectId: s.project.id, path: worktreePath, branch,
   });
-  for (const scope of [['src/gate.ts'], ['outside.ts']]) {
-    createTask(s.project.storeDir, {
+  const tasks = [['src/gate.ts'], ['src/', './outside.ts']].map((scope) => createTask(
+    s.project.storeDir, {
       id: newId(), projectId: s.project.id, title: 'Review', scope,
       assignee: 'dev0', status: 'ready_for_review', branch,
       worktreeId: s.worktreeIds[1]!, createdAt: new Date().toISOString(),
-    });
-  }
+    },
+  ));
 
   const response = await handleGuiRequest(
     { id: '1', method: 'gui.preMerge', params: { projectId: s.project.id } }, ctx(s));
   assert.equal(response.ok, true);
-  const rows = response.ok ? response.result as Array<{ status: string; summary: string }> : [];
-  const outside = rows.find((row) => row.status === 'needs-review');
-  assert.ok(outside, JSON.stringify(rows));
-  assert.ok(rows.some((row) => row.status === 'verified'), JSON.stringify(rows));
+  const rows = response.ok
+    ? response.result as Array<{ id: string; status: string; summary: string }> : [];
+  assert.equal(
+    rows.find((row) => row.id === tasks[0]!.id)?.status, 'needs-review', JSON.stringify(rows),
+  );
+  // A normalized literal directory scope covers descendants; an exact-path
+  // comparison would leave both committed files flagged as outside the lease.
+  assert.equal(
+    rows.find((row) => row.id === tasks[1]!.id)?.status, 'verified', JSON.stringify(rows),
+  );
 });
 
 test('chat reaches a live vendor session and falls back to durable mail', async (t) => {
@@ -621,6 +629,36 @@ test('delete-old is an explicit second confirmation after a completed move', asy
   assert.equal(secondDelete.ok, false);
 });
 
+test('delete-old refuses when the moved store lost a manifest file', async (t) => {
+  const s = setupAcceptance(t);
+  const target = join(s.root, 'missing-final-file-target');
+  mkdirSync(target, { recursive: true });
+  const guarded = 'guarded file\n';
+  writeFileSync(join(s.project.storeDir, 'guard.md'), guarded);
+  const moved = await startMove(ctx(s), s.project.id, target);
+  assert.equal(moved.phase, 'done', moved.error ?? '');
+  const final = moveFinalPath(moved);
+
+  rmSync(join(final, 'guard.md'));
+  const missing = await handleGuiRequest(
+    { id: '1', method: 'gui.moveDeleteOld', params: { projectId: s.project.id } }, ctx(s));
+  assert.equal(missing.ok, false);
+  if (!missing.ok) assert.equal(missing.error.code, 'MOVE_CHANGED');
+  assert.ok(existsSync(s.project.storeDir), 'the last copy must not be deleted');
+
+  writeFileSync(join(final, 'guard.md'), 'tampered file\n');
+  const changed = await handleGuiRequest(
+    { id: '2', method: 'gui.moveDeleteOld', params: { projectId: s.project.id } }, ctx(s));
+  assert.equal(changed.ok, false);
+  if (!changed.ok) assert.equal(changed.error.code, 'MOVE_CHANGED');
+  assert.ok(existsSync(s.project.storeDir));
+
+  writeFileSync(join(final, 'guard.md'), guarded);
+  const deleted = await handleGuiRequest(
+    { id: '3', method: 'gui.moveDeleteOld', params: { projectId: s.project.id } }, ctx(s));
+  assert.equal(deleted.ok, true, deleted.ok ? '' : deleted.error.message);
+});
+
 test('mail written between verification and the switch is carried into the moved store', async (t) => {
   const s = setupAcceptance(t);
   const target = join(s.root, 'late-target');
@@ -650,6 +688,49 @@ test('mail written between verification and the switch is carried into the moved
   const deleted = await handleGuiRequest(
     { id: '2', method: 'gui.moveDeleteOld', params: { projectId: s.project.id } }, ctx(s));
   assert.equal(deleted.ok, true, deleted.ok ? '' : deleted.error.message);
+});
+
+test('a late-write sync failure stays offline at the switching checkpoint', async (t) => {
+  const s = setupAcceptance(t);
+  const target = join(s.root, 'late-sync-failure-target');
+  mkdirSync(target, { recursive: true });
+  const preview = await handleGuiRequest({
+    id: '1', method: 'gui.movePreflight', params: { projectId: s.project.id, target },
+  }, ctx(s));
+  assert.equal(preview.ok, true, preview.ok ? '' : preview.error.message);
+  const planned = preview.ok ? preview.result as MoveStatus : undefined;
+  const paths = movePaths(target, s.project.id);
+  mkdirSync(paths.final, { recursive: true });
+  const seed = 'seed\n';
+  writeFileSync(join(paths.final, 'manifest.json'), `${JSON.stringify({
+    schema: 1, files: { 'a-late.md': createHash('sha256').update(seed).digest('hex') },
+  })}\n`);
+  // A directory where the late file should land makes the sync fail before it
+  // can write anything, leaving the manifest and source untouched.
+  mkdirSync(join(paths.final, 'a-late.md'));
+  writeFileSync(join(s.project.storeDir, 'a-late.md'), 'accepted while switching\n');
+  mkdirSync(dirname(moveJournalPath(s.paths, s.project.id)), { recursive: true });
+  writeFileSync(moveJournalPath(s.paths, s.project.id), `${JSON.stringify({
+    ...planned!, phase: 'switching', checkpoint: 'switching',
+  })}\n`);
+
+  const stalled = await resumeMove(ctx(s), s.project.id);
+  assert.equal(stalled.phase, 'offline', stalled.error ?? '');
+  assert.match(stalled.error ?? '', /STORE_OFFLINE/);
+  const journal = readMove(ctx(s), s.project.id);
+  assert.equal(journal.phase, 'offline');
+  assert.equal(journal.checkpoint, 'switching');
+  assert.ok(existsSync(s.project.storeDir), 'the original store must remain for recovery');
+  assert.equal(existsSync(join(paths.final, 'a-late.md')), true);
+  const refusedDelete = await handleGuiRequest(
+    { id: '2', method: 'gui.moveDeleteOld', params: { projectId: s.project.id } }, ctx(s));
+  assert.equal(refusedDelete.ok, false);
+
+  rmSync(join(paths.final, 'a-late.md'), { recursive: true, force: true });
+  const resumed = await resumeMove(ctx(s), s.project.id);
+  assert.equal(resumed.phase, 'done', resumed.error ?? '');
+  assert.equal(readFileSync(join(paths.final, 'a-late.md'), 'utf8'), 'accepted while switching\n');
+  assert.equal(readMove(ctx(s), s.project.id).phase, 'done');
 });
 
 test('a failure after the switch keeps its checkpoint and resumes finalisation', async (t) => {

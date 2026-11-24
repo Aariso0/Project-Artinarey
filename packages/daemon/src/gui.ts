@@ -5,7 +5,7 @@ import {
   listGitWorktrees, loadConfig, newId, queryMail, readApprovals, readSessions, readTasks,
   rehomePersona, resolveRepo, saveConfig, sendMail, sessionLogFile, setAutoApprove,
   adoptWorktree as coreAdoptWorktree, createWorktree as coreCreateWorktree, planWorktree,
-  type Project, type SessionSummary,
+  uncoveredFiles, type Project, type SessionSummary,
 } from '@artinarey/core';
 import {
   deleteOldStore, preflightMove, readMove, startMove, undoMove,
@@ -315,7 +315,8 @@ function preMergeRows(ctx: RpcContext, project: Project): GuiPreMerge[] {
         available = false;
       }
     }
-    const uncovered = changed.filter((file) => !task.scope.includes(file));
+    // Use the core lease rule: a literal scope covers its descendants and globs match.
+    const uncovered = uncoveredFiles([task], changed);
     return {
       id: task.id,
       worktreeId: task.worktreeId!,

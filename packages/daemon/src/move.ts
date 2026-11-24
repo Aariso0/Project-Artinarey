@@ -280,9 +280,13 @@ async function switchAndFinish(ctx: RpcContext, status: MoveStatus): Promise<Mov
   ctx.registry.projects.updateStoreDir(status.projectId, paths.final);
   try {
     syncLateWrites(status.source, paths.final);
-  } catch {
-    // If late writes cannot be copied, delete-old must keep the old store: the
-    // manifest no longer matches it, so its unchanged-store guard refuses.
+  } catch (err) {
+    // The switch already happened: fail durably at the switching checkpoint so
+    // a later resume retries the late-write sync instead of indexing and
+    // completing an incomplete destination. The old store stays available.
+    return toOffline(ctx, current, moveError(
+      'STORE_OFFLINE', `late-write sync failed: ${asMoveError(err).message}`,
+    ));
   }
   current = writeMove(ctx, { ...current, phase: 'rebuilding' });
   buildIndex(join(ctx.paths.cacheRoot, status.projectId, 'index.sqlite'), paths.final);
@@ -449,6 +453,19 @@ export function deleteOldStore(ctx: RpcContext, projectId: string): { deleted: b
     throw moveError('MOVE_CHANGED', 'the moved store has no copy manifest; refusing to delete the old store');
   }
   const expected = Object.keys(manifest.files).sort();
+  // The old store matching the manifest is not enough: the live destination
+  // must still hold every file the move verified, with the same bytes.
+  const destinationFiles = new Set(
+    filesUnder(paths.final).map((file) => file.slice(paths.final.length + 1)),
+  );
+  for (const relative of expected) {
+    if (!destinationFiles.has(relative)
+        || sha256(join(paths.final, relative)) !== manifest.files[relative]) {
+      throw moveError(
+        'MOVE_CHANGED', 'the moved store no longer matches the move manifest; refusing to delete the old store',
+      );
+    }
+  }
   const actual = filesUnder(source).map((file) => file.slice(source.length + 1)).sort();
   if (actual.length !== expected.length
       || actual.some((relative, i) => relative !== expected[i]
