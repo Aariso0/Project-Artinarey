@@ -129,11 +129,19 @@ export function createDaemonClient(options: DaemonClientOptions): DaemonClient {
             const line = buffer.slice(0, end);
             buffer = buffer.slice(end + 1);
             if (!line.trim()) continue;
-            const id = JSON.parse(line).id as string;
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(line);
+            } catch {
+              continue; // a torn or malformed line is not a reply
+            }
+            if (!parsed || typeof parsed !== 'object') continue;
+            const id = (parsed as { id?: unknown }).id;
+            if (typeof id !== 'string') continue;
             const waiting = pending.get(id);
             if (waiting) {
               pending.delete(id);
-              waiting.resolve(JSON.parse(line) as RpcResponse);
+              waiting.resolve(parsed as RpcResponse);
             }
           }
         });

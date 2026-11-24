@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Keep `rullama-permission` at 0.12.0 and `thiserror` at 1.0.x — not used here, never bump.
-- Never edit the tracked `.gitignore`, global git config, or the global ignore file. The exclude block goes only in `$GIT_COMMON_DIR/info/exclude`; global ignore coverage is reported read-only.
+- Never edit the tracked `.gitignore`, global git config, or the global ignore file. The exclude block goes only in `$GIT_COMMON_DIR/info/exclude`; global ignore coverage is reported read-only. **M0 validation to close here:** create a real `.worktrees/<name>/` directory with `git worktree add`, then verify from every linked worktree (`git check-ignore -v .worktrees/<name>`) that it is ignored by the shared `$GIT_COMMON_DIR/info/exclude` rule — not just the `.artinarey.json` marker file. Do not make this pass by editing the tracked `.gitignore`.
 - `git worktree remove` runs **without** `--force`, and never deletes a branch.
 - A persona's home may only be changed to a worktree of the **same project** (`repoCommonDir` comparison).
 - Senior dev is exempt from the home-worktree warning.

@@ -133,9 +133,10 @@ Why it exists:
 | API | Model access | OpenCode only for now. A separate adapter process calls a model API through a configurable base URL; the daemon still has no LLM and no outbound calls. |
 | GUI | Daemon auth | The webview holds no secret. The native Tauri shell proxies daemon calls, and the daemon checks a per-platform Origin allowlist. |
 | Liveness | Session release | A pidfd-based process handle, not the parent PID. Manual force-release stays. |
+| Trust | Socket role | **Coordination, not authorization.** Agents are cooperative peers under one OS user; the socket stops them overwriting each other. An agent acts only as the persona bound to its directory. Starting another persona in a worktree with an active agent or pending work requires your approval. An active agent holds an exclusive worktree lock until it is stopped or you force-release it. |
 
 ### Interactions between decisions (read these)
-1. **A1 c + one persona per directory.** Directory identity means two personas cannot share a directory. The daemon enforces one active persona per directory. A second session there is refused (`DIRECTORY_BUSY`) unless the user takes over.
+1. **A1 c + one active persona per directory.** Directory identity decides which persona an agent acts as. Only one persona may be active in a worktree at a time; other personas may work there later, once it is released and has no pending work. A second simultaneous claim is refused (`DIRECTORY_BUSY`) unless the user takes over.
 2. **Senior dev sessions, not subagents.** The senior dev spawns completely new independent sessions that keep running when it is idle. It never creates subagents. Subagent permission inheritance is not documented and is not relied on.
 3. **A1 c depends on the shim's working directory equalling the agent's.** OpenCode docs say the MCP `cwd` defaults to the workspace/project folder; M0 confirms it with real worktrees.
 4. **B4 c + leases.** Because nothing merges itself, the real checkpoint is the pre-merge check (section 8), not the commit hook.
@@ -311,6 +312,13 @@ Style (shared with chatter): ACTION first, numbered steps, time estimates, no pr
 - **Release** happens when: the shim disconnects and a pidfd reports the process is gone, the `artinarey run` wrapper exits, the GUI session ends, or the user force-releases in GUI or CLI. Parent PID is not used: it changes on reparenting and can be reused.
 - **Take over** (user only): GUI or `artinarey release <worktree> --force`.
 
+### Several personas, one worktree
+- Personas are associated with a worktree over time; only one may be active in it at once. A new persona may be spun up there when no persona is currently active and no one has pending work in that worktree.
+- If another persona has pending work there, spinning up a new one needs your permission. The approval card shows the project, worktree, persona, and what is pending. Agents may exchange mail and propose a mutually agreeable handoff, but they cannot approve their own replacement.
+- If a persona is currently active, the worktree is locked: no second agent can run there until that persona is stopped or you force-release it. The GUI shows a macOS-style modal explaining that you must stop or delete persona X to do Y in that worktree, with an OK button to dismiss it.
+- Mail is per persona: an agent sends and receives only as the persona bound to its directory. The daemon derives `from` from the binding, never from a client-supplied field. The socket is a coordination channel, not an authorization boundary; directory spoofing remains an accepted risk (section 13).
+- These spawn and modal rules are for M4/M5/M7; M3 only enforces the active binding and the git worktree lock.
+
 ### First session in a project
 The agent calls `check_in`. With no personas, it is told to ask the user which role to start as (developer, researcher, tester, senior dev). Then `claim_persona(new_role=...)`.
 
@@ -381,7 +389,7 @@ GUI "Adopt" or `artinarey worktree adopt <path>` for worktrees created elsewhere
 - Moved path or changed branch: flagged, binding paused until the user confirms.
 
 ### Lock
-While a persona is bound, the daemon runs `git worktree lock --reason "artinarey: <persona> active"` and unlocks on release. Prevents accidental `worktree remove` or prune.
+While a persona is bound, the daemon runs `git worktree lock --reason "artinarey: <persona> active"` and unlocks on release. Prevents accidental `worktree remove` or prune. This is also the safe lock that stops a second agent from running in the worktree until the active persona is stopped or the user force-releases it.
 
 ### Remove
 GUI or CLI refuses if a persona is bound. Uses `git worktree remove` without `--force`. **Never deletes a branch.**
@@ -432,6 +440,7 @@ The senior dev may stack steps on an agent: do a step, ask you to approve, then 
 3. Under the cap: spawn immediately. At or over the cap: show a warning phrased around token consumption; you may proceed, but a senior-dev request creates a **pending approval** and waits for you (`CAP_REACHED` with the approval ID). Artinarey does not measure tokens.
 4. Spawn: bind persona to the directory, lock the worktree, launch via the adapter, record the session. The new session is completely independent and keeps running when the senior dev is idle. The senior dev never creates subagents and cannot delete personas.
 5. The agent receives its first prompt: role card, task, scope, "call `check_in` first". Chained steps are stored with the task; each waits at its own approval gate.
+6. Before spawning into a worktree, check that no persona is active there and no one has pending work in it. If either is true, only the user may authorise the session; agents can propose a handoff by mail but cannot self-approve.
 
 **Cap (C2 a):** 3 running sessions **per project**, soft. Configurable; over-cap needs your approval when the senior dev asks.
 **Agents never launch processes.** Only the daemon does.
@@ -545,8 +554,10 @@ Style: minimal, dark. Background `#0d1117`, text `#e6edf3`, accent green `#2ea04
    - **Pre-merge:** per branch, changed files vs lease, red flags. No merge button (B4 c).
    - **Audit:** append-only log view.
 3. **Chat:** one persona at a time. Live session: message delivered through the adapter. No live session: queued as mail, with a "start a session?" prompt.
-4. **Approvals tray:** risky calls, spawn over cap, scope requests, persona takeover. Shows which agent is blocked and how long it has waited.
+4. **Approvals tray:** risky calls, spawn over cap, scope requests, persona takeover, and spawning into a worktree with pending work. Shows which agent is blocked and how long it has waited.
 5. **Settings:** data root, spawn cap, shared files, env include list, port offset step.
+
+**Active-worktree blocker dialog:** macOS-style modal when an agent tries to start in a worktree that is locked by an active persona. It names the project, worktree, and blocking persona, says the user must stop or delete persona X to do Y, and has a single OK button to close it.
 
 ### v1 scope (D3 a)
 Slice 1 has a read-only window: Projects, Personas, Worktrees, Mail list. Chat, worktree creation, approvals, and Move arrive in M7.
@@ -568,7 +579,7 @@ Slice 1 has a read-only window: Projects, Personas, Worktrees, Mail list. Chat, 
 1. **Containment is detection, not a sandbox.** The shim detects out-of-worktree intent with command and path heuristics and asks you, but detection can be bypassed: `curl` launched from inside the worktree reaches the network, and `python -c "open('/etc/passwd')"` contains no outside path. You accepted this residual risk on 2026-11-23. There is no dedicated OS user, container, or egress limit in v1; reopen only if you change your mind. Public docs must say out-of-worktree use is **detected and approval-gated**, never "impossible".
 2. **"Local only" is partial.** Anything an agent reads reaches its model provider, and the separate API adapter calls a model API. Keep secrets out of mail. Free-plan data policies are not checked.
 3. **Hooks can be skipped** (`--no-verify`). Checkpoint 3 (pre-merge check) is the backstop.
-4. **Directory identity can be spoofed** by an agent that `cd`s into another worktree and calls the tools. This also weakens containment detection. Mitigations: the daemon logs the directory on every call, takes over only through the user, and flags a persona that calls from a directory that is not its binding.
+4. **Directory identity can be spoofed** by an agent that `cd`s into another worktree and calls the tools. This also weakens containment detection. The socket is a coordination channel among cooperative agents under one OS user, not an authorization boundary; persona isolation is logical (mail identity comes from the binding, never from a client field). Mitigations: the daemon logs the directory on every call, takeovers and force-releases are user actions, and a persona calling from a directory that is not its binding is flagged. Spawn approval for pending work and the active-worktree blocker modal are M4/M5/M7 work, not M3 enforcement. Note that a crafted socket client could call internal methods such as `release_force` today; hardening that is tracked in M5.
 5. **A blocked agent waits forever** if you never answer. Notifications stop after 15 minutes and the session keeps its cap slot. By design: no auto-fail, no timeout release.
 
 ---
@@ -633,7 +644,7 @@ Goal: confirm the working-directory identity (A1 c) with real tools before writi
 - [x] Test: `kill -9` mid-write recovers cleanly
 
 **Done when:** the two tests above pass.
-**Notes / blockers:** 41 tests pass; `pnpm test`, `pnpm typecheck`, `pnpm lint`, `pnpm build` all green. `better-sqlite3@13.2.0` ships prebuilt binaries, so no native build step is needed in CI. Implementation plan: `docs/superpowers/plans/2026-11-23-m1-foundation.md`.
+**Notes / blockers:** 41 tests pass; `pnpm test`, `pnpm typecheck`, `pnpm lint`, `pnpm build` all green. `better-sqlite3@13.2.0` ships prebuilt binaries, so no native build step is needed in CI. Implementation plan: `docs/plans/2026-11-23-m1-foundation.md`.
 
 ### M2 · MCP shim, tools, identity by folder
 **Status:** ✅ · **Estimate:** 1 d · **Depends on:** M1 · **Checks:** U11, U14
@@ -647,7 +658,7 @@ Goal: confirm the working-directory identity (A1 c) with real tools before writi
 - [x] Test: two directories, two personas, mail both ways through real OpenCode
 
 **Done when:** the real-OpenCode mail test passes.
-**Notes / blockers:** 69 tests pass; `pnpm test`, `pnpm typecheck`, `pnpm lint`, `pnpm build` all green. Two real OpenCode sessions in separate directories claimed different personas and exchanged mail in both directions; `DIRECTORY_BUSY`, `NEEDS_CONFIRMATION`, `NO_PROJECT` and `WORKTREE_UNMANAGED` all have recorded results. Implementation plan: `docs/superpowers/plans/2026-11-23-m2-mcp-shim-identity.md`.
+**Notes / blockers:** 69 tests pass; `pnpm test`, `pnpm typecheck`, `pnpm lint`, `pnpm build` all green. Two real OpenCode sessions in separate directories claimed different personas and exchanged mail in both directions; `DIRECTORY_BUSY`, `NEEDS_CONFIRMATION`, `NO_PROJECT` and `WORKTREE_UNMANAGED` all have recorded results. Implementation plan: `docs/plans/2026-11-23-m2-mcp-shim-identity.md`.
 
 Implementation deviation (no decision changes): Node 26 exposes no pidfd API. The shim holds one long-lived socket per session; the daemon releases the binding when that socket closes and cross-checks the forwarded pid with `process.kill(pid, 0)`. This is event-driven, not polled, and keeps the settled intent of tying liveness to the session rather than the parent pid. Revisit if Node gains pidfd support. Manual `release <worktree> --force` remains the user's override.
 
@@ -689,6 +700,8 @@ Implementation deviation (no decision changes): Node 26 exposes no pidfd API. Th
 - [ ] Tool 12 `request_session`; cap 3 per project; over-cap warning and CLI approval path
 - [ ] CLI approval commands (`approvals`, `approve`) and OS desktop notifications at 0/5/15 minutes
 - [ ] Supervision: pidfd handles, re-adopt after daemon restart, logs under the cache folder
+- [ ] Refuse to spawn into a worktree with an active persona or pending work unless the user approves; the card shows project, worktree, persona and pending item
+- [ ] Durable claim generations and conditional ownership updates across CLI and daemon, with reconciliation for interrupted Git lock transfers; keep `release_force` and shutdown behind operator authorization
 - [ ] Role cards: senior dev, developer, researcher, tester
 - [ ] **Record the accepted risk:** section 13 containment limits documented in the README; an OS sandbox stays out of scope unless you reopen it
 
@@ -714,7 +727,8 @@ Implementation deviation (no decision changes): Node 26 exposes no pidfd API. Th
 - [ ] Chat: live through the adapter; queued as mail when no session; copy to senior dev
 - [ ] New worktree and Adopt dialogs with the C4 warning
 - [ ] Edit a persona's home worktree (same project only)
-- [ ] Approvals tray: risky calls, spawn over cap, scope requests, takeover; per-worktree auto-approve button
+- [ ] Approvals tray: risky calls, spawn over cap, scope requests, takeover, spawn into worktrees with pending work; per-worktree auto-approve button
+- [ ] Active-worktree blocker modal: name the project, worktree and blocking persona; say the user must stop or delete persona X to do Y; single OK button
 - [ ] Tabs: Tasks and leases, Sessions, Pre-merge, Audit
 - [ ] Storage settings: data root, per-project override, `storage set`
 - [ ] Move wizard: preflight, pause, copy, verify, switch, rebuild, resume, undo, delete-old confirmation

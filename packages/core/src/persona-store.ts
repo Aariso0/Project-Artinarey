@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWrite } from './store.ts';
 
@@ -26,12 +26,14 @@ export function personaDir(storeDir: string, personaId: string): string {
 
 export function readPersona(storeDir: string, personaId: string): PersonaState {
   const file = join(personaDir(storeDir, personaId), 'persona.json');
-  if (!existsSync(file)) return { ...DEFAULT_PERSONA };
+  let content: string;
   try {
-    return { ...DEFAULT_PERSONA, ...(JSON.parse(readFileSync(file, 'utf8')) as Partial<PersonaState>) };
-  } catch {
-    return { ...DEFAULT_PERSONA };
+    content = readFileSync(file, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { ...DEFAULT_PERSONA };
+    throw err;
   }
+  return { ...DEFAULT_PERSONA, ...(JSON.parse(content) as Partial<PersonaState>) };
 }
 
 export function writePersona(storeDir: string, personaId: string, value: PersonaState): void {

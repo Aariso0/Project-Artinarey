@@ -1,7 +1,7 @@
 import { existsSync, readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { ArtinareyError } from './errors.ts';
-import { newId } from './ids.ts';
+import { isUlid, newId } from './ids.ts';
 import { appendJournal, atomicWrite, withProjectLock } from './store.ts';
 
 export type MailKind =
@@ -73,6 +73,7 @@ export function validateMail(input: MailInput, ctx: MailContext): ValidationResu
     return reject('wildcard recipients are not allowed');
   }
 
+  if (input.id !== undefined && !isUlid(input.id)) return reject('id must be a ULID');
   if (Buffer.byteLength(input.body, 'utf8') > BODY_LIMIT) return reject('body exceeds the 8 KB limit');
 
   const searchable = `${input.subject}\n${input.action}\n${input.body}`;
@@ -119,7 +120,7 @@ export function validateMail(input: MailInput, ctx: MailContext): ValidationResu
 
 function yamlScalar(value: string): string {
   if (value === '') return '""';
-  if (/:\s|[\n\r]|^[\s#&*!|>'"%@`{}\[\],?-]|\s$|^(true|false|null|~)$/i.test(value)) {
+  if (/:\s|\s#|[\n\r,]|^[\s#&*!|>'"%@`{}\[\],?-]|\s$|^(true|false|null|~)$/i.test(value)) {
     return JSON.stringify(value);
   }
   return value;
@@ -174,7 +175,19 @@ export async function sendMail(
     if (mailIdExists(storeDir, record.id)) {
       throw new ArtinareyError('MAIL_REJECTED', `mail id already exists: ${record.id}`);
     }
-    atomicWrite(file, serializeMail(record), 0o444);
+    try {
+      atomicWrite(file, serializeMail(record), 0o444);
+    } catch (err) {
+      // A failure after the rename means the mail is already committed.
+      if (existsSync(file)) {
+        throw new ArtinareyError(
+          'MAIL_PARTIAL',
+          `mail ${record.id} is committed but the write did not complete; do not resend`,
+          record.id,
+        );
+      }
+      throw err;
+    }
     try {
       appendJournal(join(storeDir, 'events', 'audit.jsonl'), {
         type: 'mail_sent',

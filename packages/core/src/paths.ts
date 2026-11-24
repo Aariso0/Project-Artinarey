@@ -1,4 +1,4 @@
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 
 export type XdgPaths = {
@@ -16,7 +16,7 @@ function absoluteOverride(value: string | undefined): string | undefined {
 }
 
 export function resolveXdgPaths(env: NodeJS.ProcessEnv = process.env): XdgPaths {
-  const home = env.HOME ?? '';
+  const home = absoluteOverride(env.HOME) ?? homedir();
   const configHome = absoluteOverride(env.XDG_CONFIG_HOME) ?? join(home, '.config');
   const dataHome = absoluteOverride(env.XDG_DATA_HOME) ?? join(home, '.local', 'share');
   const cacheHome = absoluteOverride(env.XDG_CACHE_HOME) ?? join(home, '.cache');

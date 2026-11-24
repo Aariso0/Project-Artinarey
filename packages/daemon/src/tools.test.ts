@@ -2,16 +2,19 @@ import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
-  existsSync, mkdirSync, readFileSync, readdirSync, rmSync,
+  existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { connect, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
 import {
-  createPersona, findMarker, newId, openRegistry, queryMail, resolveXdgPaths, writeMarker,
+  buildIndex, createPersona, findMarker, listGitWorktrees, newId, openRegistry,
+  queryMail, readPersona, resolveXdgPaths, serializeMail, validateMail,
+  withProjectLock, writeMarker, type Registry,
 } from '@artinarey/core';
 import { createRpcServer, type RpcResponse, type RpcServer } from './server.ts';
+import { releaseConnection, type RpcContext } from './tools.ts';
 
 type Client = {
   call(method: string, params?: Record<string, unknown>): Promise<RpcResponse>;
@@ -24,10 +27,6 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 1000): Promise<vo
     if (Date.now() >= deadline) throw new Error('condition not met before deadline');
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
-}
-
-async function flush(): Promise<void> {
-  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
 }
 
 async function openClient(path: string): Promise<Client> {
@@ -86,6 +85,54 @@ function git(args: string[], cwd: string): void {
   execFileSync('git', args, { cwd, encoding: 'utf8' });
 }
 
+function gitWorktreeLocked(repo: string, path: string): boolean {
+  const canonical = realpathSync(path);
+  return listGitWorktrees(repo)
+    .find((worktree) => realpathSync(worktree.path) === canonical)?.locked === true;
+}
+
+/** Seed a mail file directly so tests can simulate mails core validation would reject. */
+function seedMail(s: ReturnType<typeof setup>, mail: {
+  id: string;
+  from: string;
+  to: string[];
+  cc?: string[];
+  kind: 'task' | 'receipt' | 'note';
+  subject: string;
+  action: string;
+  in_reply_to?: string;
+  body?: string;
+}): void {
+  const file = join(s.project.storeDir, 'mail', '2026', '11', `${mail.id}.md`);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, serializeMail({
+    id: mail.id,
+    thread: mail.id,
+    in_reply_to: mail.in_reply_to ?? '',
+    from: mail.from,
+    to: mail.to,
+    cc: mail.cc ?? [],
+    subject: mail.subject,
+    kind: mail.kind,
+    action: mail.action,
+    eta: '',
+    worktree: '',
+    body: mail.body ?? 'seeded mail',
+    created_at: '2026-11-24T00:00:00Z',
+  }));
+}
+
+function reindex(s: ReturnType<typeof setup>): void {
+  buildIndex(join(s.paths.cacheRoot, s.project.id, 'index.sqlite'), s.project.storeDir);
+}
+
+function receiptTexts(s: ReturnType<typeof setup>): string[] {
+  return readdirSync(join(s.project.storeDir, 'mail'), { recursive: true })
+    .filter((entry) => String(entry).endsWith('.md'))
+    .map((entry) => readFileSync(join(s.project.storeDir, 'mail', String(entry)), 'utf8'))
+    .filter((text) => /^kind: receipt$/m.test(text));
+}
+
 function setup() {
   const root = join(tmpdir(), `artinarey-tools-${newId()}`);
   const runtime = join(root, 'runtime');
@@ -113,12 +160,56 @@ function setup() {
   return { root, paths, registry, project, worktrees, ids };
 }
 
-async function serve(s: ReturnType<typeof setup>): Promise<{ server: RpcServer; socketPath: string }> {
+async function serve(
+  s: ReturnType<typeof setup>,
+  onConnectionClosed?: () => void,
+): Promise<{ server: RpcServer; socketPath: string }> {
   const socketPath = join(s.paths.socketPath);
   mkdirSync(join(s.paths.socketPath, '..'), { recursive: true });
-  const server = createRpcServer(socketPath, undefined, { registry: s.registry, paths: s.paths });
+  const server = createRpcServer(socketPath, undefined, { registry: s.registry, paths: s.paths },
+    onConnectionClosed);
   await server.start();
   return { server, socketPath };
+}
+
+/** Raw client that keeps reply ids so pipelining order can be asserted. */
+async function rawClient(path: string) {
+  const socket = connect(path);
+  await new Promise<void>((resolve, reject) => {
+    socket.once('connect', resolve);
+    socket.once('error', reject);
+  });
+  socket.setEncoding('utf8');
+  const pending = new Map<string, (response: RpcResponse) => void>();
+  const replies: RpcResponse[] = [];
+  let buffer = '';
+  socket.on('data', (chunk: string) => {
+    buffer += chunk;
+    let end: number;
+    while ((end = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, end);
+      buffer = buffer.slice(end + 1);
+      if (!line.trim()) continue;
+      const response = JSON.parse(line) as RpcResponse;
+      replies.push(response);
+      pending.get(response.id)?.(response);
+      pending.delete(response.id);
+    }
+  });
+  let seq = 0;
+  return {
+    write(line: string) { socket.write(`${line}\n`); },
+    call(method: string, params: Record<string, unknown> = {}): Promise<RpcResponse> {
+      const id = String(++seq);
+      return new Promise((resolve) => {
+        pending.set(id, resolve);
+        socket.write(`${JSON.stringify({ id, method, params })}\n`);
+      });
+    },
+    replies,
+    resetReplies() { replies.length = 0; },
+    close() { socket.destroy(); },
+  };
 }
 
 async function attach(client: Client, cwd: string): Promise<void> {
@@ -404,8 +495,9 @@ test('force release invalidates the old holder and preserves a reclaimed binding
   const s = setup();
   const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
   const cleanup = track(t, s);
+  let disconnects = 0;
 
-  const started = await serve(s);
+  const started = await serve(s, () => { disconnects++; });
   cleanup.server = started.server;
   const holder = await openClient(started.socketPath);
   cleanup.clients.push(holder);
@@ -421,16 +513,17 @@ test('force release invalidates the old holder and preserves a reclaimed binding
   assert.equal(stale.ok, false, 'the released identity must not stay usable');
   if (!stale.ok) {
     assert.equal(stale.error.code, 'INVALID_INPUT');
-    assert.match(stale.error.message, /attach/);
+    assert.match(stale.error.message, /claim_persona/);
   }
 
   await attach(admin, s.worktrees[0]!);
   await claim(admin, dev);
   assert.equal(s.registry.bindings.forWorktree(s.ids[0]!)?.id, dev);
 
+  const beforeClose = disconnects;
   holder.close();
   cleanup.clients.splice(cleanup.clients.indexOf(holder), 1);
-  await flush();
+  await waitUntil(() => disconnects > beforeClose);
   assert.equal(s.registry.bindings.forWorktree(s.ids[0]!)?.id, dev,
     'the old connection must not release the new binding');
 });
@@ -440,16 +533,18 @@ test('a repeat claim of a CLI-created binding does not transfer cleanup ownershi
   const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
   s.registry.bindings.bind(dev, s.ids[0]!);
   const cleanup = track(t, s);
+  let disconnects = 0;
 
-  const started = await serve(s);
+  const started = await serve(s, () => { disconnects++; });
   cleanup.server = started.server;
   const client = await openClient(started.socketPath);
   cleanup.clients.push(client);
   await attach(client, s.worktrees[0]!);
   await claim(client, dev);
+  const beforeClose = disconnects;
   client.close();
   cleanup.clients.splice(cleanup.clients.indexOf(client), 1);
-  await flush();
+  await waitUntil(() => disconnects > beforeClose);
   assert.equal(s.registry.bindings.forWorktree(s.ids[0]!)?.id, dev,
     'the real binding owner keeps its binding');
 });
@@ -552,7 +647,7 @@ test('a repeat claim refreshes ownership so disconnect releases the binding', as
 
   client.close();
   cleanup.clients.splice(cleanup.clients.indexOf(client), 1);
-  await flush();
+  await waitUntil(() => !s.registry.bindings.forWorktree(s.ids[0]!));
   assert.equal(s.registry.bindings.forWorktree(s.ids[0]!), undefined,
     'the connection must still own the binding after a repeat claim');
 });
@@ -601,6 +696,58 @@ test('mark_done rebuilds the index when the receipt already exists', async (t) =
     .map((f) => readFileSync(join(s.project.storeDir, 'mail', String(f)), 'utf8'))
     .filter((text) => /^kind: receipt$/m.test(text));
   assert.equal(receipts.length, 1, 'a retry must not send a second receipt');
+});
+
+test('pipelined requests reply in order and a mid-flight close leaves no binding', async (t) => {
+  const s = setup();
+  const first = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  const second = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-b', 'Dev B');
+  const cleanup = track(t, s);
+  let disconnects = 0;
+  const started = await serve(s, () => { disconnects++; });
+  cleanup.server = started.server;
+
+  const client = await rawClient(started.socketPath);
+  cleanup.clients.push({ call: (method, params) => client.call(method, params), close: () => client.close() });
+  const handshake = await client.call('attach', { cwd: s.worktrees[0]!, pid: process.pid });
+  assert.equal(handshake.ok, true, JSON.stringify(handshake));
+  const claimed = await client.call('claim_persona', { persona_id: first });
+  assert.equal(claimed.ok, true, JSON.stringify(claimed));
+  client.resetReplies();
+
+  let releaseHold!: () => void;
+  const holding = withProjectLock(s.project.storeDir, () => new Promise<void>((resolve) => {
+    releaseHold = resolve;
+  }));
+  // The first request blocks on the store lock; the second must not overtake it.
+  client.write(`${JSON.stringify({
+    id: '1', method: 'send_mail', params: {
+      to: ['user'], subject: 'slow', kind: 'note', action: 'read', body: 'blocked on the lock',
+    },
+  })}`);
+  client.write('{"id":"2","method":"ping","params":{}}');
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(client.replies.length, 0,
+    `a pipelined reply must not overtake a pending request: ${JSON.stringify(client.replies)}`);
+  releaseHold();
+  await holding;
+  await waitUntil(() => client.replies.length === 2);
+  assert.deepEqual(client.replies.map((reply) => reply.id), ['1', '2']);
+
+  // A pipelined claim that arrives while an earlier request is pending must not
+  // record a binding after the connection has gone away.
+  const beforeClose = disconnects;
+  client.write(`${JSON.stringify({
+    id: '3', method: 'send_mail', params: {
+      to: ['user'], subject: 'in flight', kind: 'note', action: 'read', body: 'connection dies',
+    },
+  })}`);
+  client.write(`${JSON.stringify({ id: '4', method: 'claim_persona', params: { persona_id: second } })}`);
+  client.close();
+  await waitUntil(() => disconnects > beforeClose);
+  assert.equal(s.registry.bindings.forWorktree(s.ids[0]!)?.id, undefined,
+    'a late claim must not leave a binding after the socket closed');
+  assert.ok(first && second);
 });
 
 test('send_mail indexes a committed mail even when the audit append fails', async (t) => {
@@ -662,4 +809,244 @@ test('a failed best-effort reindex never replaces the MAIL_PARTIAL error', async
     assert.equal(sent.error.code, 'MAIL_PARTIAL', 'the original error must survive');
     assert.match(sent.error.message, /do not resend/i);
   }
+});
+
+test('receiptExists matches exact frontmatter fields, not substrings or body text', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev', 'Dev');
+  const devA = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+
+  const mailId = newId();
+  seedMail(s, { id: mailId, from: 'dev-a', to: ['dev'], kind: 'task', subject: 'review me', action: 'review' });
+  // `from: dev-a` contains `from: dev`, and `dev-a` is not `dev`.
+  seedMail(s, {
+    id: newId(), from: 'dev-a', to: ['dev'], cc: ['senior-dev'], kind: 'receipt', in_reply_to: mailId,
+    subject: 'decoy from dev-a', action: 'done',
+  });
+  // A longer reply id starts with the real id; a body can quote frontmatter.
+  seedMail(s, {
+    id: newId(), from: 'dev', to: ['user'], kind: 'receipt', in_reply_to: `${mailId}0`,
+    subject: 'decoy long id', action: 'done',
+  });
+  seedMail(s, {
+    id: newId(), from: 'dev-a', to: ['dev'], kind: 'note', subject: 'body decoy', action: 'read',
+    body: `kind: receipt\nin_reply_to: ${mailId}\nfrom: dev`,
+  });
+  reindex(s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, dev);
+  const done = await client.call('mark_done', { id: mailId, note: 'Done for real.' });
+  assert.equal(done.ok, true, JSON.stringify(done));
+
+  const receipts = receiptTexts(s);
+  // Two decoy receipts, one body decoy that quotes frontmatter, and the real receipt.
+  assert.equal(receipts.length, 4, 'the decoys must not suppress the real receipt');
+  assert.ok(receipts.some((text) => text.includes(`in_reply_to: ${mailId}\n`)
+    && text.includes('from: dev\n')), 'a receipt with exact fields must be sent');
+  assert.ok(devA);
+});
+
+test('one throwing binding lookup does not stop the other disconnect releases', async (t) => {
+  const s = setup();
+  const first = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  const second = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-b', 'Dev B');
+  track(t, s);
+  s.registry.bindings.bind(first, s.ids[0]!);
+  s.registry.bindings.bind(second, s.ids[1]!);
+
+  const flaky = {
+    bindings: {
+      forWorktree(worktreeId: string) {
+        if (worktreeId === 'bad') throw new Error('lookup boom');
+        return s.registry.bindings.forWorktree(worktreeId);
+      },
+      release(personaId: string) { s.registry.bindings.release(personaId); },
+    },
+    projects: { list: () => s.registry.projects.list() },
+    worktrees: { list: (projectId: string) => s.registry.worktrees.list(projectId) },
+  } as unknown as Registry;
+  const ctx: RpcContext = {
+    registry: flaky, paths: s.paths,
+    claimedBindings: [
+      { personaId: 'missing', storeDir: s.project.storeDir, worktreeId: 'bad' },
+      { personaId: first, storeDir: s.project.storeDir, worktreeId: s.ids[0]! },
+      { personaId: second, storeDir: s.project.storeDir, worktreeId: s.ids[1]! },
+    ],
+  };
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    assert.doesNotThrow(() => releaseConnection(ctx));
+    assert.equal(s.registry.bindings.forWorktree(s.ids[0]!), undefined);
+    assert.equal(s.registry.bindings.forWorktree(s.ids[1]!), undefined,
+      'a later binding must be attempted after an earlier lookup throws');
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test('force release keeps the worktree so the holder can claim a persona again', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const holder = await openClient(started.socketPath);
+  cleanup.clients.push(holder);
+  await attach(holder, s.worktrees[0]!);
+  await claim(holder, dev);
+
+  const admin = await openClient(started.socketPath);
+  cleanup.clients.push(admin);
+  const forced = await admin.call('release_force', { worktreeId: s.ids[0]! });
+  assert.equal(forced.ok, true, JSON.stringify(forced));
+
+  const stale = await holder.call('inbox');
+  assert.equal(stale.ok, false);
+  if (!stale.ok) {
+    assert.equal(stale.error.code, 'INVALID_INPUT');
+    assert.match(stale.error.message, /claim_persona/, 'recovery must name the next tool');
+  }
+  const reclaim = await holder.call('claim_persona', { persona_id: dev });
+  assert.equal(reclaim.ok, true, JSON.stringify(reclaim));
+  assert.equal(s.registry.bindings.forWorktree(s.ids[0]!)?.id, dev);
+});
+
+test('mark_done skips the receipt when senior-dev is not registered', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev', 'Dev');
+  const cleanup = track(t, s);
+  const mailId = newId();
+  seedMail(s, { id: mailId, from: 'dev-a', to: ['dev'], kind: 'task', subject: 'seed', action: 'review' });
+  reindex(s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, dev);
+  const done = await client.call('mark_done', { id: mailId, note: 'Done.' });
+  assert.equal(done.ok, true, JSON.stringify(done));
+  if (done.ok) assert.match((done.result as { text: string }).text, /no receipt sent/);
+  assert.equal(receiptTexts(s).length, 0, 'an unregistered senior-dev must not be cc-ed');
+  const doneEvents = readFileSync(join(s.project.storeDir, 'events', 'audit.jsonl'), 'utf8')
+    .split('\n').filter((line) => line.includes(`"id":"${mailId}"`)
+      && line.includes('"type":"task_done"'));
+  assert.equal(doneEvents.length, 1);
+});
+
+test('mark_done does not cc senior-dev when the original sender is user or senior-dev', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev', 'Dev');
+  createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+  const fromUser = newId();
+  const fromLead = newId();
+  seedMail(s, { id: fromUser, from: 'user', to: ['dev'], kind: 'task', subject: 'from user', action: 'review' });
+  seedMail(s, {
+    id: fromLead, from: 'senior-dev', to: ['dev'], kind: 'task', subject: 'from lead', action: 'review',
+  });
+  reindex(s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, dev);
+  assert.equal((await client.call('mark_done', { id: fromUser, note: 'Done.' })).ok, true);
+  assert.equal((await client.call('mark_done', { id: fromLead, note: 'Done.' })).ok, true);
+  const receipts = receiptTexts(s);
+  assert.equal(receipts.length, 2);
+  assert.ok(receipts.every((text) => /^cc: \[\]$/m.test(text)),
+    'senior-dev is the original sender or user for both tasks');
+});
+
+test('mark_done completes when the original sender is unknown and validation stays strict', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev', 'Dev');
+  createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+  const mailId = newId();
+  seedMail(s, { id: mailId, from: 'ghost', to: ['dev'], kind: 'task', subject: 'old sender', action: 'review' });
+  reindex(s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, dev);
+  const done = await client.call('mark_done', { id: mailId, note: 'Done.' });
+  assert.equal(done.ok, true, JSON.stringify(done));
+  if (done.ok) {
+    assert.match((done.result as { text: string }).text, /no receipt sent|no longer registered/);
+  }
+  assert.equal(receiptTexts(s).length, 0, 'an unknown recipient must not produce a receipt');
+  const doneEvents = readFileSync(join(s.project.storeDir, 'events', 'audit.jsonl'), 'utf8')
+    .split('\n').filter((line) => line.includes(`"id":"${mailId}"`)
+      && line.includes('"type":"task_done"'));
+  assert.equal(doneEvents.length, 1, 'task completion is still recorded');
+
+  const checked = validateMail({
+    from: 'dev', to: ['ghost'], cc: ['senior-dev'], subject: 'receipt',
+    kind: 'receipt', action: 'done', body: 'strict validation',
+  }, { knownPersonas: ['dev', 'senior-dev', 'user'], role: 'dev', sharedTasks: [] });
+  assert.equal(checked.ok, false, 'core validation must still reject unknown recipients');
+  if (!checked.ok) assert.match(checked.reason, /unknown recipient: ghost/);
+});
+
+test('a failed claim audit rolls back binding, persona state and worktree lock', async (t) => {
+  const s = setup();
+  const repo = join(s.root, 'repo');
+  const worktree = join(s.root, 'git-wt');
+  mkdirSync(repo, { recursive: true });
+  git(['init', '-q'], repo);
+  git(['-c', 'user.name=Tester', '-c', 'user.email=tester@example.com',
+    'commit', '--allow-empty', '-q', '-m', 'init'], repo);
+  git(['worktree', 'add', '-q', '-b', 'feature/rollback', worktree], repo);
+  const worktreeId = newId();
+  s.registry.worktrees.upsert({
+    id: worktreeId, projectId: s.project.id, path: worktree, branch: 'feature/rollback',
+  });
+  writeMarker(worktree, s.project.id, worktreeId);
+  const persona = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-rollback', 'Rollback');
+  const cleanup = track(t, s);
+  let disconnects = 0;
+
+  const started = await serve(s, () => { disconnects++; });
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  const attached = await client.call('attach', { cwd: worktree, pid: process.pid });
+  assert.equal(attached.ok, true, JSON.stringify(attached));
+
+  const audit = join(s.project.storeDir, 'events', 'audit.jsonl');
+  rmSync(audit, { force: true });
+  mkdirSync(audit, { recursive: true });
+  const claimed = await client.call('claim_persona', { persona_id: persona });
+  assert.equal(claimed.ok, false, JSON.stringify(claimed));
+  assert.equal(s.registry.bindings.forWorktree(worktreeId), undefined,
+    'a failed claim must not leave an unowned binding');
+  const state = readPersona(s.project.storeDir, persona);
+  assert.equal(state.state, 'new', 'persona state must be restored');
+  assert.equal(state.home_worktree_id, null);
+  assert.equal(state.role, 'dev-rollback');
+  assert.equal(gitWorktreeLocked(repo, worktree), false, 'the acquired worktree lock must be released');
+
+  const beforeClose = disconnects;
+  client.close();
+  cleanup.clients.splice(cleanup.clients.indexOf(client), 1);
+  await waitUntil(() => disconnects > beforeClose);
+  assert.equal(s.registry.bindings.forWorktree(worktreeId), undefined,
+    'disconnect must not have an unowned binding to release');
 });

@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
+  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
   statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -45,6 +46,34 @@ function gitSucceeds(args: string[], cwd: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Fixture paths can be reached through a symlinked temp root. */
+function samePath(a: string, b: string): boolean {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return resolve(a) === resolve(b);
+  }
+}
+
+function withEnv(name: string, value: string, run: () => void): void {
+  const previous = process.env[name];
+  process.env[name] = value;
+  try {
+    run();
+  } finally {
+    if (previous === undefined) delete process.env[name];
+    else process.env[name] = previous;
+  }
+}
+
+/** A hook that runs inside `git worktree add` after the target directory exists. */
+function installPostCheckoutHook(repo: string, body: string): void {
+  const hooks = join(repo, '.git', 'hooks');
+  mkdirSync(hooks, { recursive: true });
+  const hook = join(hooks, 'post-checkout');
+  writeFileSync(hook, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
 }
 
 function commit(dir: string, message: string): void {
@@ -154,6 +183,27 @@ test('locked and prunable reasons do not leak into the following block', () => {
   });
 });
 
+test('parses lock reasons so ownership can be distinguished', () => {
+  const text = [
+    'worktree /repos/owned',
+    `HEAD ${'a'.repeat(40)}`,
+    'branch refs/heads/owned',
+    'locked artinarey:dev-auth',
+    '',
+    'worktree /repos/manual',
+    `HEAD ${'b'.repeat(40)}`,
+    'branch refs/heads/manual',
+    'locked manual hold',
+    '',
+  ].join('\n');
+
+  const result = parseWorktreePorcelain(text);
+  assert.equal(result[0]?.locked, true);
+  assert.equal(result[0]?.lockReason, 'artinarey:dev-auth');
+  assert.equal(result[1]?.locked, true);
+  assert.equal(result[1]?.lockReason, 'manual hold');
+});
+
 test('parses a bare block', () => {
   const text = [
     'worktree /repos/bare.git',
@@ -194,7 +244,7 @@ test('empty porcelain output yields no worktrees', () => {
 test('lists this repository as a worktree', () => {
   const worktrees = listGitWorktrees(root);
   assert.ok(worktrees.length >= 1);
-  assert.equal(worktrees.some((wt) => wt.path === root), true);
+  assert.equal(worktrees.some((wt) => samePath(wt.path, root)), true);
 });
 
 test('listGitWorktrees keeps a worktree path containing a newline intact', () => {
@@ -206,9 +256,30 @@ test('listGitWorktrees keeps a worktree path containing a newline intact', () =>
       cwd: repo, stdio: 'ignore',
     });
     const listed = listGitWorktrees(repo);
-    assert.equal(listed.some((wt) => wt.path === path), true, JSON.stringify(listed));
+    assert.equal(listed.some((wt) => samePath(wt.path, path)), true, JSON.stringify(listed));
   } finally {
     rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('globalIgnoreCoverage probes the XDG default ignore file when core.excludesFile is unset', () => {
+  const repo = tempRepo();
+  const xdg = mkdtempSync(join(tmpdir(), 'artinarey-xdg-'));
+  try {
+    const config = join(xdg, 'gitconfig');
+    writeFileSync(config, '[user]\n\tname = Tester\n');
+    mkdirSync(join(xdg, 'git'), { recursive: true });
+    const ignore = join(xdg, 'git', 'ignore');
+    writeFileSync(ignore, '.worktrees/\n');
+
+    withGlobalConfig(config, () => withEnv('XDG_CONFIG_HOME', xdg, () => {
+      assert.deepEqual(core.globalIgnoreCoverage(repo), {
+        globalFile: ignore, coversWorktrees: true,
+      });
+    }));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(xdg, { recursive: true, force: true });
   }
 });
 
@@ -272,11 +343,11 @@ test('globalIgnoreCoverage reports no global excludes without writing files', ()
     writeFileSync(config, '[user]\n\tname = Tester\n');
     const beforeConfig = readFileSync(config, 'utf8');
 
-    withGlobalConfig(config, () => {
+    withGlobalConfig(config, () => withEnv('XDG_CONFIG_HOME', global, () => {
       assert.deepEqual(core.globalIgnoreCoverage(repo), {
         globalFile: null, coversWorktrees: false,
       });
-    });
+    }));
 
     assert.equal(readFileSync(gitignore, 'utf8'), '# local ignore\nnode_modules/\n');
     assert.equal(readFileSync(config, 'utf8'), beforeConfig);
@@ -447,7 +518,7 @@ test('createWorktree adds the git worktree, writes marker and env, and registers
     assert.equal(worktree.path, plan.path);
     assert.equal(worktree.branch, plan.branch);
     assert.equal(worktree.portOffset, plan.portOffset);
-    assert.equal(listGitWorktrees(repo).some((wt) => wt.path === plan.path), true);
+    assert.equal(listGitWorktrees(repo).some((wt) => samePath(wt.path, plan.path)), true);
     assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', `refs/heads/${plan.branch}`], repo),
       true);
 
@@ -483,7 +554,7 @@ test('createWorktree rolls back a failed write without registering the worktree'
     assert.throws(() => core.createWorktree(registry, storeDir, plan));
 
     assert.equal(existsSync(plan.path), false);
-    assert.equal(listGitWorktrees(repo).some((wt) => wt.path === plan.path), false);
+    assert.equal(listGitWorktrees(repo).some((wt) => samePath(wt.path, plan.path)), false);
     assert.equal(registry.worktrees.list(project.id).length, 1);
     assert.equal(existsSync(join(plan.path, '.artinarey.json')), false);
     assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', `refs/heads/${plan.branch}`], repo),
@@ -500,7 +571,7 @@ test('createWorktree rolls back a failed write without registering the worktree'
   }
 });
 
-test('createWorktree rollback on add failure leaves a target populated by someone else', () => {
+test('createWorktree rejects a pre-existing target before git runs', () => {
   const { dir, repo, storeDir, registry, project } = newProjectRepo();
   try {
     git(['branch', 'base-tmp'], repo);
@@ -509,10 +580,37 @@ test('createWorktree rollback on add failure leaves a target populated by someon
     writeFileSync(join(plan.path, 'mine.txt'), 'user data\n');
     git(['branch', '-D', 'base-tmp'], repo);
 
-    assert.throws(() => core.createWorktree(registry, storeDir, plan));
+    // The directory exists at preflight, so git add is never attempted.
+    expectInvalidInput(() => core.createWorktree(registry, storeDir, plan), 'pre-existing target');
 
     assert.equal(readFileSync(join(plan.path, 'mine.txt'), 'utf8'), 'user data\n');
     assert.equal(existsSync(join(plan.path, '.artinarey.json')), false);
+    assert.equal(registry.worktrees.list(project.id).length, 1);
+    assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', `refs/heads/${plan.branch}`], repo),
+      false);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('rollbackFailedAdd leaves a hook-created file in the git-registered worktree', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    installPostCheckoutHook(repo, [
+      'top=$(git rev-parse --show-toplevel)',
+      "printf 'HOOK FILE\\n' > \"$top/hook-created.txt\"",
+      'exit 1',
+    ].join('\n'));
+    const plan = core.planWorktree(registry, project.id, repo, 'hook-add');
+
+    assert.throws(() => core.createWorktree(registry, storeDir, plan));
+
+    // Git registered the worktree before the hook failed: rollback must not delete
+    // content the hook created after preflight.
+    assert.equal(readFileSync(join(plan.path, 'hook-created.txt'), 'utf8'), 'HOOK FILE\n');
+    assert.equal(existsSync(join(plan.path, '.artinarey.json')), false);
+    assert.equal(listGitWorktrees(repo).some((wt) => samePath(wt.path, plan.path)), true);
     assert.equal(registry.worktrees.list(project.id).length, 1);
   } finally {
     registry.close();
@@ -536,7 +634,7 @@ test('a stale plan for the same name cannot remove another caller\'s worktree', 
       'second caller with a stale plan');
 
     assert.equal(readFileSync(userFile, 'utf8'), 'user data\n');
-    assert.equal(listGitWorktrees(repo).some((wt) => wt.path === firstPlan.path), true);
+    assert.equal(listGitWorktrees(repo).some((wt) => samePath(wt.path, firstPlan.path)), true);
     assert.equal(core.findMarker(firstPlan.path)?.marker.worktree_id, first.id);
     assert.equal(registry.worktrees.list(project.id).length, 2);
     assert.equal(gitSucceeds(
@@ -677,11 +775,12 @@ test('removeWorktree after release drops git worktree, sessions and only its reg
     const target = join(repo, '.worktrees', 'gone');
     git(['worktree', 'add', '-q', '-b', 'artinarey/gone', target], repo);
     const worktree = core.adoptWorktree(registry, storeDir, project.id, target);
-    const rootId = registry.worktrees.list(project.id).find((row) => row.path === repo)?.id;
+    const rootId = registry.worktrees.list(project.id).find((row) => samePath(row.path, repo))?.id;
     assert.ok(rootId);
 
     writeFileSync(join(target, '.env.artinarey'), 'ARTINAREY_PORT_OFFSET=10\n');
-    writeFileSync(join(target, '.env'), 'SECRET=copied\n');
+    // An adopted worktree has no generated-env manifest: a handwritten .env would
+    // be dirt, so this fixture deliberately stays clean.
     const persona = core.createPersona(registry, storeDir, project.id, 'dev-gone', 'Gone');
     registry.bindings.bind(persona, worktree.id);
     for (const minute of ['01', '02']) {
@@ -697,12 +796,12 @@ test('removeWorktree after release drops git worktree, sessions and only its reg
 
     assert.equal(core.lockGitWorktree(target, 'dev-gone'), true);
     core.releasePersona(registry, storeDir, persona);
-    assert.equal(listGitWorktrees(repo).find((row) => row.path === target)?.locked, false);
+    assert.equal(listGitWorktrees(repo).find((row) => samePath(row.path, target))?.locked, false);
 
     core.removeWorktree(registry, project.id, worktree.id);
 
     assert.equal(existsSync(target), false);
-    assert.equal(listGitWorktrees(repo).some((row) => row.path === target), false);
+    assert.equal(listGitWorktrees(repo).some((row) => samePath(row.path, target)), false);
     assert.equal(gitSucceeds(
       ['show-ref', '--verify', '--quiet', 'refs/heads/artinarey/gone'], repo,
     ), true);
@@ -754,7 +853,7 @@ test('removeWorktree refuses a dirty or locked worktree without changing any of 
     ), true);
 
     rmSync(userFile, { force: true });
-    assert.equal(core.lockGitWorktree(target, 'manual hold'), true);
+    git(['worktree', 'lock', '--reason', 'manual hold', target], repo);
     expectInvalidInput(
       () => core.removeWorktree(registry, project.id, worktree.id),
       'locked worktree',
@@ -762,7 +861,8 @@ test('removeWorktree refuses a dirty or locked worktree without changing any of 
     assert.equal(readFileSync(join(target, '.artinarey.json'), 'utf8').includes(worktree.id), true);
     assert.equal(readFileSync(join(target, '.env'), 'utf8'), 'SECRET=kept\n');
     assert.equal(registry.worktrees.list(project.id).some((row) => row.id === worktree.id), true);
-    assert.equal(core.unlockGitWorktree(target), true);
+    assert.equal(core.unlockGitWorktree(target), false, 'a manual lock is not ours to release');
+    git(['worktree', 'unlock', target], repo);
   } finally {
     registry.close();
     rmSync(dir, { recursive: true, force: true });
@@ -780,9 +880,9 @@ test('lockGitWorktree and unlockGitWorktree toggle a real worktree and return fa
     const target = join(dir, 'lockable');
     git(['worktree', 'add', '-q', '-b', 'artinarey/lockable', target], repo);
     assert.equal(core.lockGitWorktree(target, 'dev-lockable'), true);
-    assert.equal(listGitWorktrees(repo).find((row) => row.path === target)?.locked, true);
+    assert.equal(listGitWorktrees(repo).find((row) => samePath(row.path, target))?.locked, true);
     assert.equal(core.unlockGitWorktree(target), true);
-    assert.equal(listGitWorktrees(repo).find((row) => row.path === target)?.locked, false);
+    assert.equal(listGitWorktrees(repo).find((row) => samePath(row.path, target))?.locked, false);
   } finally {
     registry.close();
     rmSync(dir, { recursive: true, force: true });
@@ -802,10 +902,259 @@ test('claimPersona locks the bound git worktree and force release unlocks it', (
     const persona = core.createPersona(registry, storeDir, project.id, 'dev-locked', 'Locked');
     const claimed = core.claimPersona(registry, storeDir, identity.identity, { personaId: persona });
     assert.equal(claimed.ok, true);
-    assert.equal(listGitWorktrees(repo).find((row) => row.path === target)?.locked, true);
+    assert.equal(listGitWorktrees(repo).find((row) => samePath(row.path, target))?.locked, true);
 
     assert.equal(core.releaseWorktreeForce(registry, storeDir, worktree.id), true);
-    assert.equal(listGitWorktrees(repo).find((row) => row.path === target)?.locked, false);
+    assert.equal(listGitWorktrees(repo).find((row) => samePath(row.path, target))?.locked, false);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('createWorktree rollback preserves hook-created files and the marker in a dirty worktree', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    writeFileSync(join(repo, '.env'), 'SECRET=copied\n');
+    installPostCheckoutHook(repo, [
+      'top=$(git rev-parse --show-toplevel)',
+      "printf 'HOOK FILE\\n' > \"$top/user.txt\"",
+      "printf 'HOOK ENV\\n' > \"$top/.env\"",
+      'exit 0',
+    ].join('\n'));
+    const plan = core.planWorktree(registry, project.id, repo, 'dirty-rollback');
+
+    assert.throws(() => core.createWorktree(registry, storeDir, plan), (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.equal((err as { code?: string }).code, 'INVALID_INPUT');
+      assert.match(err.message, /retained worktree at/);
+      assert.ok(err.message.includes(plan.path), 'error names the retained path');
+      return true;
+    });
+
+    assert.equal(readFileSync(join(plan.path, 'user.txt'), 'utf8'), 'HOOK FILE\n');
+    const marker = core.findMarker(plan.path);
+    assert.ok(marker, 'the marker stays so the worktree can be re-adopted');
+    assert.equal(marker?.marker.project_id, project.id);
+    assert.equal(registry.worktrees.list(project.id).length, 1);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('planWorktree and createWorktree reject a base that tracks the reserved marker', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    writeFileSync(join(repo, '.artinarey.json'), '{"schema":1}\n');
+    git(['add', '.artinarey.json'], repo);
+    commit(repo, 'track marker');
+
+    expectInvalidInput(
+      () => core.planWorktree(registry, project.id, repo, 'tracked-marker'),
+      'tracked marker in plan',
+    );
+
+    const plan: core.WorktreePlan = {
+      path: join(repo, '.worktrees', 'tracked-marker'),
+      branch: 'artinarey/tracked-marker',
+      base: 'HEAD',
+      portOffset: 0,
+      copy: [],
+      envFile: join(repo, '.worktrees', 'tracked-marker', '.env.artinarey'),
+    };
+    expectInvalidInput(() => core.createWorktree(registry, storeDir, plan), 'tracked marker at add');
+
+    assert.equal(existsSync(plan.path), false);
+    assert.equal(gitSucceeds(['show-ref', '--verify', '--quiet', `refs/heads/${plan.branch}`], repo),
+      false);
+    assert.equal(registry.worktrees.list(project.id).length, 1);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('removeWorktree never treats a manifest path outside the env filenames as owned', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    const target = join(repo, '.worktrees', 'manifest-path');
+    git(['worktree', 'add', '-q', '-b', 'artinarey/manifest-path', target], repo);
+    const worktree = core.adoptWorktree(registry, storeDir, project.id, target);
+    const outside = join(repo, 'outside.env');
+    writeFileSync(outside, 'OUTSIDE\n');
+    const markerPath = join(target, '.artinarey.json');
+    const marker = JSON.parse(readFileSync(markerPath, 'utf8')) as Record<string, unknown>;
+    marker.generated_env = [{
+      name: '../../outside.env',
+      sha256: createHash('sha256').update('OUTSIDE\n').digest('hex'),
+    }];
+    writeFileSync(markerPath, JSON.stringify(marker));
+
+    core.removeWorktree(registry, project.id, worktree.id);
+
+    assert.equal(readFileSync(outside, 'utf8'), 'OUTSIDE\n');
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('removeWorktree preserves a handwritten env file and refuses removal', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    const target = join(repo, '.worktrees', 'handwritten');
+    git(['worktree', 'add', '-q', '-b', 'artinarey/handwritten', target], repo);
+    const worktree = core.adoptWorktree(registry, storeDir, project.id, target);
+    const handwritten = join(target, '.env.local');
+    writeFileSync(handwritten, 'MINE=kept\n');
+
+    expectInvalidInput(
+      () => core.removeWorktree(registry, project.id, worktree.id),
+      'unlisted handwritten env',
+    );
+
+    assert.equal(readFileSync(handwritten, 'utf8'), 'MINE=kept\n');
+    assert.equal(existsSync(target), true);
+    assert.equal(listGitWorktrees(repo).some((row) => samePath(row.path, target)), true);
+    assert.equal(registry.worktrees.list(project.id).some((row) => row.id === worktree.id), true);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('removeWorktree deletes only generated env copies listed in the marker manifest', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    writeFileSync(join(repo, '.env'), 'GENERATED=1\n');
+    const plan = core.planWorktree(registry, project.id, repo, 'generated');
+    const worktree = core.createWorktree(registry, storeDir, plan);
+    const marker = JSON.parse(readFileSync(join(plan.path, '.artinarey.json'), 'utf8')) as {
+      generated_env?: Array<{ name: string; sha256: string }>;
+    };
+    assert.deepEqual(marker.generated_env, [{
+      name: '.env',
+      sha256: createHash('sha256').update('GENERATED=1\n').digest('hex'),
+    }]);
+
+    core.removeWorktree(registry, project.id, worktree.id);
+
+    assert.equal(existsSync(plan.path), false);
+    assert.equal(registry.worktrees.list(project.id).some((row) => row.id === worktree.id), false);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('removeWorktree preserves an edited generated env copy and refuses removal', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    writeFileSync(join(repo, '.env'), 'GENERATED=1\n');
+    const plan = core.planWorktree(registry, project.id, repo, 'edited');
+    const worktree = core.createWorktree(registry, storeDir, plan);
+    const generated = join(plan.path, '.env');
+    writeFileSync(generated, 'EDITED=1\n');
+
+    expectInvalidInput(
+      () => core.removeWorktree(registry, project.id, worktree.id),
+      'edited generated env',
+    );
+
+    assert.equal(readFileSync(generated, 'utf8'), 'EDITED=1\n');
+    assert.equal(existsSync(plan.path), true);
+    assert.equal(listGitWorktrees(repo).some((row) => samePath(row.path, plan.path)), true);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('removeWorktree refuses a symlinked generated env entry before staging', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    writeFileSync(join(repo, '.env'), 'GENERATED=1\n');
+    const plan = core.planWorktree(registry, project.id, repo, 'env-symlink');
+    const worktree = core.createWorktree(registry, storeDir, plan);
+    const outside = join(dir, 'outside.env');
+    writeFileSync(outside, 'OUTSIDE\n');
+    const env = join(plan.path, '.env');
+    rmSync(env);
+    symlinkSync(outside, env);
+
+    expectInvalidInput(
+      () => core.removeWorktree(registry, project.id, worktree.id),
+      'symlinked generated env',
+    );
+
+    assert.equal(lstatSync(env).isSymbolicLink(), true);
+    assert.equal(readFileSync(outside, 'utf8'), 'OUTSIDE\n');
+    assert.equal(existsSync(plan.path), true);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('removeWorktree preserves an env entry replaced after staging when git refuses removal', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    writeFileSync(join(repo, '.env'), 'GENERATED=1\n');
+    const plan = core.planWorktree(registry, project.id, repo, 'late-symlink');
+    const worktree = core.createWorktree(registry, storeDir, plan);
+    const outside = join(dir, 'outside.env');
+    writeFileSync(outside, 'OUTSIDE\n');
+    const env = join(plan.path, '.env');
+
+    // Git sees new dirt only after preflight, so worktree removal fails at the last
+    // moment while the env entry is now a symlink created by another process.
+    const list = registry.sessions.list.bind(registry.sessions);
+    let intruded = false;
+    registry.sessions.list = ((...args: Parameters<typeof list>) => {
+      if (!intruded) {
+        intruded = true;
+        writeFileSync(join(plan.path, 'intruder.txt'), 'late dirt\n');
+        rmSync(env);
+        symlinkSync(outside, env);
+      }
+      return list(...args);
+    }) as typeof list;
+
+    assert.throws(() => core.removeWorktree(registry, project.id, worktree.id));
+
+    assert.equal(lstatSync(env).isSymbolicLink(), true);
+    assert.equal(readFileSync(outside, 'utf8'), 'OUTSIDE\n');
+    assert.equal(registry.worktrees.list(project.id).some((row) => row.id === worktree.id), true);
+  } finally {
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('removeWorktree reports committed removal even when the audit append fails', () => {
+  const { dir, repo, storeDir, registry, project } = newProjectRepo();
+  try {
+    const target = join(repo, '.worktrees', 'audit-failed');
+    git(['worktree', 'add', '-q', '-b', 'artinarey/audit-failed', target], repo);
+    const worktree = core.adoptWorktree(registry, storeDir, project.id, target);
+    const persona = core.createPersona(registry, storeDir, project.id, 'dev-audit', 'Audit');
+    registry.sessions.append({
+      projectId: project.id, worktreeId: worktree.id, personaId: persona,
+      vendor: 'opencode', startedAt: '2026-11-24T13:00:00Z',
+    });
+    const auditFile = join(storeDir, 'events', 'audit.jsonl');
+    rmSync(auditFile, { force: true });
+    mkdirSync(auditFile, { recursive: true });
+
+    const result = core.removeWorktree(registry, project.id, worktree.id);
+
+    assert.equal(result.removed, true);
+    assert.equal(result.auditWritten, false);
+    assert.match(result.auditError ?? '', /audit/);
+    assert.equal(existsSync(target), false);
+    assert.equal(registry.worktrees.list(project.id).some((row) => row.id === worktree.id), false);
+    assert.equal(registry.sessions.list(project.id).some((s) => s.worktreeId === worktree.id), false);
   } finally {
     registry.close();
     rmSync(dir, { recursive: true, force: true });

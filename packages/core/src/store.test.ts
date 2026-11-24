@@ -4,12 +4,13 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   appendJournal,
   atomicWrite,
   recoverProject,
   withProjectLock,
+  writeAllSync,
 } from './store.ts';
 
 function tempStore(): string {
@@ -124,4 +125,32 @@ test('withProjectLock allows different keys to proceed in parallel', async () =>
 
   await Promise.all([run('a'), run('b')]);
   assert.equal(maxActive, 2);
+});
+
+test('writeAllSync keeps writing until the whole buffer is committed', () => {
+  const written: string[] = [];
+  const shortWrite = (_fd: number, buffer: Buffer, offset: number, length: number): number => {
+    const chunk = Math.min(2, length);
+    written.push(buffer.subarray(offset, offset + chunk).toString());
+    return chunk;
+  };
+
+  writeAllSync(0, 'abcdef', shortWrite);
+
+  assert.deepEqual(written, ['ab', 'cd', 'ef']);
+});
+
+test('writeAllSync rejects a writer that makes no progress', () => {
+  assert.throws(() => writeAllSync(0, 'x', () => 0), /no progress/i);
+});
+
+test('appendJournal repairs a torn tail before appending', () => {
+  const file = join(tempStore(), 'events', 'audit.jsonl');
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, '{"id":"1"}\n{"id":"tor');
+
+  appendJournal(file, { id: '2' });
+
+  const lines = readFileSync(file, 'utf8').trim().split('\n');
+  assert.deepEqual(lines.map((line) => JSON.parse(line!)), [{ id: '1' }, { id: '2' }]);
 });

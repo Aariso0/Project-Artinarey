@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newId } from './ids.ts';
-import { readPersona, writePersona, type PersonaState } from './persona-store.ts';
+import { personaDir, readPersona, writePersona, type PersonaState } from './persona-store.ts';
 
 const store = join(tmpdir(), `artinarey-persona-store-${newId()}`);
 
@@ -37,4 +37,20 @@ test('writePersona writes persona.json under personas/<id> and round-trips', () 
   writePersona(store, id, { ...value, state: 'active' });
   assert.equal(readPersona(store, id).home_worktree_id, '01HOME', 'updates must preserve the home worktree');
   assert.equal(readPersona(store, id).state, 'active');
+});
+
+test('readPersona propagates malformed persona.json', () => {
+  const id = newId();
+  const file = join(personaDir(store, id), 'persona.json');
+  mkdirSync(personaDir(store, id), { recursive: true });
+  writeFileSync(file, '{not json');
+
+  assert.throws(() => readPersona(store, id));
+});
+
+test('readPersona propagates an unreadable persona.json entry', () => {
+  const id = newId();
+  mkdirSync(join(personaDir(store, id), 'persona.json'), { recursive: true });
+
+  assert.throws(() => readPersona(store, id));
 });

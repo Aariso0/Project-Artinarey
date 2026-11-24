@@ -2,10 +2,13 @@ import { randomUUID } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
+  fstatSync,
   fsyncSync,
+  ftruncateSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
   renameSync,
   statSync,
@@ -28,6 +31,23 @@ function fsyncDir(dir: string): void {
   }
 }
 
+type WriteFn = (fd: number, buffer: Buffer, offset: number, length: number) => number;
+
+/** writeSync may commit fewer bytes than requested; loop until the buffer is gone. */
+export function writeAllSync(
+  fd: number,
+  content: string | Buffer,
+  write: WriteFn = writeSync,
+): void {
+  const buffer = typeof content === 'string' ? Buffer.from(content, 'utf8') : content;
+  let offset = 0;
+  while (offset < buffer.length) {
+    const written = write(fd, buffer, offset, buffer.length - offset);
+    if (!Number.isInteger(written) || written <= 0) throw new Error('write made no progress');
+    offset += written;
+  }
+}
+
 /** Temp in the same directory → fsync → chmod → rename → fsync directory. */
 export function atomicWrite(path: string, content: string, mode = 0o644): void {
   const dir = dirname(path);
@@ -36,7 +56,7 @@ export function atomicWrite(path: string, content: string, mode = 0o644): void {
   try {
     const fd = openSync(tmp, 'wx', 0o600);
     try {
-      writeSync(fd, content);
+      writeAllSync(fd, Buffer.from(content, 'utf8'));
       fsyncSync(fd);
     } finally {
       closeSync(fd);
@@ -57,9 +77,19 @@ export function atomicWrite(path: string, content: string, mode = 0o644): void {
 /** Append one newline-terminated JSON line with fsync. */
 export function appendJournal(path: string, event: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
-  const fd = openSync(path, 'a');
+  const fd = openSync(path, 'a+');
   try {
-    writeSync(fd, `${JSON.stringify(event)}\n`);
+    const size = fstatSync(fd).size;
+    if (size > 0) {
+      const last = Buffer.alloc(1);
+      readSync(fd, last, 0, 1, size - 1);
+      if (last[0] !== 0x0a) {
+        const content = readFileSync(path, 'utf8');
+        const newline = content.lastIndexOf('\n');
+        ftruncateSync(fd, newline + 1);
+      }
+    }
+    writeAllSync(fd, `${JSON.stringify(event)}\n`);
     fsyncSync(fd);
   } finally {
     closeSync(fd);

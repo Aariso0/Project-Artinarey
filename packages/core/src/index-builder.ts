@@ -35,6 +35,32 @@ function unquote(value: string): string {
   return value;
 }
 
+function splitList(raw: string): string[] {
+  const items: string[] = [];
+  let current = '';
+  let quoted = false;
+  let escaped = false;
+  for (const char of raw) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+    } else if (quoted && char === '\\') {
+      current += char;
+      escaped = true;
+    } else if (char === '"') {
+      current += char;
+      quoted = !quoted;
+    } else if (char === ',' && !quoted) {
+      items.push(current.trim());
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  items.push(current.trim());
+  return items.map(unquote).filter(Boolean);
+}
+
 function parseFrontmatter(text: string): Frontmatter | undefined {
   const lines = text.split(/\r?\n/);
   if (lines[0] !== '---') return undefined;
@@ -47,7 +73,7 @@ function parseFrontmatter(text: string): Frontmatter | undefined {
     if (!match) return undefined;
     const [, key, raw] = match;
     out[key!] = raw!.startsWith('[') && raw!.endsWith(']')
-      ? raw!.slice(1, -1).split(',').map((s) => unquote(s.trim())).filter(Boolean)
+      ? splitList(raw!.slice(1, -1))
       : unquote(raw!);
   }
   return out;

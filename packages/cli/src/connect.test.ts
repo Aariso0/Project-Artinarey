@@ -488,6 +488,41 @@ test('worktree remove <name> refuses a bound worktree, then removes it after rel
   registry.close();
 });
 
+test('worktree remove reports a committed removal when the audit append fails', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const target = join(repo, '.worktrees', 'audit-lost');
+  execFileSync('git', ['worktree', 'add', '-q', '-b', 'artinarey/audit-lost', target], { cwd: repo });
+  assert.equal(await main(['worktree', 'adopt', target], env, repo), 0);
+  const row = registry.worktrees.list(project.id).find((wt) => wt.path === target);
+  assert.ok(row);
+
+  const auditFile = join(project.storeDir, 'events', 'audit.jsonl');
+  rmSync(auditFile, { force: true });
+  mkdirSync(auditFile, { recursive: true });
+
+  let output = '';
+  let errors = '';
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (s: unknown) => { output += `${String(s)}\n`; };
+  console.error = (s: unknown) => { errors += `${String(s)}\n`; };
+  let code: number;
+  try {
+    code = await main(['worktree', 'remove', 'audit-lost'], env, repo);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+
+  assert.equal(code, 0, `${errors}${output}`);
+  assert.match(output, /removed/);
+  assert.match(errors, /audit event was not written/i);
+  assert.equal(existsSync(target), false);
+  assert.equal(registry.worktrees.list(project.id).some((wt) => wt.id === row.id), false);
+  registry.close();
+});
+
 test('persona list prints role, name, home and state for the current project only', async () => {
   const dir = root();
   const { repo, env, registry, project } = seededRepo(dir);
@@ -699,6 +734,66 @@ function stubOverlappingSessionVendor(
   return command;
 }
 
+/** Make two personas share a role by rebuilding the table without its UNIQUE constraint. */
+function duplicatePersonaRole(registryFile: string, projectId: string, role: string): void {
+  const db = new Database(registryFile);
+  db.pragma('foreign_keys = OFF');
+  db.exec(`
+    CREATE TABLE personas_rebuilt (
+      id TEXT PRIMARY KEY, project_id TEXT NOT NULL, role TEXT NOT NULL, name TEXT NOT NULL,
+      vendor TEXT, last_vendor_session_id TEXT
+    );
+    INSERT INTO personas_rebuilt SELECT * FROM personas;
+    DROP TABLE personas;
+    ALTER TABLE personas_rebuilt RENAME TO personas;
+  `);
+  db.prepare(`INSERT INTO personas (id, project_id, role, name, vendor, last_vendor_session_id)
+              VALUES (?, ?, ?, ?, NULL, NULL)`)
+    .run(newId(), projectId, role, 'Duplicate');
+  db.close();
+}
+
+/** A vendor that corrupts the persona file after the claim succeeds. */
+function stubCorruptPersonaVendor(dir: string, personaFile: string): string {
+  const require = createRequire(import.meta.url);
+  const script = join(dir, 'corrupt-persona.mjs');
+  writeFileSync(script, [
+    "import { writeFileSync } from 'node:fs';",
+    `writeFileSync(${JSON.stringify(personaFile)}, 'not-json');`,
+  ].join('\n'));
+  const command = join(dir, 'corrupt-persona.sh');
+  writeFileSync(command, [
+    '#!/bin/sh',
+    `exec '${process.execPath}' --import '${require.resolve('tsx/esm')}' '${script}'`,
+  ].join('\n'), { mode: 0o755 });
+  return command;
+}
+
+/** A vendor that releases the run's binding and hands the worktree to another persona. */
+function stubHandoverVendor(
+  dir: string, fromPersonaId: string, toPersonaId: string, worktreeId: string,
+): string {
+  const require = createRequire(import.meta.url);
+  const coreUrl = pathToFileURL(require.resolve('@artinarey/core')).href;
+  const script = join(dir, 'handover-vendor.mjs');
+  writeFileSync(script, [
+    `const core = await import(${JSON.stringify(coreUrl)});`,
+    'const registry = core.openRegistry(core.resolveXdgPaths(process.env).registryFile);',
+    'try {',
+    `  registry.bindings.release(${JSON.stringify(fromPersonaId)});`,
+    `  registry.bindings.bind(${JSON.stringify(toPersonaId)}, ${JSON.stringify(worktreeId)});`,
+    '} finally {',
+    '  registry.close();',
+    '}',
+  ].join('\n'));
+  const command = join(dir, 'handover-vendor.sh');
+  writeFileSync(command, [
+    '#!/bin/sh',
+    `exec '${process.execPath}' --import '${require.resolve('tsx/esm')}' '${script}'`,
+  ].join('\n'), { mode: 0o755 });
+  return command;
+}
+
 /** Make sessions.append fail while leaving session reads available to cleanup. */
 function failSessionInserts(registryFile: string): void {
   const db = new Database(registryFile);
@@ -706,6 +801,75 @@ function failSessionInserts(registryFile: string): void {
             BEGIN SELECT RAISE(ABORT, 'session insert failed'); END;`);
   db.close();
 }
+
+test('run resolves a unique role token and records the persona id', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-by-role', 'By Role');
+  const vendor = stubVendor(dir);
+
+  const result = await captureMain(
+    ['run', 'opencode', '--persona', 'dev-by-role'],
+    { ...env, ARTINAREY_TEST_VENDOR: vendor.command }, repo,
+  );
+  assert.equal(result.code, 0, `${result.err}${result.out}`);
+  assert.equal(readFileSync(vendor.out, 'utf8').trim(), realpathSync(repo));
+  assert.equal(registry.bindings.forWorktree(rootRow.id), undefined);
+  assert.equal(readPersona(project.storeDir, persona).state, 'idle');
+  const sessions = registry.sessions.list(project.id);
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0]?.personaId, persona);
+  registry.close();
+});
+
+test('run rejects an ambiguous role token before claiming', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-ambiguous', 'Ambiguous');
+  duplicatePersonaRole(resolveXdgPaths(env).registryFile, project.id, 'dev-ambiguous');
+  const vendor = stubVendor(dir);
+
+  const result = await captureMain(
+    ['run', 'opencode', '--persona', 'dev-ambiguous'],
+    { ...env, ARTINAREY_TEST_VENDOR: vendor.command }, repo,
+  );
+  assert.equal(result.code, 1, `${result.err}${result.out}`);
+  assert.match(result.err, /ambiguous persona: dev-ambiguous/);
+  assert.equal(existsSync(vendor.out), false);
+  assert.equal(registry.bindings.forWorktree(rootRow.id), undefined);
+  assert.equal(readPersona(project.storeDir, persona).state, 'new');
+  assert.equal(registry.sessions.list(project.id).length, 0);
+  registry.close();
+});
+
+test('run rolls back a role-token claim when the claim audit fails', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-role-rollback', 'Role Rollback');
+  const beforeState = readPersona(project.storeDir, persona);
+  const vendor = stubVendor(dir);
+  const auditFile = join(project.storeDir, 'events', 'audit.jsonl');
+  rmSync(auditFile, { force: true });
+  mkdirSync(auditFile);
+
+  const result = await captureMain(
+    ['run', 'opencode', '--persona', 'dev-role-rollback'],
+    { ...env, ARTINAREY_TEST_VENDOR: vendor.command }, repo,
+  );
+  assert.equal(result.code, 1, `${result.err}${result.out}`);
+  assert.match(result.err, /run failed/);
+  assert.equal(existsSync(vendor.out), false);
+  assert.equal(registry.bindings.forWorktree(rootRow.id), undefined);
+  assert.deepEqual(readPersona(project.storeDir, persona), beforeState);
+  assert.equal(worktreeLocked(repo), false);
+  registry.close();
+});
 
 test('run rolls back binding, lock and persona state when the claim audit fails', async () => {
   const dir = root();
@@ -926,6 +1090,76 @@ test('run releases its claim when the only other unended session is stale', asyn
   registry.close();
 });
 
+test('run releases when the last session of a binding created by an earlier run exits', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-last-exit', 'Last Exit');
+  // A created the binding and exited first; B joins it and is the last to exit.
+  registry.bindings.bind(persona, rootRow.id);
+  const now = new Date().toISOString();
+  registry.sessions.append({
+    projectId: project.id, worktreeId: rootRow.id, personaId: persona,
+    vendor: 'opencode', startedAt: now, endedAt: now, createdBinding: true,
+  });
+  const vendor = stubVendor(dir);
+
+  const result = await captureMain(
+    ['run', 'opencode', '--persona', persona],
+    { ...env, ARTINAREY_TEST_VENDOR: vendor.command }, repo,
+  );
+  assert.equal(result.code, 0, `${result.err}${result.out}`);
+  assert.equal(registry.bindings.forWorktree(rootRow.id), undefined);
+  assert.equal(readPersona(project.storeDir, persona).state, 'idle');
+  assert.equal(registry.sessions.list(project.id).length, 2);
+  registry.close();
+});
+
+test('run retains a binding that predated both overlapping runs', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-preexisting', 'Preexisting');
+  registry.bindings.bind(persona, rootRow.id);
+  const now = new Date().toISOString();
+  registry.sessions.append({
+    projectId: project.id, worktreeId: rootRow.id, personaId: persona,
+    vendor: 'opencode', startedAt: now, endedAt: now, createdBinding: false,
+  });
+  const vendor = stubVendor(dir);
+
+  const result = await captureMain(
+    ['run', 'opencode', '--persona', persona],
+    { ...env, ARTINAREY_TEST_VENDOR: vendor.command }, repo,
+  );
+  assert.equal(result.code, 0, `${result.err}${result.out}`);
+  assert.equal(registry.bindings.forWorktree(rootRow.id)?.id, persona);
+  assert.equal(readPersona(project.storeDir, persona).state, 'active');
+  assert.equal(registry.sessions.list(project.id).length, 2);
+  registry.close();
+});
+
+test('run retains a binding handed to another persona mid-run', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-handover', 'Handover');
+  const successor = createPersona(registry, project.storeDir, project.id, 'dev-successor', 'Successor');
+  const vendor = stubHandoverVendor(dir, persona, successor, rootRow.id);
+
+  const result = await captureMain(
+    ['run', 'opencode', '--persona', persona],
+    { ...env, ARTINAREY_TEST_VENDOR: vendor }, repo,
+  );
+  assert.equal(result.code, 0, `${result.err}${result.out}`);
+  assert.equal(registry.bindings.forWorktree(rootRow.id)?.id, successor);
+  assert.equal(readPersona(project.storeDir, persona).state, 'active');
+  registry.close();
+});
+
 test('run opencode binds a persona, records a complete session and releases on exit', async () => {
   const dir = root();
   const { repo, env, registry, project } = seededRepo(dir);
@@ -973,6 +1207,28 @@ test('run returns the vendor exit code and still releases and closes the session
   const sessions = registry.sessions.list(project.id);
   assert.equal(sessions.length, 1);
   assert.ok(sessions[0]?.endedAt);
+  registry.close();
+});
+
+test('run still ends its session and returns the vendor code when release fails', async () => {
+  const dir = root();
+  const { repo, env, registry, project } = seededRepo(dir);
+  const rootRow = registry.worktrees.list(project.id)[0];
+  assert.ok(rootRow);
+  const persona = createPersona(registry, project.storeDir, project.id, 'dev-release-fails', 'Release Fails');
+  const personaFile = join(project.storeDir, 'personas', persona, 'persona.json');
+  const vendor = stubCorruptPersonaVendor(dir, personaFile);
+
+  const result = await captureMain(
+    ['run', 'opencode', '--persona', persona],
+    { ...env, ARTINAREY_TEST_VENDOR: vendor }, repo,
+  );
+  assert.equal(result.code, 0, `${result.err}${result.out}`);
+  assert.match(result.err, /failed to release persona/i);
+  assert.equal(registry.bindings.forWorktree(rootRow.id), undefined);
+  const sessions = registry.sessions.list(project.id);
+  assert.equal(sessions.length, 1);
+  assert.ok(sessions[0]?.endedAt, 'session must be ended even when release fails');
   registry.close();
 });
 

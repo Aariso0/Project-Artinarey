@@ -1,14 +1,20 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
-  closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync,
-  rmdirSync, rmSync, statSync, writeFileSync, writeSync,
+  closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync,
+  rmdirSync, rmSync, writeFileSync, writeSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { ArtinareyError } from './errors.ts';
-import { auditWorktreeRemoval, MARKER_FILE, writeMarker } from './identity.ts';
+import {
+  assertPlainMarkerPath, auditWorktreeRemoval, MARKER_FILE, readMarker, writeMarker,
+} from './identity.ts';
 import { newId } from './ids.ts';
 import type { Registry, Worktree } from './registry.ts';
+
+/** Git lock reasons written by Artinarey carry this prefix; other locks are never ours. */
+export const LOCK_REASON_PREFIX = 'artinarey:';
 
 export type GitWorktree = {
   path: string;
@@ -16,6 +22,8 @@ export type GitWorktree = {
   branch: string | null;
   detached: boolean;
   locked: boolean;
+  /** Git's reason text, present only for a `locked <reason>` porcelain line. */
+  lockReason?: string;
   prunable: boolean;
   bare: boolean;
 };
@@ -62,6 +70,7 @@ export function parseWorktreePorcelain(text: string): GitWorktree[] {
         break;
       case 'locked':
         current.locked = true;
+        if (value !== '') current.lockReason = value;
         break;
       case 'prunable':
         current.prunable = true;
@@ -217,7 +226,10 @@ export function globalIgnoreCoverage(repoDir: string): {
     }).trim();
     if (value !== '') globalFile = value;
   } catch {
-    return { globalFile: null, coversWorktrees: false };
+    // core.excludesFile is unset: git itself falls back to the XDG ignore file.
+    const xdg = process.env.XDG_CONFIG_HOME;
+    const fallback = join(xdg && xdg !== '' ? xdg : join(homedir(), '.config'), 'git', 'ignore');
+    if (existsSync(fallback)) globalFile = fallback;
   }
   if (globalFile === null) return { globalFile: null, coversWorktrees: false };
 
@@ -284,6 +296,13 @@ function defaultBase(repoRoot: string): string {
   }
 }
 
+/** The marker is reserved: a checkout that already tracks it must be rejected up front. */
+function assertMarkerUntracked(repoRoot: string, baseCommit: string | undefined): void {
+  if (baseCommit && gitSucceeds(repoRoot, ['cat-file', '-e', `${baseCommit}:${MARKER_FILE}`])) {
+    throw new ArtinareyError('INVALID_INPUT', `base already tracks the reserved ${MARKER_FILE}`);
+  }
+}
+
 /**
  * Read-only preflight. Every rejection happens before a directory, branch, marker,
  * env file or registry row can exist.
@@ -311,6 +330,7 @@ export function planWorktree(
   if (!baseCommit) {
     throw new ArtinareyError('INVALID_INPUT', `base ref does not exist: ${resolvedBase}`);
   }
+  assertMarkerUntracked(repoRoot, baseCommit);
 
   const existingCount = reconcileWorktrees(registry, projectId, listGitWorktrees(repoRoot)).length;
   return {
@@ -323,17 +343,21 @@ export function planWorktree(
   };
 }
 
-/** Best-effort cleanup: prefer git's own removal, never `--force`. */
-function discardGitWorktree(repoRoot: string, path: string): void {
+/**
+ * Best-effort cleanup: prefer git's own removal, never `--force` and never a
+ * recursive delete. A dirty worktree is retained, not treated as disposable.
+ */
+function discardGitWorktree(repoRoot: string, path: string): boolean {
   try {
     execFileSync('git', ['worktree', 'remove', path], { cwd: repoRoot, stdio: 'ignore' });
+    return true;
   } catch {
     try {
       execFileSync('git', ['worktree', 'prune'], { cwd: repoRoot, stdio: 'ignore' });
     } catch {
       // Nothing left to prune.
     }
-    if (existsSync(path)) rmSync(path, { recursive: true, force: true });
+    return false;
   }
 }
 
@@ -403,15 +427,28 @@ export function createWorktree(registry: Registry, storeDir: string, plan: Workt
   }
   const repoRoot = dirname(dirname(plan.path));
   assertPlanAvailable(registry, repoRoot, plan);
+  const baseCommit = commitAt(repoRoot, plan.base);
+  assertMarkerUntracked(repoRoot, baseCommit);
   ensureExcludeBlock(resolveRepo(repoRoot).commonDir);
 
   const id = newId();
   const markerPath = join(plan.path, MARKER_FILE);
-  const markerContent = JSON.stringify({ schema: 1, project_id: project.id, worktree_id: id });
+  // The manifest is built from the exact bytes written, so later edits are dirt.
+  const copies = plan.copy.map((file) => ({
+    file, content: readFileSync(join(repoRoot, file)),
+  }));
+  const generatedEnv = copies.map(({ file, content }) => ({
+    name: file, sha256: createHash('sha256').update(content).digest('hex'),
+  }));
+  const markerContent = JSON.stringify({
+    schema: 1,
+    project_id: project.id,
+    worktree_id: id,
+    ...(generatedEnv.length > 0 ? { generated_env: generatedEnv } : {}),
+  });
   const branchCreated = !gitSucceeds(repoRoot, [
     'show-ref', '--verify', '--quiet', `refs/heads/${plan.branch}`,
   ]);
-  const baseCommit = commitAt(repoRoot, plan.base);
   try {
     execFileSync('git', ['worktree', 'add', plan.path, '-b', plan.branch, plan.base], {
       cwd: repoRoot,
@@ -426,15 +463,14 @@ export function createWorktree(registry: Registry, storeDir: string, plan: Workt
   const createdFiles: string[] = [];
   let registered = false;
   try {
-    // Claim ownership immediately after the add, before any other artifact is written.
+    // Claim ownership before any other artifact is written.
     writeGeneratedFile(markerPath, markerContent);
     createdFiles.push(markerPath);
     writeGeneratedFile(plan.envFile, `ARTINAREY_PORT_OFFSET=${plan.portOffset}\n`);
     createdFiles.push(plan.envFile);
-    for (const file of plan.copy) {
-      const target = join(plan.path, file);
-      writeGeneratedFile(target, readFileSync(join(repoRoot, file)));
-      createdFiles.push(target);
+    for (const { file, content } of copies) {
+      writeGeneratedFile(join(plan.path, file), content);
+      createdFiles.push(join(plan.path, file));
     }
     registry.worktrees.upsert({
       id,
@@ -448,12 +484,21 @@ export function createWorktree(registry: Registry, storeDir: string, plan: Workt
     if (!row) throw new ArtinareyError('NOT_FOUND', `worktree not registered: ${id}`);
     return row;
   } catch (err) {
+    let removed = true;
     if (ownsMarker(markerPath, markerContent)) {
-      for (const file of createdFiles) rmSync(file, { recursive: true, force: true });
-      discardGitWorktree(repoRoot, plan.path);
+      // The marker stays: it is excluded from git status and lets the retained
+      // worktree be re-adopted. Only our generated copies may be deleted.
+      for (const file of createdFiles) {
+        if (file !== markerPath) rmSync(file, { force: true });
+      }
+      removed = discardGitWorktree(repoRoot, plan.path);
     }
     if (registered) registry.worktrees.delete(id);
     if (branchCreated) discardCreatedBranch(repoRoot, plan.branch, baseCommit);
+    if (!removed) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new ArtinareyError('INVALID_INPUT', `${message}; retained worktree at ${plan.path}`);
+    }
     throw err;
   }
 }
@@ -495,6 +540,8 @@ export function adoptWorktree(
   if (!samePath(commonDir, project.repoCommonDir) || !gitWorktree) {
     throw new ArtinareyError('INVALID_INPUT', `worktree belongs to another repository: ${target}`);
   }
+  // Reject foreign markers before ensureExcludeBlock or any other cleanup can run.
+  const markerExisted = assertPlainMarkerPath(target);
 
   ensureExcludeBlock(project.repoCommonDir);
   const id = newId();
@@ -504,7 +551,7 @@ export function adoptWorktree(
       id, projectId, path: target, branch: gitWorktree.branch, portOffset: 0,
     });
   } catch (err) {
-    rmSync(join(target, MARKER_FILE), { force: true });
+    if (!markerExisted) rmSync(join(target, MARKER_FILE), { force: true });
     throw err;
   }
   const row = registry.worktrees.list(projectId).find((wt) => wt.id === id);
@@ -512,11 +559,24 @@ export function adoptWorktree(
   return row;
 }
 
+/** Owned env files are keyed by name and the hash of the bytes Artinarey wrote. */
+type OwnedEnv = Map<string, string>;
+
+function envSha256(path: string): string | undefined {
+  try {
+    if (!lstatSync(path).isFile()) return undefined;
+    return createHash('sha256').update(readFileSync(path)).digest('hex');
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Git refuses to remove a locked or dirty worktree without --force. Check before
  * deleting anything so a refused removal leaves every file exactly where it was.
+ * Only listed, unchanged env copies count as ours; everything else is dirt.
  */
-function assertRemovableWorktree(path: string): void {
+function assertRemovableWorktree(path: string, owned: OwnedEnv): void {
   let locked = false;
   let status = '';
   try {
@@ -528,61 +588,125 @@ function assertRemovableWorktree(path: string): void {
     throw new ArtinareyError('INVALID_INPUT', `worktree is not removable: ${path}`);
   }
   if (locked) throw new ArtinareyError('INVALID_INPUT', `worktree is locked: ${path}`);
-  // .env files are the only generated files not covered by the exclude block.
-  const dirt = status.split('\n').filter((line) =>
-    line !== '' && !(line.startsWith('?? ') && ENV_FILES.includes(line.slice(3))));
+  const dirt = status.split('\n').filter((line) => {
+    if (line === '') return false;
+    if (!line.startsWith('?? ')) return true;
+    const name = line.slice(3);
+    const expected = owned.get(name);
+    return expected === undefined || envSha256(join(path, name)) !== expected;
+  });
   if (dirt.length > 0) {
     throw new ArtinareyError('INVALID_INPUT',
       `worktree has uncommitted or untracked files: ${path}`);
   }
 }
 
+/** A committed removal can still be missing its audit line; callers can tell them apart. */
+export type WorktreeRemovalResult = {
+  removed: true;
+  auditWritten: boolean;
+  auditError?: string;
+};
+
 /**
  * Remove a managed worktree without ever forcing git or deleting a branch. Session
  * history goes with the worktree so the foreign-key-constrained row can be deleted.
  */
-export function removeWorktree(registry: Registry, projectId: string, id: string): void {
+export function removeWorktree(registry: Registry, projectId: string, id: string): WorktreeRemovalResult {
   const worktree = registry.worktrees.list(projectId).find((row) => row.id === id);
   if (!worktree) throw new ArtinareyError('NOT_FOUND', `unknown worktree: ${id}`);
   if (registry.bindings.forWorktree(id)) {
     throw new ArtinareyError('INVALID_INPUT', `worktree is bound to a persona: ${id}`);
   }
-  assertRemovableWorktree(worktree.path);
+  const owned: OwnedEnv = new Map();
+  for (const entry of readMarker(worktree.path)?.generated_env ?? []) {
+    // The marker is user-writable data, never a source of arbitrary paths.
+    if (ENV_FILES.includes(entry.name)) owned.set(entry.name, entry.sha256);
+  }
+  assertRemovableWorktree(worktree.path, owned);
 
   const project = registry.projects.get(projectId);
   const sessionsRemoved = registry.sessions.list(projectId)
     .filter((session) => session.worktreeId === id).length;
-  // Keep the env contents in case git still refuses at the last moment.
-  const envFiles = ENV_FILES.map((name) => join(worktree.path, name))
-    .filter((file) => existsSync(file))
-    .map((file) => ({ file, content: readFileSync(file), mode: statSync(file).mode & 0o777 }));
+  // Keep the exact bytes in case git still refuses at the last moment.
+  const staged: Array<{ file: string; content: Buffer; mode: number }> = [];
   try {
-    for (const { file } of envFiles) rmSync(file, { force: true });
+    for (const [name, expected] of owned) {
+      const file = join(worktree.path, name);
+      // A concurrent replacement after preflight is not ours to stage or overwrite.
+      if (envSha256(file) !== expected) continue;
+      try {
+        const mode = lstatSync(file).mode & 0o777;
+        const content = readFileSync(file);
+        rmSync(file, { force: true });
+        staged.push({ file, content, mode });
+      } catch {
+        // Leave an unreadable or raced entry alone.
+      }
+    }
     execFileSync('git', ['worktree', 'remove', worktree.path], {
       cwd: worktree.path, stdio: 'ignore',
     });
   } catch (err) {
-    for (const { file, content, mode } of envFiles) writeFileSync(file, content, { mode });
+    for (const { file, content, mode } of staged) {
+      try {
+        lstatSync(file);
+        continue; // any entry created after staging is foreign: never overwrite it
+      } catch {
+        // Missing: the staged bytes can be restored.
+      }
+      try {
+        writeFileSync(file, content, { mode });
+      } catch {
+        // Best effort: preserve the original git failure.
+      }
+    }
     throw err;
   }
   registry.sessions.deleteForWorktree(id);
   registry.worktrees.delete(id);
-  if (project) auditWorktreeRemoval(project.storeDir, id, sessionsRemoved);
+  if (!project) {
+    return { removed: true, auditWritten: false, auditError: 'no project store for audit' };
+  }
+  try {
+    auditWorktreeRemoval(project.storeDir, id, sessionsRemoved);
+    return { removed: true, auditWritten: true };
+  } catch (err) {
+    return {
+      removed: true,
+      auditWritten: false,
+      auditError: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 /** Lock/unlock are best-effort: plain temp directories are not git worktrees. */
 export function lockGitWorktree(markerDir: string, reason: string): boolean {
   try {
-    execFileSync('git', ['worktree', 'lock', '--reason', reason, markerDir], {
+    execFileSync('git', ['worktree', 'lock', '--reason', `${LOCK_REASON_PREFIX}${reason}`, markerDir], {
       cwd: markerDir, stdio: 'ignore',
     });
     return true;
   } catch {
-    return false;
+    // Git refuses to replace a lock. A repeat claim is fine only if we already own it.
+    return ownedLockReason(markerDir) !== undefined;
+  }
+}
+
+/** The reason of a lock Artinarey created, if this directory still holds one. */
+function ownedLockReason(markerDir: string): string | undefined {
+  try {
+    const row = listGitWorktrees(markerDir).find((wt) => samePath(wt.path, markerDir));
+    return row?.locked && row.lockReason?.startsWith(LOCK_REASON_PREFIX)
+      ? row.lockReason
+      : undefined;
+  } catch {
+    return undefined;
   }
 }
 
 export function unlockGitWorktree(markerDir: string): boolean {
+  if (ownedLockReason(markerDir) === undefined) return false;
   try {
     execFileSync('git', ['worktree', 'unlock', markerDir], {
       cwd: markerDir, stdio: 'ignore',

@@ -6,6 +6,7 @@ import {
   atomicWrite,
   buildIndex,
   claimPersona,
+  DEFAULT_PERSONA,
   fail,
   ok,
   queryMail,
@@ -13,11 +14,13 @@ import {
   releasePersona,
   releaseWorktreeForce,
   resolveIdentity,
+  rollbackFailedClaim,
   roster,
   sendMail,
   type ArtinareyErrorCode,
   type Identity,
   type IndexedMail,
+  type PersonaState,
   type Registry,
   type ToolReply,
   type XdgPaths,
@@ -142,16 +145,53 @@ function unread(ctx: RpcContext, identity: Identity): number {
   return countUnread(mails, readIds(identity.storeDir, identity.role), identity.role);
 }
 
+/** Read only top-level frontmatter scalars, honouring serializeMail's JSON quoting. */
+function frontmatter(text: string): Record<string, string> {
+  const lines = text.split('\n');
+  if (lines[0] !== '---') return {};
+  const end = lines.indexOf('---', 1);
+  if (end < 0) return {};
+  const fields: Record<string, string> = {};
+  for (const line of lines.slice(1, end)) {
+    const split = line.indexOf(':');
+    if (split < 0) continue;
+    const key = line.slice(0, split);
+    const raw = line.slice(split + 1).trim();
+    if (raw.startsWith('"')) {
+      try {
+        fields[key] = JSON.parse(raw) as string;
+        continue;
+      } catch {
+        // Fall through and keep the literal, so a torn line cannot match a receipt.
+      }
+    }
+    fields[key] = raw;
+  }
+  return fields;
+}
+
 function receiptExists(storeDir: string, mailId: string, role: string): boolean {
   const root = join(storeDir, 'mail');
   if (!existsSync(root)) return false;
   return readdirSync(root, { recursive: true }).some((entry) => {
     if (!String(entry).endsWith('.md')) return false;
-    const text = readFileSync(join(root, String(entry)), 'utf8');
-    return /^kind: receipt$/m.test(text)
-      && text.includes(`in_reply_to: ${mailId}`)
-      && text.includes(`from: ${role}`);
+    const fields = frontmatter(readFileSync(join(root, String(entry)), 'utf8'));
+    return fields.kind === 'receipt' && fields.in_reply_to === mailId && fields.from === role;
   });
+}
+
+/** The worktree a persona was bound to before this claim, for rollback. */
+function boundWorktree(
+  ctx: RpcContext, personaId: string,
+): { id: string; path: string } | undefined {
+  for (const project of ctx.registry.projects.list()) {
+    for (const worktree of ctx.registry.worktrees.list(project.id)) {
+      if (ctx.registry.bindings.forWorktree(worktree.id)?.id === personaId) {
+        return { id: worktree.id, path: worktree.path };
+      }
+    }
+  }
+  return undefined;
 }
 
 function rosterText(entries: ReturnType<typeof roster>): string {
@@ -163,27 +203,38 @@ function rosterText(entries: ReturnType<typeof roster>): string {
   }).join('\n')}`;
 }
 
-/** Forget a worktree's identity and cleanup ownership, on this context or all of them. */
+/** Forget a worktree's persona and cleanup ownership, keeping its attachment. */
 export function invalidateWorktree(ctx: RpcContext, worktreeId: string): void {
   if (ctx.claimedBindings) {
     ctx.claimedBindings = ctx.claimedBindings.filter((binding) => binding.worktreeId !== worktreeId);
   }
-  if (ctx.identity?.worktreeId === worktreeId) delete ctx.identity;
+  if (ctx.identity?.worktreeId === worktreeId) {
+    // Replace rather than mutate: the daemon shares identity with other contexts.
+    ctx.identity = {
+      projectId: ctx.identity.projectId,
+      worktreeId: ctx.identity.worktreeId,
+      markerDir: ctx.identity.markerDir,
+      storeDir: ctx.identity.storeDir,
+    };
+  }
 }
 
 function requireIdentity(
   id: string,
   ctx: RpcContext,
 ): { identity: Identity } | { response: RpcResponse } {
-  if (!ctx.identity?.personaId || !ctx.identity.role) {
+  if (!ctx.identity) {
+    return { response: toolFail(id, 'NO_PROJECT', 'call attach before this tool') };
+  }
+  if (!ctx.identity.personaId || !ctx.identity.role) {
     return {
-      response: toolFail(id, 'INVALID_INPUT', 'call attach and claim_persona before this tool'),
+      response: toolFail(id, 'INVALID_INPUT', 'call claim_persona before this tool'),
     };
   }
   const bound = ctx.registry.bindings.forWorktree(ctx.identity.worktreeId);
   if (bound?.id !== ctx.identity.personaId) {
     invalidateWorktree(ctx, ctx.identity.worktreeId);
-    return { response: toolFail(id, 'NO_PROJECT', 'binding was released; call attach again') };
+    return { response: toolFail(id, 'NO_PROJECT', 'binding was released; call claim_persona') };
   }
   return { identity: ctx.identity };
 }
@@ -260,14 +311,39 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
 
   if (request.method === 'claim_persona') {
     if (!ctx.identity) return toolFail(id, 'NO_PROJECT', 'call attach before claim_persona');
-    const alreadyBound = ctx.registry.bindings.forWorktree(ctx.identity.worktreeId)?.id;
-    const result = claimPersona(ctx.registry, ctx.identity.storeDir, ctx.identity, {
-      personaId: str(params.persona_id),
-      newRole: str(params.new_role),
-      name: str(params.name),
-      confirmMove: params.confirm_move === true,
-      rehome: params.rehome === true,
-    });
+    const identity = ctx.identity;
+    const requestedId = str(params.persona_id);
+    const newRole = str(params.new_role);
+    const name = str(params.name);
+    const alreadyBound = ctx.registry.bindings.forWorktree(identity.worktreeId)?.id;
+    const peopleBefore = new Set(ctx.registry.personas.list(identity.projectId).map((p) => p.id));
+    const stateBefore: PersonaState = requestedId
+      ? readPersona(identity.storeDir, requestedId)
+      : { ...DEFAULT_PERSONA, role: newRole ?? '', name: name ?? newRole ?? '' };
+    const originalWorktree = requestedId ? boundWorktree(ctx, requestedId) : undefined;
+    let result;
+    try {
+      result = claimPersona(ctx.registry, identity.storeDir, identity, {
+        personaId: requestedId,
+        newRole,
+        name,
+        confirmMove: params.confirm_move === true,
+        rehome: params.rehome === true,
+      });
+    } catch (err) {
+      // claimPersona commits binding/lock/persona state before its audit append.
+      // Undo that partial claim before the daemon can record connection ownership.
+      const createdId = ctx.registry.personas.list(identity.projectId)
+        .find((persona) => !peopleBefore.has(persona.id) && persona.role === newRole)?.id;
+      try {
+        rollbackFailedClaim(ctx.registry, identity, requestedId ?? createdId,
+          alreadyBound, stateBefore, originalWorktree);
+      } catch (rollbackErr) {
+        console.error(`claim rollback failed: ${(rollbackErr as Error).message ?? String(rollbackErr)}`);
+      }
+      const e = err as { code?: ArtinareyErrorCode; message?: string };
+      return toolFail(id, e.code ?? 'INVALID_INPUT', e.message ?? 'claim failed');
+    }
     if (!result.ok) return toolFail(id, result.code, result.message);
     ctx.identity = result.identity;
     const bindings = ctx.claimedBindings ?? [];
@@ -396,24 +472,37 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
     const mail = queryMail(indexFile(ctx, identity.projectId))
       .find((m) => m.id === mailId && addressedTo(m, identity.role!));
     if (!mail) return toolFail(id, 'NOT_FOUND', `no mail with id ${mailId} assigned to you`);
+    const roles = knownRoles(ctx, identity.projectId);
+    let receiptStatus = 'mailed a receipt';
     if (!receiptExists(identity.storeDir, mailId, identity.role!)) {
-      try {
-        await sendMail(identity.storeDir, {
-          from: identity.role!,
-          to: [mail.from],
-          cc: mail.from === 'senior-dev' || mail.from === 'user' ? [] : ['senior-dev'],
-          subject: `Re: ${mail.subject}`,
-          kind: 'receipt',
-          action: 'done',
-          in_reply_to: mailId,
-          body: note,
-        }, {
-          knownPersonas: knownRoles(ctx, identity.projectId),
-          role: identity.role!,
-          sharedTasks: [],
-        });
-      } catch (err) {
-        return toolFail(id, 'MAIL_REJECTED', (err as Error).message);
+      const senderKnown = roles.includes(mail.from);
+      const seniorRegistered = roles.includes('senior-dev');
+      const needsSeniorCc = mail.from !== 'senior-dev' && mail.from !== 'user';
+      if (!senderKnown) {
+        // Completion is durable even if the original sender's persona was removed.
+        receiptStatus = `no receipt sent because ${mail.from} is no longer registered`;
+      } else if (needsSeniorCc && !seniorRegistered) {
+        // A receipt to another persona needs a senior-dev cc, but that role is absent.
+        receiptStatus = 'no receipt sent because senior-dev is not registered in this project';
+      } else {
+        try {
+          await sendMail(identity.storeDir, {
+            from: identity.role!,
+            to: [mail.from],
+            cc: seniorRegistered && needsSeniorCc ? ['senior-dev'] : [],
+            subject: `Re: ${mail.subject}`,
+            kind: 'receipt',
+            action: 'done',
+            in_reply_to: mailId,
+            body: note,
+          }, {
+            knownPersonas: roles,
+            role: identity.role!,
+            sharedTasks: [],
+          });
+        } catch (err) {
+          return toolFail(id, 'MAIL_REJECTED', (err as Error).message);
+        }
       }
     }
     // Retry-safe mail, but the index is derived: rebuild it even when the receipt
@@ -430,7 +519,7 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
         created_at: new Date().toISOString(),
       });
     }
-    return toolOk(id, ok(`Marked ${mailId} done and mailed a receipt.`, unread(ctx, identity), 'inbox'));
+    return toolOk(id, ok(`Marked ${mailId} done and ${receiptStatus}.`, unread(ctx, identity), 'inbox'));
   }
 
   if (request.method === 'report') {
@@ -466,12 +555,12 @@ export function releaseConnection(ctx: RpcContext): void {
   const bindings = ctx.claimedBindings ?? [];
   delete ctx.claimedBindings;
   for (const binding of bindings) {
-    const bound = ctx.registry.bindings.forWorktree(binding.worktreeId);
-    if (bound?.id !== binding.personaId) continue;
-    // A later claim of the same persona is a new binding instance, not ours to release.
-    if (binding.claimLine !== undefined
-        && claimLine(binding.storeDir, binding.personaId) !== binding.claimLine) continue;
     try {
+      const bound = ctx.registry.bindings.forWorktree(binding.worktreeId);
+      if (bound?.id !== binding.personaId) continue;
+      // A later claim of the same persona is a new binding instance, not ours to release.
+      if (binding.claimLine !== undefined
+          && claimLine(binding.storeDir, binding.personaId) !== binding.claimLine) continue;
       releasePersona(ctx.registry, binding.storeDir, binding.personaId);
     } catch (err) {
       console.error(`persona release failed: ${(err as Error).message ?? String(err)}`);

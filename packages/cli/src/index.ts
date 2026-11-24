@@ -6,10 +6,10 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   adoptWorktree, atomicWrite, buildIndex, claimPersona, createWorktree, ensureExcludeBlock,
-  findMarker, globalIgnoreCoverage, listGitWorktrees, lockGitWorktree, newId, openRegistry,
+  findMarker, globalIgnoreCoverage, listGitWorktrees, newId, openRegistry,
   planWorktree, projectStore, readPersona, reconcileWorktrees, rehomePersona, releasePersona,
-  removeWorktree, resolveIdentity, resolveRepo, resolveXdgPaths, roster, unlockGitWorktree,
-  writeMarker, writePersona,
+  removeWorktree, resolveIdentity, resolveRepo, resolveXdgPaths, roster, rollbackFailedClaim,
+  writeMarker,
 } from '@artinarey/core';
 import { callDaemon, daemonStatus, startDaemon, stopDaemon } from '@artinarey/daemon';
 
@@ -85,33 +85,6 @@ function boundWorktree(
     }
   }
   return undefined;
-}
-
-/** Undo the binding, persona state and locks if claimPersona throws after acquiring them. */
-function rollbackFailedClaim(
-  registry: RegistryHandle,
-  identity: Parameters<typeof claimPersona>[2],
-  personaId: string | undefined,
-  previousBinding: string | undefined,
-  previousState: ReturnType<typeof readPersona>,
-  originalWorktree: { id: string; path: string } | undefined,
-): void {
-  if (!personaId || registry.bindings.forWorktree(identity.worktreeId)?.id !== personaId) return;
-  try {
-    writePersona(identity.storeDir, personaId, previousState);
-  } finally {
-    // Only undo resources this attempt acquired; keep a binding/lock that predated it.
-    if (previousBinding !== personaId) {
-      registry.bindings.release(personaId);
-      unlockGitWorktree(identity.markerDir);
-      // A confirmed move may have rebound the persona from its old worktree;
-      // put that binding and lock back instead of losing the original home.
-      if (originalWorktree && originalWorktree.id !== identity.worktreeId) {
-        registry.bindings.bind(personaId, originalWorktree.id);
-        lockGitWorktree(originalWorktree.path, registry.personas.get(personaId)?.role ?? personaId);
-      }
-    }
-  }
 }
 
 /** Git is the authority on whether a registered worktree is still attached here. */
@@ -321,8 +294,11 @@ export async function main(
           console.error(`unknown worktree: ${name}`);
           return 1;
         }
-        removeWorktree(registry, project.id, row.id);
+        const removal = removeWorktree(registry, project.id, row.id);
         console.log(`removed ${row.path}`);
+        if (!removal.auditWritten) {
+          console.error(`warning: worktree removed but audit event was not written: ${removal.auditError ?? 'unknown error'}`);
+        }
         return 0;
       } finally {
         registry.close();
@@ -473,7 +449,7 @@ export async function main(
     let registry: RegistryHandle | undefined;
     let claimed: ClaimedPersona | undefined;
     let claimedWorktreeId: string | undefined;
-    let newlyAcquired = false;
+    let createdBinding = false;
     let sessionId: string | undefined;
     try {
       registry = openRegistry(resolveXdgPaths(env).registryFile);
@@ -488,18 +464,27 @@ export async function main(
         return 1;
       }
 
-      const options = { personaId: personaToken, confirmMove, rehome };
-      const attemptedId = resolvePersona(registry, identity.projectId, personaToken).id ?? personaToken;
+      const resolvedPersona = resolvePersona(registry, identity.projectId, personaToken);
+      if (resolvedPersona.error) {
+        console.error(resolvedPersona.error);
+        return 1;
+      }
+      if (!resolvedPersona.id) {
+        console.error(`unknown persona: ${personaToken}`);
+        return 1;
+      }
+      const personaId = resolvedPersona.id;
+      const options = { personaId, confirmMove, rehome };
       const previousBinding = registry.bindings.forWorktree(identity.worktreeId)?.id;
-      const originalWorktree = boundWorktree(registry, attemptedId);
-      const previousState = readPersona(identity.storeDir, attemptedId);
+      const originalWorktree = boundWorktree(registry, personaId);
+      const previousState = readPersona(identity.storeDir, personaId);
       const db = registry;
       const tryClaim = (claimOptions: Parameters<typeof claimPersona>[3]) => {
         try {
           return claimPersona(db, identity.storeDir, identity, claimOptions);
         } catch (err) {
           rollbackFailedClaim(
-            db, identity, attemptedId, previousBinding, previousState, originalWorktree,
+            db, identity, personaId, previousBinding, previousState, originalWorktree,
           );
           throw err;
         }
@@ -519,7 +504,7 @@ export async function main(
       }
       claimed = claim;
       claimedWorktreeId = claim.identity.worktreeId;
-      newlyAcquired = previousBinding !== claim.personaId;
+      createdBinding = previousBinding !== claim.personaId;
 
       sessionId = registry.sessions.append({
         projectId: identity.projectId,
@@ -527,6 +512,7 @@ export async function main(
         personaId: claim.personaId,
         vendor,
         startedAt: new Date().toISOString(),
+        createdBinding,
       });
       const child = spawn(vendorCommand, [], {
         cwd: identity.markerDir, stdio: 'inherit', env,
@@ -540,21 +526,33 @@ export async function main(
       return 1;
     } finally {
       if (registry) {
-        if (claimed && claimedWorktreeId && newlyAcquired) {
-          const record = claimed;
-          const now = Date.now();
-          const otherActive = registry.sessions.list(record.identity.projectId)
-            .some((session) => session.worktreeId === claimedWorktreeId
-              && session.personaId === record.personaId && !session.endedAt
-              && session.id !== sessionId
-              && now - Date.parse(session.startedAt) <= ACTIVE_SESSION_TTL_MS);
-          if (!otherActive
-              && registry.bindings.forWorktree(claimedWorktreeId)?.id === record.personaId) {
-            releasePersona(registry, record.identity.storeDir, record.personaId);
+        try {
+          if (claimed && claimedWorktreeId) {
+            const record = claimed;
+            const now = Date.now();
+            const recent = registry.sessions.list(record.identity.projectId)
+              .filter((session) => session.worktreeId === claimedWorktreeId
+                && session.personaId === record.personaId
+                && now - Date.parse(session.startedAt) <= ACTIVE_SESSION_TTL_MS);
+            const otherActive = recent.some((session) => !session.endedAt && session.id !== sessionId);
+            // A joining run may be the last to exit: release only if this run or a
+            // sibling session created the binding, never a pre-existing one. The
+            // local flag also covers a claim whose session insert failed.
+            const createdByOverlap = createdBinding || recent.some((session) => session.createdBinding);
+            if (!otherActive && createdByOverlap
+                && registry.bindings.forWorktree(claimedWorktreeId)?.id === record.personaId) {
+              try {
+                releasePersona(registry, record.identity.storeDir, record.personaId);
+              } catch (err) {
+                // Cleanup is best-effort: never replace the vendor's exit code with ours.
+                console.error(`run failed to release persona: ${(err as Error).message}`);
+              }
+            }
           }
+          if (sessionId) registry.sessions.end(sessionId, new Date().toISOString());
+        } finally {
+          registry.close();
         }
-        if (sessionId) registry.sessions.end(sessionId, new Date().toISOString());
-        registry.close();
       }
     }
   }

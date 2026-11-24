@@ -111,7 +111,7 @@ spike/m0/                              throwaway; removed in Task 10
   evidence.md                          pasted command/output pairs, verbatim
   README.md                            exact re-run commands
 opencode.json                          committed at repo root so the worktree inherits it
-docs/superpowers/plans/2026-11-23-m0-foundation-spike.md   this plan
+docs/plans/2026-11-23-m0-foundation-spike.md             this plan
 ```
 
 Conventions:
@@ -498,7 +498,7 @@ updates:
       interval: weekly
 ```
 
-The npm entry is inert until a root `package.json` exists; that is intentional — M1 will add one.
+The `npm` ecosystem key is correct for pnpm: Dependabot detects pnpm through `pnpm-lock.yaml`, so the entry applies without waiting for a root `package.json`.
 
 Create `.github/workflows/ci.yml`:
 

@@ -61,6 +61,8 @@ export function createRpcServer(
   socketPath: string,
   onShutdown?: () => void,
   shared?: RpcContext,
+  /** Test seam: fires after per-connection cleanup, including when release fails. */
+  onConnectionClosed?: () => void,
 ): RpcServer {
   let server: Server | undefined;
   let closePromise: Promise<void> | undefined;
@@ -97,29 +99,30 @@ export function createRpcServer(
         });
         socket.on('close', () => {
           sockets.delete(socket);
-          if (ctx) {
-            contexts.delete(ctx);
-            try {
+          try {
+            if (ctx) {
+              contexts.delete(ctx);
               releaseConnection(ctx);
-            } catch (err) {
-              console.error(`connection cleanup failed: ${(err as Error).message ?? String(err)}`);
-            } finally {
-              closed.delete(closedPromise);
-              markClosed();
             }
-          } else {
+          } catch (err) {
+            console.error(`connection cleanup failed: ${(err as Error).message ?? String(err)}`);
+          } finally {
             closed.delete(closedPromise);
             markClosed();
+            onConnectionClosed?.();
           }
         });
         socket.setEncoding('utf8');
         let buffer = '';
+        // One queue per connection: replies stay in request order and a loop that
+        // awaits a slow tool cannot race a later data event over the same buffer.
+        let queued: Promise<void> = Promise.resolve();
 
         socket.on('data', (chunk: string) => {
           buffer += chunk;
-          let end: number;
-          void (async () => {
-            while ((end = buffer.indexOf('\n')) >= 0) {
+          queued = queued.then(async () => {
+            let end: number;
+            while (!socket.destroyed && (end = buffer.indexOf('\n')) >= 0) {
               const line = buffer.slice(0, end);
               buffer = buffer.slice(end + 1);
               if (!line.trim()) continue;
@@ -129,15 +132,27 @@ export function createRpcServer(
               let shutdown = false;
               try {
                 request = JSON.parse(line) as RpcRequest;
-                response = await dispatchRequest(request, ctx);
-                shutdown = response.ok && request?.method === 'shutdown';
               } catch (err) {
-                response = {
+                socket.write(`${JSON.stringify({
                   id: 'invalid',
                   ok: false,
                   error: {
                     code: (err as { code?: string }).code ?? 'INVALID_INPUT',
                     message: (err as Error).message ?? 'malformed JSON',
+                  },
+                } satisfies RpcResponse)}\n`);
+                continue;
+              }
+              try {
+                response = await dispatchRequest(request, ctx);
+                shutdown = response.ok && request?.method === 'shutdown';
+              } catch (err) {
+                response = {
+                  id: request?.id ?? 'invalid',
+                  ok: false,
+                  error: {
+                    code: (err as { code?: string }).code ?? 'INTERNAL_ERROR',
+                    message: (err as Error).message ?? 'request failed',
                   },
                 };
               }
@@ -149,7 +164,7 @@ export function createRpcServer(
                 });
               }
             }
-          })().catch((err) => {
+          }).catch((err) => {
             console.error(`request failed: ${(err as Error).message ?? String(err)}`);
           });
         });
@@ -180,9 +195,13 @@ export function createRpcServer(
           // Every close handler must release its binding before the registry closes.
           await Promise.allSettled([...closed]);
           closed.clear();
-          if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
-          if (existsSync(socketPath)) unlinkSync(socketPath);
-          onShutdown?.();
+          try {
+            if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
+            if (existsSync(socketPath)) unlinkSync(socketPath);
+          } finally {
+            // Lock and registry cleanup must happen even if the socket is unremovable.
+            onShutdown?.();
+          }
         })();
       }
       return closePromise;

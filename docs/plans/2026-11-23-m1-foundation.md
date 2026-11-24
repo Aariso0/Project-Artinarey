@@ -172,7 +172,7 @@ Create root `package.json`, `pnpm-workspace.yaml`, `tsconfig.base.json`, `eslint
 }
 ```
 
-Update `.github/workflows/ci.yml` node job: use `pnpm/action-setup@v4` with `version: 10`, `actions/setup-node@v4` with `cache: pnpm`, then `pnpm install --frozen-lockfile`, `pnpm typecheck`, `pnpm lint`, `pnpm test`. The `npm ci` job is wrong once a root `package.json` exists.
+Update `.github/workflows/ci.yml` node job: use `pnpm/action-setup@v4` with `version: 10`, `actions/setup-node@v4` with `cache: pnpm`, then `pnpm install --frozen-lockfile`, `pnpm typecheck`, `pnpm lint`, `pnpm test`. The `npm ci` job is wrong once a root `package.json` exists. Set workflow-level `permissions: contents: read` and add `persist-credentials: false` to the `actions/checkout@v4` step. Credential persistence is disabled at checkout, not in `actions/setup-node`.
 
 **Verify:** `pnpm install` succeeds, `pnpm test` exits 0 with no tests yet, `pnpm typecheck` clean, `pnpm lint` clean. Commit `chore: scaffold pnpm monorepo`.
 

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,6 +17,36 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void
     if (Date.now() >= deadline) throw new Error('condition not met before deadline');
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+}
+
+function rawRpc(path: string, line: string): Promise<RpcResponse> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(path);
+    let buffer = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      socket.destroy();
+      if (!settled) reject(new Error('RPC timed out'));
+    }, 2000);
+    socket.setEncoding('utf8');
+    socket.on('connect', () => socket.write(`${line}\n`));
+    socket.on('data', (chunk: string) => {
+      buffer += chunk;
+      const end = buffer.indexOf('\n');
+      if (end === -1 || settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        resolve(JSON.parse(buffer.slice(0, end)) as RpcResponse);
+      } catch (err) {
+        reject(err);
+      }
+      socket.destroy();
+    });
+    socket.on('error', (err) => {
+      if (!settled) { settled = true; clearTimeout(timer); reject(err); }
+    });
+  });
 }
 
 function rpc(path: string, request: unknown): Promise<RpcResponse> {
@@ -133,6 +163,55 @@ test('a connection cleanup failure does not hang server.close', async () => {
     await server.close();
   } finally {
     console.error = originalError;
+  }
+});
+
+test('a dispatch exception replies with the parsed request id, not invalid', async () => {
+  const path = socketPath();
+  const registry = {
+    personas: { list() { throw new Error('dispatch boom'); } },
+  } as unknown as Registry;
+  const server = createRpcServer(path, undefined, {
+    registry, paths: {} as XdgPaths,
+    identity: {
+      projectId: 'p', worktreeId: 'w', markerDir: '/tmp', storeDir: '/tmp',
+      personaId: 'x', role: 'dev',
+    },
+  });
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    await server.start();
+    const response = await rpc(path, { id: 'req-7', method: 'check_in' });
+    assert.equal(response.ok, false);
+    assert.equal(response.id, 'req-7', 'a dispatch failure must stay matched to its request');
+    if (!response.ok) assert.match(response.error.message, /dispatch boom/);
+    // Only a JSON parse failure keeps the reserved id.
+    const malformed = await rawRpc(path, '{not json');
+    assert.equal(malformed.id, 'invalid');
+  } finally {
+    console.error = originalError;
+    await server.close();
+  }
+});
+
+test('close runs onShutdown even when the socket cannot be unlinked', async () => {
+  const path = socketPath();
+  let shutdownCalls = 0;
+  const server = createRpcServer(path, () => { shutdownCalls++; });
+  await server.start();
+  // A directory cannot be unlinked: this forces the failure after server.close().
+  rmSync(path);
+  mkdirSync(path);
+  try {
+    await assert.rejects(() => server.close(), (err: NodeJS.ErrnoException) => {
+      assert.ok(err.code === 'EISDIR' || err.code === 'EPERM' || err.code === 'EISFAULT');
+      return true;
+    });
+    assert.equal(shutdownCalls, 1, 'the callback must run even when unlink fails');
+  } finally {
+    rmSync(path, { recursive: true, force: true });
+    await server.close().catch(() => {});
   }
 });
 

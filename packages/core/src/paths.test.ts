@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { homedir } from 'node:os';
+import { isAbsolute, join } from 'node:path';
 import { projectStore, resolveXdgPaths } from './paths.ts';
 
 const fullEnv = {
@@ -44,6 +46,16 @@ test('resolveXdgPaths ignores relative XDG overrides', () => {
   assert.equal(p.dataRoot, '/tmp/home/.local/share/artinarey');
   assert.equal(p.cacheRoot, '/tmp/home/.cache/artinarey');
   assert.equal(p.socketPath.includes('relative/run'), false, 'relative runtime override is ignored');
+});
+
+test('resolveXdgPaths uses the OS home directory when HOME is missing', () => {
+  const p = resolveXdgPaths({});
+
+  assert.equal(p.configDir, join(homedir(), '.config', 'artinarey'));
+  assert.equal(p.dataRoot, join(homedir(), '.local', 'share', 'artinarey'));
+  assert.equal(p.cacheRoot, join(homedir(), '.cache', 'artinarey'));
+  assert.equal(isAbsolute(p.configDir), true);
+  assert.equal(isAbsolute(p.socketPath), true);
 });
 
 test('projectStore places a project directly under the data root', () => {

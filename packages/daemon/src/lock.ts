@@ -134,6 +134,18 @@ export async function acquireLock(file: string): Promise<InstanceLock> {
         const pid = await publishedPid(file);
         if (pid === undefined) {
           if (!existsSync(file)) continue;
+          // Empty/malformed content has no live owner. Reclaim it only under the
+          // cross-process guard and only if it is still the same unreadable file.
+          const reclaimed = withStaleGuard(file, () => {
+            if (!sameFile(seen, statIfExists(file)) || readLock(file) !== undefined) return false;
+            try {
+              unlinkSync(file);
+            } catch (err) {
+              if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+            }
+            return true;
+          });
+          if (reclaimed) continue;
           throw new ArtinareyError('ALREADY_RUNNING', 'daemon lock is being created; retry');
         }
         if (isAlive(pid)) {

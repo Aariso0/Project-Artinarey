@@ -1,13 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync,
+  symlinkSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newId } from './ids.ts';
 import { openRegistry } from './registry.ts';
 import { readPersona, writePersona } from './persona-store.ts';
-import { listGitWorktrees } from './worktree.ts';
+import { adoptWorktree, listGitWorktrees } from './worktree.ts';
 import {
   claimPersona,
   createPersona,
@@ -118,7 +121,9 @@ function gitRegistrySetup() {
 }
 
 function isLocked(repo: string, path: string): boolean {
-  return listGitWorktrees(repo).find((wt) => wt.path === path)?.locked === true;
+  const canonical = realpathSync(path);
+  return listGitWorktrees(repo)
+    .find((wt) => realpathSync(wt.path) === canonical)?.locked === true;
 }
 
 test('resolveIdentity maps a marked directory to its project and worktree', () => {
@@ -461,6 +466,58 @@ test('release and force release unlock even when the audit append fails', () => 
   }
 });
 
+test('release keeps the binding and git lock when binding deletion fails', () => {
+  const s = gitRegistrySetup();
+  try {
+    const x = s.add('x');
+    const y = s.add('y');
+    const persona = createPersona(s.registry, s.storeDir, s.project.id, 'dev-keep-lock', 'Keep');
+    const other = createPersona(s.registry, s.storeDir, s.project.id, 'dev-force-keep', 'Force');
+    const xIdentity = resolveIdentity(s.registry, x.path);
+    const yIdentity = resolveIdentity(s.registry, y.path);
+    assert.equal(xIdentity.ok, true);
+    assert.equal(yIdentity.ok, true);
+    if (!xIdentity.ok || !yIdentity.ok) return;
+    assert.equal(claimPersona(s.registry, s.storeDir, xIdentity.identity, { personaId: persona }).ok, true);
+    assert.equal(claimPersona(s.registry, s.storeDir, yIdentity.identity, { personaId: other }).ok, true);
+
+    const release = s.registry.bindings.release;
+    s.registry.bindings.release = () => { throw new Error('database is locked'); };
+    assert.throws(() => releasePersona(s.registry, s.storeDir, persona));
+    assert.throws(() => releaseWorktreeForce(s.registry, s.storeDir, y.id));
+    s.registry.bindings.release = release;
+
+    assert.equal(s.registry.bindings.forWorktree(x.id)?.id, persona);
+    assert.equal(s.registry.bindings.forWorktree(y.id)?.id, other);
+    assert.equal(isLocked(s.repo, x.path), true);
+    assert.equal(isLocked(s.repo, y.path), true);
+  } finally {
+    s.registry.close();
+  }
+});
+
+test('release unlocks the worktree when the persona file write fails after deletion', () => {
+  const s = gitRegistrySetup();
+  try {
+    const x = s.add('x');
+    const persona = createPersona(s.registry, s.storeDir, s.project.id, 'dev-bad-state', 'Bad');
+    const identity = resolveIdentity(s.registry, x.path);
+    assert.equal(identity.ok, true);
+    if (!identity.ok) return;
+    assert.equal(claimPersona(s.registry, s.storeDir, identity.identity, { personaId: persona }).ok, true);
+
+    const personaFile = join(s.storeDir, 'personas', persona, 'persona.json');
+    rmSync(personaFile, { force: true });
+    mkdirSync(personaFile, { recursive: true });
+
+    assert.throws(() => releasePersona(s.registry, s.storeDir, persona));
+    assert.equal(s.registry.bindings.forWorktree(x.id), undefined);
+    assert.equal(isLocked(s.repo, x.path), false);
+  } finally {
+    s.registry.close();
+  }
+});
+
 test('resolveIdentity returns WORKTREE_UNMANAGED when the diagnostic audit fails', () => {
   const s = setup();
   const bogus = join(s.root, 'bogus');
@@ -514,4 +571,148 @@ test('rehomePersona clears the home mismatch that would otherwise need confirmat
   assert.deepEqual(rehomePersona(s.registry, s.storeDir, dev, s.wt2), { ok: true });
   assert.equal(claimPersona(s.registry, s.storeDir, other.identity, { personaId: dev }).ok, true);
   s.registry.close();
+});
+
+function expectInvalidInput(run: () => unknown, label: string): void {
+  assert.throws(run, (err: unknown) => {
+    assert.ok(err instanceof Error, `${label}: expected an Error`);
+    assert.equal((err as { code?: string }).code, 'INVALID_INPUT');
+    return true;
+  }, label);
+}
+
+test('adoptWorktree refuses a symlinked marker without writing through it', () => {
+  const s = gitRegistrySetup();
+  try {
+    const target = s.add('symlink-marker');
+    s.registry.worktrees.delete(target.id);
+    rmSync(join(target.path, '.artinarey.json'));
+    const outside = join(s.root, 'outside-sentinel.json');
+    writeFileSync(outside, 'SENTINEL\n');
+    const marker = join(target.path, '.artinarey.json');
+    symlinkSync(outside, marker);
+
+    expectInvalidInput(
+      () => adoptWorktree(s.registry, s.storeDir, s.project.id, target.path),
+      'symlinked marker',
+    );
+
+    assert.equal(lstatSync(marker).isSymbolicLink(), true);
+    assert.equal(readFileSync(outside, 'utf8'), 'SENTINEL\n');
+    assert.deepEqual(s.registry.worktrees.list(s.project.id).map((row) => row.id), []);
+  } finally {
+    s.registry.close();
+  }
+});
+
+test('adoptWorktree refuses a directory marker without removing it', () => {
+  const s = gitRegistrySetup();
+  try {
+    const target = s.add('dir-marker');
+    s.registry.worktrees.delete(target.id);
+    const marker = join(target.path, '.artinarey.json');
+    rmSync(marker);
+    mkdirSync(marker);
+
+    expectInvalidInput(
+      () => adoptWorktree(s.registry, s.storeDir, s.project.id, target.path),
+      'directory marker',
+    );
+
+    assert.equal(lstatSync(marker).isDirectory(), true);
+    assert.deepEqual(s.registry.worktrees.list(s.project.id).map((row) => row.id), []);
+  } finally {
+    s.registry.close();
+  }
+});
+
+test('a manual git lock survives release while an Artinarey lock is removed', () => {
+  const s = gitRegistrySetup();
+  try {
+    const x = s.add('x');
+    const y = s.add('y');
+    const owned = createPersona(s.registry, s.storeDir, s.project.id, 'dev-owned', 'Owned');
+    const manual = createPersona(s.registry, s.storeDir, s.project.id, 'dev-manual', 'Manual');
+    const xIdentity = resolveIdentity(s.registry, x.path);
+    const yIdentity = resolveIdentity(s.registry, y.path);
+    assert.equal(xIdentity.ok, true);
+    assert.equal(yIdentity.ok, true);
+    if (!xIdentity.ok || !yIdentity.ok) return;
+    assert.equal(claimPersona(s.registry, s.storeDir, xIdentity.identity, { personaId: owned }).ok, true);
+    assert.equal(claimPersona(s.registry, s.storeDir, yIdentity.identity, { personaId: manual }).ok, true);
+    assert.equal(isLocked(s.repo, x.path), true);
+    assert.equal(isLocked(s.repo, y.path), true);
+
+    // Replace only y's Artinarey lock with one Git created outside Artinarey.
+    git(['worktree', 'unlock', y.path], s.repo);
+    git(['worktree', 'lock', '--reason', 'manual hold', y.path], s.repo);
+    const manualRow = listGitWorktrees(s.repo)
+      .find((wt) => realpathSync(wt.path) === realpathSync(y.path));
+    assert.equal(manualRow?.lockReason, 'manual hold');
+
+    releasePersona(s.registry, s.storeDir, owned);
+    releasePersona(s.registry, s.storeDir, manual);
+
+    assert.equal(isLocked(s.repo, x.path), false, 'Artinarey unlocked its own lock');
+    assert.equal(isLocked(s.repo, y.path), true, 'a manual lock must survive release');
+    assert.equal(listGitWorktrees(s.repo)
+      .find((wt) => realpathSync(wt.path) === realpathSync(y.path))?.lockReason, 'manual hold');
+    git(['worktree', 'unlock', y.path], s.repo);
+  } finally {
+    s.registry.close();
+  }
+});
+
+test('a repeat claim keeps Artinarey lock ownership through release', () => {
+  const s = gitRegistrySetup();
+  try {
+    const x = s.add('x');
+    const persona = createPersona(s.registry, s.storeDir, s.project.id, 'dev-repeat', 'Repeat');
+    const identity = resolveIdentity(s.registry, x.path);
+    assert.equal(identity.ok, true);
+    if (!identity.ok) return;
+    assert.equal(claimPersona(s.registry, s.storeDir, identity.identity, { personaId: persona }).ok, true);
+    assert.equal(claimPersona(s.registry, s.storeDir, identity.identity, { personaId: persona }).ok, true);
+    const row = listGitWorktrees(s.repo)
+      .find((wt) => realpathSync(wt.path) === realpathSync(x.path));
+    assert.match(row?.lockReason ?? '', /^artinarey:/);
+
+    releasePersona(s.registry, s.storeDir, persona);
+    assert.equal(isLocked(s.repo, x.path), false);
+  } finally {
+    s.registry.close();
+  }
+});
+
+test('createPersona compensates an audit failure so a retry does not duplicate the persona', () => {
+  const s = setup();
+  try {
+    const auditFile = join(s.storeDir, 'events', 'audit.jsonl');
+    rmSync(auditFile, { force: true });
+    mkdirSync(auditFile, { recursive: true });
+
+    assert.throws(() => createPersona(s.registry, s.storeDir, s.project.id, 'dev-retry', 'Retry'));
+    assert.deepEqual(s.registry.personas.list(s.project.id), []);
+    const personasDir = join(s.storeDir, 'personas');
+    if (existsSync(personasDir)) assert.deepEqual(readdirSync(personasDir), []);
+
+    rmSync(auditFile, { recursive: true, force: true });
+    const retry = createPersona(s.registry, s.storeDir, s.project.id, 'dev-retry', 'Retry');
+    assert.deepEqual(s.registry.personas.list(s.project.id).map((p) => p.id), [retry]);
+    assert.equal(auditEvents(s.storeDir, 'persona_created').length, 1);
+  } finally {
+    s.registry.close();
+  }
+});
+
+test('createPersona removes the registry row when the persona file write fails', () => {
+  const s = setup();
+  try {
+    // A plain file where the personas directory belongs makes atomicWrite fail.
+    writeFileSync(join(s.storeDir, 'personas'), 'blocker\n');
+    assert.throws(() => createPersona(s.registry, s.storeDir, s.project.id, 'dev-write-fail', 'Write'));
+    assert.deepEqual(s.registry.personas.list(s.project.id), []);
+  } finally {
+    s.registry.close();
+  }
 });

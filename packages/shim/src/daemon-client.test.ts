@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -86,6 +87,77 @@ test('daemon errors become isError replies with the full instruction text', asyn
   } finally {
     client.close();
     await server.close();
+    s.registry.close();
+  }
+});
+
+test('a dispatch exception reply is matched to its request instead of timing out', async () => {
+  const s = setup();
+  const server = createRpcServer(s.paths.socketPath, undefined, {
+    registry: s.registry, paths: s.paths,
+  });
+  await server.start();
+  const client = createDaemonClient({
+    paths: s.paths, cwd: s.cwd, pid: process.pid, autoStart: false, timeoutMs: 400,
+  });
+  try {
+    assert.equal((await client.invoke('check_in', {})).isError, false);
+    // queryMail now throws for this path; the daemon must reply with the request id.
+    const index = join(s.paths.cacheRoot, s.project.id, 'index.sqlite');
+    mkdirSync(index, { recursive: true });
+    const reply = await client.invoke('inbox', {});
+    assert.equal(reply.isError, true);
+    assert.doesNotMatch(reply.text, /STORE_OFFLINE/, 'a matched error reply must not time out');
+  } finally {
+    client.close();
+    await server.close();
+    s.registry.close();
+  }
+});
+
+test('malformed and unmatched replies are ignored without crashing the client', async () => {
+  const s = setup();
+  const server = createServer((socket) => {
+    socket.setEncoding('utf8');
+    let buffer = '';
+    socket.on('data', (chunk: string) => {
+      buffer += chunk;
+      let end: number;
+      while ((end = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, end);
+        buffer = buffer.slice(end + 1);
+        const id = JSON.parse(line).id as string;
+        socket.write('{not json\n');
+        socket.write(`${JSON.stringify({ id: 'someone-else', ok: true, result: {
+          text: 'wrong', isError: false,
+        } })}\n`);
+        socket.write(`${JSON.stringify({ id, ok: true, result: {
+          text: 'ok', isError: false,
+        } })}\n`);
+      }
+    });
+  });
+  mkdirSync(dirname(s.paths.socketPath), { recursive: true });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(s.paths.socketPath, resolve);
+  });
+  const client = createDaemonClient({
+    paths: s.paths, cwd: s.cwd, pid: process.pid, autoStart: false, timeoutMs: 500,
+  });
+  const uncaught: Error[] = [];
+  const onUncaught = (err: Error) => { uncaught.push(err); };
+  process.on('uncaughtException', onUncaught);
+  try {
+    const reply = await client.invoke('check_in', {});
+    assert.equal(reply.isError, false, reply.text);
+    assert.equal(reply.text, 'ok');
+    assert.deepEqual(uncaught, [], 'a malformed line must not throw from the data listener');
+  } finally {
+    process.off('uncaughtException', onUncaught);
+    client.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(s.paths.socketPath, { force: true });
     s.registry.close();
   }
 });

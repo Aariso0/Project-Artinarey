@@ -213,3 +213,32 @@ test('50 concurrent sendMail calls give unique ids, 50 immutable files, and 50 a
   assert.equal(recoverProject(dir).trimmedLines, 0, 'no torn audit lines');
   assert.deepEqual(recoverProject(dir).removedTemps, []);
 });
+
+test('validateMail rejects explicit ids that are not ULIDs', () => {
+  assert.match(rejectionReason({ ...base, id: 'alias/../E' }), /ULID/i);
+  assert.match(rejectionReason({ ...base, id: '../outside' }), /ULID/i);
+  assert.equal(validateMail({ ...base, id: newId() }, ctx).ok, true);
+});
+
+test('sendMail does not overwrite an existing file through a path-alias id', async () => {
+  const dir = tempStore();
+  const id = newId();
+  await sendMail(dir, { ...base, id, subject: 'original' }, ctx);
+
+  await assert.rejects(
+    () => sendMail(dir, { ...base, id: `alias/../${id}`, subject: 'replacement' }, ctx),
+    (err: unknown) => err instanceof ArtinareyError && err.code === 'MAIL_REJECTED',
+  );
+
+  const file = join(dir, 'mail', '2026', '11', `${id}.md`);
+  assert.match(readFileSync(file, 'utf8'), /subject: original/);
+});
+
+test('serializeMail quotes values containing a YAML comment marker', () => {
+  const result = validateMail({ ...base, subject: 'Review #42' }, ctx);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  const text = serializeMail({ ...result.value, created_at: '2026-11-23T10:15:00Z' });
+  assert.match(text, /^subject: "Review #42"$/m);
+});

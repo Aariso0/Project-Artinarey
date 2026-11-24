@@ -1,50 +1,95 @@
-import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import {
+  closeSync, constants as fsConstants, existsSync, lstatSync, openSync, readFileSync,
+  realpathSync, rmSync, writeSync,
+} from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import type { ArtinareyErrorCode } from './errors.ts';
-import { readPersona, writePersona } from './persona-store.ts';
+import { ArtinareyError, type ArtinareyErrorCode } from './errors.ts';
+import { personaDir, readPersona, writePersona, type PersonaState } from './persona-store.ts';
 import { appendJournal } from './store.ts';
 import type { Registry } from './registry.ts';
 import { listGitWorktrees, lockGitWorktree, unlockGitWorktree } from './worktree.ts';
+
+/** An env copy Artinarey created itself, identified by the exact bytes it wrote. */
+export type GeneratedEnv = { name: string; sha256: string };
 
 export type Marker = {
   schema: 1;
   project_id: string;
   worktree_id: string;
+  generated_env?: GeneratedEnv[];
 };
 
 export const MARKER_FILE = '.artinarey.json';
 
+function isGeneratedEnv(value: unknown): value is GeneratedEnv {
+  if (typeof value !== 'object' || value === null) return false;
+  const entry = value as Record<string, unknown>;
+  return typeof entry.name === 'string' && typeof entry.sha256 === 'string';
+}
+
 function isMarker(value: unknown): value is Marker {
   if (typeof value !== 'object' || value === null) return false;
   const m = value as Record<string, unknown>;
-  return m.schema === 1 && typeof m.project_id === 'string' && typeof m.worktree_id === 'string';
+  return m.schema === 1 && typeof m.project_id === 'string' && typeof m.worktree_id === 'string'
+    && (m.generated_env === undefined
+      || (Array.isArray(m.generated_env) && m.generated_env.every(isGeneratedEnv)));
 }
 
-/** IDs only: no store path, no persona. */
-export function writeMarker(dir: string, projectId: string, worktreeId: string): void {
-  writeFileSync(join(dir, MARKER_FILE), JSON.stringify({
+/** IDs and generated-file ownership only: no store path, no persona. */
+export function writeMarker(
+  dir: string, projectId: string, worktreeId: string, generatedEnv?: GeneratedEnv[],
+): void {
+  const marker: Marker = {
     schema: 1,
     project_id: projectId,
     worktree_id: worktreeId,
-  }));
+    ...(generatedEnv && generatedEnv.length > 0 ? { generated_env: generatedEnv } : {}),
+  };
+  // O_NOFOLLOW closes the lstat→write window; never write through a foreign marker.
+  const fd = openSync(join(dir, MARKER_FILE),
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW,
+    0o644);
+  try {
+    writeSync(fd, JSON.stringify(marker));
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Read a marker in one directory only, without walking up to a parent project. */
+export function readMarker(dir: string): Marker | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(join(dir, MARKER_FILE), 'utf8'));
+    return isMarker(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Walk up from a directory to the nearest valid marker. */
 export function findMarker(startDir: string): { dir: string; marker: Marker } | undefined {
   let current = resolve(startDir);
   while (true) {
-    const file = join(current, MARKER_FILE);
-    if (existsSync(file)) {
-      try {
-        const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
-        if (isMarker(parsed)) return { dir: current, marker: parsed };
-      } catch {
-        // ignore malformed markers and keep walking
-      }
-    }
+    const marker = readMarker(current);
+    if (marker) return { dir: current, marker };
     const parent = dirname(current);
     if (parent === current) return undefined;
     current = parent;
+  }
+}
+
+/** A non-regular marker is foreign state: reject it before any cleanup can run. */
+export function assertPlainMarkerPath(dir: string): boolean {
+  try {
+    const stat = lstatSync(join(dir, MARKER_FILE));
+    if (!stat.isFile()) {
+      throw new ArtinareyError('INVALID_INPUT', `marker is not a regular file: ${join(dir, MARKER_FILE)}`);
+    }
+    return true;
+  } catch (err) {
+    if (err instanceof ArtinareyError) throw err;
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw new ArtinareyError('INVALID_INPUT', `unusable marker path: ${join(dir, MARKER_FILE)}`);
   }
 }
 
@@ -188,10 +233,20 @@ export function createPersona(
   name: string,
 ): string {
   const persona = registry.personas.create({ projectId, role, name });
-  writePersona(storeDir, persona.id, {
-    role, name, home_worktree_id: null, state: 'new', vendor: null, last_vendor_session_id: null,
-  });
-  audit(storeDir, { type: 'persona_created', persona_id: persona.id, role, name });
+  const dir = personaDir(storeDir, persona.id);
+  const dirExisted = existsSync(dir);
+  try {
+    writePersona(storeDir, persona.id, {
+      role, name, home_worktree_id: null, state: 'new', vendor: null, last_vendor_session_id: null,
+    });
+    audit(storeDir, { type: 'persona_created', persona_id: persona.id, role, name });
+  } catch (err) {
+    // A retry must not create a second persona for this failed attempt, whether
+    // the persona file or the audit append was the step that failed.
+    registry.personas.delete(persona.id);
+    if (!dirExisted) rmSync(dir, { recursive: true, force: true });
+    throw err;
+  }
   return persona.id;
 }
 
@@ -340,12 +395,46 @@ export function claimPersona(
   };
 }
 
-/** Binding and persona file only; the caller owns the git unlock and the audits. */
-function releasePersonaCore(registry: Registry, storeDir: string, personaId: string): void {
+/** Undo a claim that threw after acquiring its binding, persona state and locks. */
+export function rollbackFailedClaim(
+  registry: Registry,
+  identity: Identity,
+  personaId: string | undefined,
+  previousBinding: string | undefined,
+  previousState: PersonaState,
+  originalWorktree: { id: string; path: string } | undefined,
+): void {
+  if (!personaId || registry.bindings.forWorktree(identity.worktreeId)?.id !== personaId) return;
+  try {
+    writePersona(identity.storeDir, personaId, previousState);
+  } finally {
+    // Only undo resources this attempt acquired; keep a binding/lock that predated it.
+    if (previousBinding !== personaId) {
+      registry.bindings.release(personaId);
+      unlockGitWorktree(identity.markerDir);
+      if (originalWorktree && originalWorktree.id !== identity.worktreeId) {
+        registry.bindings.bind(personaId, originalWorktree.id);
+        lockGitWorktree(originalWorktree.path, registry.personas.get(personaId)?.role ?? personaId);
+      }
+    }
+  }
+}
+
+/** Delete first: an unlock after a failed delete would remove Git's protection. */
+function releasePersonaCore(
+  registry: Registry,
+  storeDir: string,
+  personaId: string,
+  boundPath: string | undefined,
+): void {
   registry.bindings.release(personaId);
-  const state = readPersona(storeDir, personaId);
-  if (state.state !== 'new' || state.role) {
-    writePersona(storeDir, personaId, { ...state, state: 'idle' });
+  try {
+    const state = readPersona(storeDir, personaId);
+    if (state.state !== 'new' || state.role) {
+      writePersona(storeDir, personaId, { ...state, state: 'idle' });
+    }
+  } finally {
+    if (boundPath) unlockGitWorktree(boundPath);
   }
 }
 
@@ -354,12 +443,7 @@ export function releasePersona(
   storeDir: string,
   personaId: string,
 ): void {
-  const boundPath = boundWorktreePath(registry, personaId);
-  try {
-    releasePersonaCore(registry, storeDir, personaId);
-  } finally {
-    if (boundPath) unlockGitWorktree(boundPath);
-  }
+  releasePersonaCore(registry, storeDir, personaId, boundWorktreePath(registry, personaId));
   audit(storeDir, { type: 'persona_released', persona_id: personaId });
 }
 
@@ -374,11 +458,7 @@ export function releaseWorktreeForce(
   const boundPath = registry.projects.list()
     .flatMap((project) => registry.worktrees.list(project.id))
     .find((worktree) => worktree.id === worktreeId)?.path;
-  try {
-    releasePersonaCore(registry, storeDir, bound.id);
-  } finally {
-    if (boundPath) unlockGitWorktree(boundPath);
-  }
+  releasePersonaCore(registry, storeDir, bound.id, boundPath);
   audit(storeDir, {
     type: 'forced_release', persona_id: bound.id, worktree_id: worktreeId,
   });

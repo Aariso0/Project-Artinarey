@@ -39,6 +39,8 @@ export type SessionEvent = {
   vendor: string;
   startedAt: string;
   endedAt: string | null;
+  /** True if this run created the binding; later joiners inherit it through the overlap set. */
+  createdBinding: boolean;
 };
 
 export type MoveEvent = {
@@ -54,7 +56,8 @@ type PersonaInput = Pick<Persona, 'projectId' | 'role' | 'name'> &
   Partial<Pick<Persona, 'vendor' | 'lastVendorSessionId'>>;
 type WorktreeInput = Pick<Worktree, 'id' | 'projectId' | 'path' | 'branch'> &
   Partial<Pick<Worktree, 'portOffset'>>;
-type SessionInput = Omit<SessionEvent, 'id' | 'endedAt'> & Partial<Pick<SessionEvent, 'endedAt'>>;
+type SessionInput = Omit<SessionEvent, 'id' | 'endedAt' | 'createdBinding'> &
+  Partial<Pick<SessionEvent, 'endedAt' | 'createdBinding'>>;
 type MoveInput = Omit<MoveEvent, 'id'>;
 
 const SCHEMA = `
@@ -96,7 +99,8 @@ const SCHEMA = `
     persona_id TEXT NOT NULL REFERENCES personas(id),
     vendor TEXT NOT NULL,
     started_at TEXT NOT NULL,
-    ended_at TEXT
+    ended_at TEXT,
+    created_binding INTEGER NOT NULL DEFAULT 0
   );
   CREATE TABLE IF NOT EXISTS moves (
     id TEXT PRIMARY KEY,
@@ -121,7 +125,7 @@ type PersonaRow = {
 };
 type SessionRow = {
   id: string; project_id: string; worktree_id: string; persona_id: string;
-  vendor: string; started_at: string; ended_at: string | null;
+  vendor: string; started_at: string; ended_at: string | null; created_binding: number;
 };
 type MoveRow = {
   id: string; project_id: string; from_root: string; to_root: string; moved_at: string;
@@ -149,6 +153,7 @@ function toSession(r: SessionRow): SessionEvent {
   return {
     id: r.id, projectId: r.project_id, worktreeId: r.worktree_id, personaId: r.persona_id,
     vendor: r.vendor, startedAt: r.started_at, endedAt: r.ended_at,
+    createdBinding: r.created_binding === 1,
   };
 }
 function toMove(r: MoveRow): MoveEvent {
@@ -173,6 +178,7 @@ export type Registry = {
     create(input: PersonaInput): Persona;
     get(id: string): Persona | undefined;
     list(projectId: string): Persona[];
+    delete(id: string): void;
   };
   bindings: {
     bind(personaId: string, worktreeId: string): void;
@@ -198,9 +204,13 @@ export function openRegistry(file: string): Registry {
   const db = new Database(file);
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
-  const columns = db.pragma('table_info(worktrees)') as Array<{ name: string }>;
-  if (!columns.some((column) => column.name === 'port_offset')) {
+  const worktreeColumns = db.pragma('table_info(worktrees)') as Array<{ name: string }>;
+  if (!worktreeColumns.some((column) => column.name === 'port_offset')) {
     db.exec('ALTER TABLE worktrees ADD COLUMN port_offset INTEGER NOT NULL DEFAULT 0');
+  }
+  const sessionColumns = db.pragma('table_info(sessions)') as Array<{ name: string }>;
+  if (!sessionColumns.some((column) => column.name === 'created_binding')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN created_binding INTEGER NOT NULL DEFAULT 0');
   }
 
   return {
@@ -256,6 +266,9 @@ export function openRegistry(file: string): Registry {
         return (db.prepare('SELECT * FROM personas WHERE project_id = ? ORDER BY id')
           .all(projectId) as PersonaRow[]).map(toPersona);
       },
+      delete(id) {
+        db.prepare('DELETE FROM personas WHERE id = ?').run(id);
+      },
     },
     bindings: {
       bind(personaId, worktreeId) {
@@ -283,10 +296,11 @@ export function openRegistry(file: string): Registry {
     sessions: {
       append(event) {
         const id = newId();
-        db.prepare(`INSERT INTO sessions (id, project_id, worktree_id, persona_id, vendor, started_at, ended_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        db.prepare(`INSERT INTO sessions
+                    (id, project_id, worktree_id, persona_id, vendor, started_at, ended_at, created_binding)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
           .run(id, event.projectId, event.worktreeId, event.personaId, event.vendor,
-            event.startedAt, event.endedAt ?? null);
+            event.startedAt, event.endedAt ?? null, event.createdBinding ? 1 : 0);
         return id;
       },
       end(id, endedAt) {

@@ -56,15 +56,23 @@ test('an unreadable lockfile is never reclaimed', async (t) => {
   assert.equal(existsSync(file), true, 'the unreadable file must not be unlinked');
 });
 
-test('an empty PID file is not immediately reclaimed', async (t) => {
+test('an empty PID file is recoverable when no other process owns the guard', async (t) => {
   const file = lockPath();
-  t.after(() => rmSync(file, { force: true }));
+  t.after(() => rmSync(file, { force: true, recursive: true }));
   writeFileSync(file, '');
-  await assert.rejects(
-    () => acquireLock(file),
-    (err: unknown) => err instanceof ArtinareyError && err.code === 'ALREADY_RUNNING',
-  );
-  assert.equal(existsSync(file), true);
+  const lock = await acquireLock(file);
+  assert.equal(readLock(file), process.pid);
+  assert.equal(readFileSync(file, 'utf8').trim(), String(process.pid));
+  lock.release();
+});
+
+test('malformed PID content is recoverable when no other process owns the guard', async (t) => {
+  const file = lockPath();
+  t.after(() => rmSync(file, { force: true, recursive: true }));
+  writeFileSync(file, 'not-a-pid\nwith two lines\n');
+  const lock = await acquireLock(file);
+  assert.equal(readLock(file), process.pid);
+  lock.release();
 });
 
 test('two concurrent starters on a stale lock leave exactly one owner', async (t) => {
@@ -114,6 +122,60 @@ function waitForMessage(child: ChildProcess, expected: string): Promise<void> {
   });
 }
 
+/** A malformed file must not be reclaimed while another process holds the guard. */
+test('malformed PID recovery waits for the cross-process guard', async (t) => {
+  const file = lockPath();
+  const guard = `${file}.guard.sqlite`;
+  const marker = `${file}.starter.json`;
+  const temp = `${marker}.tmp`;
+  const guardDb = new Database(guard, { timeout: 2000 });
+
+  writeFileSync(file, 'not-a-pid\n');
+  guardDb.exec('BEGIN IMMEDIATE');
+  const script = `
+    import { writeFileSync, renameSync } from 'node:fs';
+    const { acquireLock } = await import(${JSON.stringify(pathToFileURL(join(import.meta.dirname, 'lock.ts')).href)});
+    const [pidFile, marker, temp] = process.argv.slice(1);
+    process.send('ready');
+    try {
+      const lock = await acquireLock(pidFile);
+      writeFileSync(temp, JSON.stringify({ acquired: true, pid: process.pid }));
+      renameSync(temp, marker);
+      process.send('acquired');
+      lock.release();
+    } catch (err) {
+      writeFileSync(temp, JSON.stringify({
+        acquired: false, code: err.code, message: err.message,
+      }));
+      renameSync(temp, marker);
+      process.send('failed');
+    }
+    process.disconnect?.();
+  `;
+  const child = spawn(process.execPath, [
+    '--import', 'tsx', '--input-type=module', '-e', script, file, marker, temp,
+  ], { cwd: process.cwd(), stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+  t.after(() => {
+    if (child.exitCode === null) child.kill();
+    try { guardDb.exec('ROLLBACK'); } catch { /* already committed */ }
+    try { guardDb.close(); } catch { /* already closed */ }
+    for (const path of [file, guard, `${guard}-journal`, marker, temp]) {
+      rmSync(path, { force: true });
+    }
+  });
+  child.stderr?.on('data', (chunk: Buffer) => process.stderr.write(`starter: ${chunk.toString()}`));
+  await waitForMessage(child, 'ready');
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(existsSync(marker), false, 'a guarded recovery must not publish a result yet');
+
+  guardDb.exec('COMMIT');
+  guardDb.close();
+  await waitUntil(() => existsSync(marker));
+  const outcome = JSON.parse(readFileSync(marker, 'utf8')) as { acquired: boolean; code?: string };
+  assert.equal(outcome.acquired, true, `recovery failed: ${outcome.code ?? JSON.stringify(outcome)}`);
+  assert.equal(existsSync(temp), false, 'the temp marker must be renamed, not left behind');
+});
+
 /** Two separate OS processes contend for the same stale pid file. */
 test('two starter processes racing on one stale pid file elect exactly one owner', async (t) => {
   const file = lockPath();
@@ -138,23 +200,29 @@ test('two starter processes racing on one stale pid file elect exactly one owner
   // starters must stall at this point; without one both finish immediately.
   guardDb.exec('BEGIN IMMEDIATE');
   const starterScript = `
-    import { writeFileSync } from 'node:fs';
+    import { writeFileSync, renameSync } from 'node:fs';
     const { acquireLock } = await import(${JSON.stringify(pathToFileURL(join(import.meta.dirname, 'lock.ts')).href)});
     const [pidFile, marker] = process.argv.slice(1);
+    // Publish each outcome atomically: the parent must never parse a partial JSON line.
+    const publish = (outcome) => {
+      const temp = marker + '.tmp-' + process.pid;
+      writeFileSync(temp, JSON.stringify(outcome));
+      renameSync(temp, marker);
+    };
     const released = new Promise((resolve) => {
       process.on('message', (msg) => { if (msg === 'release') resolve(); });
     });
     process.send('ready');
     try {
       const lock = await acquireLock(pidFile);
-      writeFileSync(marker, JSON.stringify({ acquired: true, pid: process.pid }));
+      publish({ acquired: true, pid: process.pid });
       process.send('acquired');
       await released;
       lock.release();
     } catch (err) {
-      writeFileSync(marker, JSON.stringify({
+      publish({
         acquired: false, code: err.code, message: err.message,
-      }));
+      });
       process.send('failed');
     }
     process.disconnect?.();

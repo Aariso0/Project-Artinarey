@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
 import { newId } from './ids.ts';
 import { buildIndex, queryMail, type IndexedMail } from './index-builder.ts';
@@ -169,4 +169,31 @@ test('queryMail filters by recipient and thread', async () => {
   assert.equal(queryMail(indexFile, { recipient: 'senior-dev' }).length, 3);
   assert.equal(queryMail(indexFile, { recipient: 'nobody' }).length, 0);
   assert.equal(queryMail(indexFile, { limit: 2 }).length, 2);
+});
+
+test('buildIndex preserves commas inside quoted frontmatter recipients', () => {
+  const store = tempDir('artinarey-index-store');
+  const indexFile = join(tempDir('artinarey-index-cache'), 'index.sqlite');
+  const id = newId();
+  const file = join(store, 'mail', '2026', '11', `${id}.md`);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, [
+    '---',
+    `id: ${id}`,
+    `thread: ${id}`,
+    'from: dev-a',
+    'to: ["dev,a"]',
+    'cc: []',
+    'subject: comma role',
+    'kind: status',
+    'created_at: 2026-11-23T10:15:00Z',
+    '---',
+    'body',
+    '',
+  ].join('\n'));
+
+  buildIndex(indexFile, store);
+
+  assert.deepEqual(queryMail(indexFile)[0]?.to, ['dev,a']);
+  assert.deepEqual(queryMail(indexFile, { recipient: 'dev,a' }).map((m) => m.id), [id]);
 });
