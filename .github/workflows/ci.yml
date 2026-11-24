@@ -34,7 +34,7 @@ jobs:
         env:
           BEFORE: ${{ github.event.before }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          BASE_REF: ${{ github.event.base_ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           if [ -n "$BASE_SHA" ]; then
@@ -42,7 +42,22 @@ jobs:
           elif [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
             base="$BEFORE"
           else
-            base="origin/${BASE_REF#refs/heads/}"
+            # First push to a new branch has no before/base_ref; use the default branch.
+            if [ -z "$DEFAULT_BRANCH" ]; then
+              echo "::error::Cannot determine comparison base: repository default branch is empty" >&2
+              exit 1
+            fi
+            base="origin/$DEFAULT_BRANCH"
+            if ! git rev-parse --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH^{commit}" >/dev/null; then
+              if ! git fetch --no-tags origin "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"; then
+                echo "::error::Failed to fetch default branch '$DEFAULT_BRANCH' for comparison" >&2
+                exit 1
+              fi
+            fi
+          fi
+          if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+            echo "::error::Comparison base '$base' does not resolve to a local commit" >&2
+            exit 1
           fi
           git diff --check "$base"...HEAD
       - run: pnpm build:gui
