@@ -15,12 +15,13 @@
 
 </div>
 
-> **Design settled. M0–M8 implemented and tested; two-agent mail exchange verified in OpenCode, the worktree lifecycle smoke-tested, the full desktop window shipped, Move is crash- and offline-safe, and the model adapter runs in an isolated process.**
+> **The short version:** Artinarey is a local traffic controller for AI coding agents. It gives each agent a real git worktree, a mailbox over MCP, and a written list of paths it may touch. Agents work in parallel; you approve the risky moves and merge the branches. The daemon never calls a model and never leaves your machine — an optional, separate adapter is the only piece that talks to an API.
 
 ---
 
 ## Contents
 
+- [What is this, actually?](#what-is-this-actually)
 - [The problem](#the-problem)
 - [Before and after](#before-and-after)
 - [How it works](#how-it-works)
@@ -29,6 +30,7 @@
 - [What's included](#whats-included)
 - [Safety and control](#safety-and-control)
 - [Running the app](#running-the-app)
+- [Build the app yourself](#build-the-app-yourself)
 - [Releases](#releases)
 - [Supported tools](#supported-tools)
 - [Progress](#progress)
@@ -37,7 +39,34 @@
 
 ---
 
+## What is this, actually?
+
+Artinarey is a small office for AI coding agents, and the metaphor is literal enough to be useful:
+
+- a **desk** is a git worktree and a branch, private to one agent;
+- a **mailbox** is an MCP server that delivers addressed Markdown messages between agents;
+- a **floor manager** is the senior-dev persona, which splits work into tasks with non-overlapping file scopes;
+- a **security desk** is the approval gate for anything that leaves an agent's assigned worktree;
+- and **you** are the boss who reads the diffs and does every merge by hand.
+
+Under the hood it is four local pieces, no cloud service required:
+
+| Piece | What it does |
+|---|---|
+| **Daemon** | Owns projects, personas, mail, leases, sessions and the audit log. Talks to the window over loopback only. |
+| **MCP shim** | Advertises mail and task tools to an agent and identifies it by the folder it runs in. |
+| **CLI** | Registers projects, starts/stops the daemon, launches agents and handles approvals. |
+| **Tauri window** | A desktop UI for projects, worktrees, chat, tasks, approvals, pre-merge, audit and storage. Holds the daemon token; the webview holds none. |
+
+**What it is not:** a model host, an auto-merger, a sandbox, or a hosted service. It does not pick your model for you, it does not merge branches, out-of-worktree detection is heuristic rather than an OS boundary, and records stay on a drive you choose. The optional model adapter is a separate process that can call an OpenAI-compatible endpoint; it is the only outbound caller, and only it reads the API key.
+
+M0–M8 are implemented and tested: two-agent mail exchange verified in OpenCode, the worktree lifecycle smoke-tested, the full desktop window shipped, Move is crash- and offline-safe, and the model adapter runs in an isolated process.
+
+---
+
 ## The problem
+
+You wanted parallel agents. What you got was parallel chaos:
 
 - You asked an agent to build a feature, and now you are **watching it type**.
 - You opened a second agent on the same repo. Now two agents edit the same file and one of them silently loses.
@@ -252,9 +281,73 @@ M7/M8 shipped the whole window. The native shell holds the daemon token; the web
 
 ---
 
+## Build the app yourself
+
+You need Node 26, pnpm 10.34.9, Rust (stable) and the Tauri 2 system dependencies for your platform. Check your machine first:
+
+```bash
+cd apps/gui
+pnpm exec tauri info
+```
+
+On Linux you also need `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `librsvg2-dev`, `libayatana-appindicator3-dev` and `libxdo-dev`. A headless machine needs a display, for example Xvfb.
+
+**Step 1 — install and build the webview** (from the repository root):
+
+```bash
+pnpm install
+pnpm run build:gui
+```
+
+`pnpm run build:gui` writes the frontend to `apps/gui/dist/`. It does **not** build the native app. To build only the webview without the Rust side, run `pnpm --filter artinarey-gui exec vite build`.
+
+**Step 2 — build native bundles** from `apps/gui`:
+
+| Platform | Command | Bundles |
+|---|---|---|
+| Linux | `pnpm exec tauri build --bundles deb rpm appimage` | `.deb`, `.rpm`, `.AppImage` |
+| macOS | `pnpm exec tauri build --bundles app dmg --no-sign` | zipped `.app`, `.dmg` |
+| Windows | `pnpm exec tauri build --bundles msi nsis --no-sign` | `.msi`, NSIS `.exe` |
+
+Add `--ci` for a non-interactive build, which is what the Release workflow uses. For example, the exact Linux CI command is:
+
+```bash
+cd apps/gui
+pnpm exec tauri build --bundles deb rpm appimage --ci
+```
+
+Finished bundles land under `apps/gui/src-tauri/target/release/bundle/`, split into `deb/`, `rpm/`, `appimage/`, `macos/`, `msi/` and `nsis/` directories. The plain executable is `apps/gui/src-tauri/target/release/artinarey-gui`.
+
+For a quick debug binary instead of bundles:
+
+```bash
+pnpm run build:gui
+cargo build --manifest-path apps/gui/src-tauri/Cargo.toml --features tauri/custom-protocol
+./apps/gui/src-tauri/target/debug/artinarey-gui
+```
+
+**Run the full gate set before committing** (from the repository root):
+
+```bash
+pnpm run typecheck
+pnpm test
+pnpm run lint
+pnpm run test:ci
+pnpm build
+pnpm run test:gui
+pnpm run build:gui
+pnpm run audit
+pnpm run version:check
+git diff --check
+```
+
+`pnpm run test:gui` runs the Rust proxy tests; `pnpm run test:ci` adds the version-script tests to the TypeScript suite. See [Running and testing Artinarey](docs/running-and-testing.md) for focused commands and daemon details.
+
+---
+
 ## Releases
 
-The version in the root `package.json` is canonical and starts at `0.1.0`. It must agree with `apps/gui/package.json` and `apps/gui/src-tauri/Cargo.toml`. Push a new version to `main`: after CI passes, the Release workflow creates the `v<version>` tag and one GitHub Release built from that exact commit. Linux gets `deb`, `rpm` and `appimage` bundles; macOS gets an unsigned zipped `.app` and `dmg`; Windows gets unsigned `msi` and `nsis` bundles. A tag that already exists is skipped, so re-pushing the same version does not publish again. There is no npm publish; all packages stay private.
+The version in the root `package.json` is canonical and starts at `0.1.0`. It must agree with `apps/gui/package.json` and `apps/gui/src-tauri/Cargo.toml`. Push a new version to `main`: after all other CI checks pass, the Release workflow creates the `v<version>` tag and one GitHub Release built from that exact commit. Linux gets `deb`, `rpm` and `appimage` bundles; macOS gets an unsigned zipped `.app` and `dmg`; Windows gets unsigned `msi` and `nsis` bundles. A tag that already exists is skipped, so re-pushing the same version does not publish again. There is no npm publish; all packages stay private.
 
 ---
 
