@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { ArtinareyError } from './errors.ts';
@@ -31,13 +32,42 @@ export type Approval = {
   createdAt: string;
   resolvedAt: string | null;
   resolvedBy: string | null;
+  /** Identifies the exact reviewed action; absent on older records. */
+  fingerprint?: string;
   /** Opaque resume data so an approved over-cap spawn can continue. */
   payload?: Record<string, unknown>;
 };
 
 export type ApprovalInput = Pick<Approval,
   'id' | 'projectId' | 'kind' | 'summary'> & Partial<Pick<Approval,
-  'worktreeId' | 'personaId' | 'payload'>>;
+  'worktreeId' | 'personaId' | 'fingerprint' | 'payload'>>;
+
+export type ApprovalFingerprintInput = {
+  projectId: string;
+  worktreeId: string | null;
+  action?: string;
+  resources?: readonly string[];
+  command?: string;
+  sessionId?: string;
+};
+
+/**
+ * Stable digest of everything an operator is being asked to approve. Resource
+ * order and duplicates do not matter; every other field does, including the
+ * OpenCode session that made the call.
+ */
+export function approvalFingerprint(input: ApprovalFingerprintInput): string {
+  const resources = [...new Set(input.resources ?? [])].sort();
+  const canonical = [
+    input.projectId ?? '',
+    input.worktreeId ?? '',
+    input.action ?? '',
+    resources,
+    input.command ?? '',
+    input.sessionId ?? '',
+  ];
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+}
 
 export function approvalFile(storeDir: string): string {
   return join(storeDir, 'events', 'approvals.jsonl');
@@ -78,14 +108,19 @@ export function createApproval(storeDir: string, input: ApprovalInput): Approval
   return approval;
 }
 
-/** Pending approval for this key, if one is already waiting on the user. */
+/**
+ * Pending approval for this key, if one is already waiting on the user. A
+ * fingerprint-scoped lookup never matches a legacy record without one.
+ */
 export function pendingApproval(
   storeDir: string,
-  match: Pick<Approval, 'projectId' | 'kind'> & Partial<Pick<Approval, 'worktreeId'>>,
+  match: Pick<Approval, 'projectId' | 'kind'>
+    & Partial<Pick<Approval, 'worktreeId' | 'fingerprint'>>,
 ): Approval | undefined {
   return readApprovals(storeDir).find((a) => a.status === 'pending'
     && a.projectId === match.projectId && a.kind === match.kind
-    && (match.worktreeId === undefined || a.worktreeId === match.worktreeId));
+    && (match.worktreeId === undefined || a.worktreeId === match.worktreeId)
+    && (match.fingerprint === undefined || a.fingerprint === match.fingerprint));
 }
 
 export function resolveApproval(

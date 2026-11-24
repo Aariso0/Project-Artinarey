@@ -4,8 +4,8 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  appendSession, buildFirstPrompt, createApproval, endSession, fileMode,
-  getAutoApprove, isProcessAlive, readApprovals, readRoleCard, readServeState,
+  approvalFingerprint, appendSession, buildFirstPrompt, createApproval, endSession, fileMode,
+  getAutoApprove, isProcessAlive, pendingApproval, readApprovals, readRoleCard, readServeState,
   readSessions, resolveApproval, riskyReasons, serveStateFile, setAutoApprove,
   writeServeState, type SessionSummary,
 } from './session.ts';
@@ -50,6 +50,43 @@ test('a torn approval line is skipped, not parsed into a phantom approval', () =
     writeFileSync(join(store, 'events', 'approvals.jsonl'),
       `${JSON.stringify({ id: 'a1', projectId: 'p', status: 'pending' })}\n{"id":"bro`);
     assert.equal(readApprovals(store).length, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('approval fingerprints are canonical and fingerprint lookups ignore legacy records', () => {
+  const root = temp();
+  try {
+    const store = join(root, 'store');
+    const input = {
+      projectId: 'p', worktreeId: 'wt', action: 'shell',
+      resources: ['b.txt', 'a.txt', 'a.txt'], command: 'curl https://example.com',
+      sessionId: 's1',
+    };
+    const fingerprint = approvalFingerprint(input);
+    assert.equal(approvalFingerprint({ ...input, resources: ['a.txt', 'b.txt'] }), fingerprint);
+    for (const changed of [
+      { projectId: 'other' }, { worktreeId: 'other' }, { action: 'edit' },
+      { resources: ['a.txt'] }, { command: 'wget https://example.com' }, { sessionId: 's2' },
+    ]) {
+      assert.notEqual(approvalFingerprint({ ...input, ...changed }), fingerprint);
+    }
+
+    createApproval(store, {
+      id: 'legacy', projectId: 'p', kind: 'risky_call', worktreeId: 'wt', summary: 'old',
+    });
+    const match = { projectId: 'p', kind: 'risky_call' as const, worktreeId: 'wt' };
+    assert.equal(pendingApproval(store, match)?.id, 'legacy');
+    assert.equal(pendingApproval(store, { ...match, fingerprint }), undefined);
+
+    const fresh = createApproval(store, {
+      id: 'fresh', projectId: 'p', kind: 'risky_call', worktreeId: 'wt',
+      summary: 'new', fingerprint,
+    });
+    assert.equal(fresh.fingerprint, fingerprint);
+    assert.equal(pendingApproval(store, { ...match, fingerprint })?.id, 'fresh');
+    assert.equal(pendingApproval(store, { ...match, fingerprint: 'other' }), undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

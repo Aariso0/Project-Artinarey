@@ -19,9 +19,11 @@ export type Task = {
   updatedAt: string;
 };
 
+type TaskChange = { status?: TaskStatus; scope?: string[]; note?: string; worktreeId?: string | null };
+
 type TaskEvent =
   | { type: 'task_created'; task: Task }
-  | { type: 'task_updated'; taskId: string; status?: TaskStatus; scope?: string[]; note?: string; at: string }
+  | ({ type: 'task_updated'; taskId: string; at: string } & TaskChange)
   | { type: 'shared_claim'; taskId: string; files: string[]; at: string }
   | { type: 'shared_release'; taskId: string; at: string };
 
@@ -67,6 +69,7 @@ export function readTasks(storeDir: string): Task[] {
       ...task,
       status: event.status ?? task.status,
       scope: event.scope ? [...event.scope] : task.scope,
+      worktreeId: event.worktreeId !== undefined ? event.worktreeId : task.worktreeId,
       updatedAt: event.at,
     });
   }
@@ -93,12 +96,15 @@ export function sharedOwners(storeDir: string): Map<string, string> {
 
 /** Scopes are repo-relative. Absolute paths, traversal and drive letters are refused. */
 export function normalizePath(input: string): string {
-  const value = input.replace(/\\/g, '/').replace(/^\.\//, '')
-    .replace(/\/{2,}/g, '/').replace(/\/$/, '');
-  if (!value || value.startsWith('/') || value.split('/').includes('..') || value.includes(':')) {
+  const value = input.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+  if (!value || value.startsWith('/') || value.includes(':')) {
     throw new ArtinareyError('INVALID_INPUT', `scope must be a repo-relative path: ${input}`);
   }
-  return value;
+  const parts = value.split('/').filter((part) => part !== '.' && part !== '');
+  if (parts.includes('..')) {
+    throw new ArtinareyError('INVALID_INPUT', `scope must be a repo-relative path: ${input}`);
+  }
+  return parts.length > 0 ? parts.join('/') : '.';
 }
 
 /** Glob syntax we cannot decide cheaply is treated as overlap, never as a free pass. */
@@ -122,6 +128,27 @@ function isPrefix(a: string, b: string): boolean {
 function literalPrefix(pattern: string): string {
   const cut = pattern.search(/[*?]/);
   return cut === -1 ? pattern : pattern.slice(0, cut).replace(/\/$/, '');
+}
+
+function hasWildcard(pattern: string): boolean {
+  return /[*?]/.test(pattern);
+}
+
+/** Literal text before the first wildcard, including a trailing separator. */
+function leadingLiteral(pattern: string): string {
+  const cut = pattern.search(/[*?]/);
+  return cut === -1 ? pattern : pattern.slice(0, cut);
+}
+
+/** Divergent literal prefixes prove two wildcard scopes cannot match the same path. */
+function disjointLiterals(a: string, b: string): boolean {
+  const left = leadingLiteral(a);
+  const right = leadingLiteral(b);
+  const shared = Math.min(left.length, right.length);
+  for (let i = 0; i < shared; i++) {
+    if (left[i] !== right[i]) return true;
+  }
+  return false;
 }
 
 function makeRe(pattern: string): RegExp | null {
@@ -149,6 +176,9 @@ function oneOverlap(a: string, b: string): Overlap {
   if (a === b) return { overlap: true, reason: 'same path', path: a };
   if (isPrefix(a, b)) return { overlap: true, reason: 'path prefix', path: b };
   if (isPrefix(b, a)) return { overlap: true, reason: 'path prefix', path: a };
+  if (hasWildcard(a) && hasWildcard(b) && !disjointLiterals(a, b)) {
+    return { overlap: true, reason: 'undecidable glob', path: a };
+  }
 
   const aRe = makeRe(a);
   const bRe = makeRe(b);
@@ -188,10 +218,7 @@ export function createTask(storeDir: string, input: Omit<Task, 'updatedAt'>): Ta
   return task;
 }
 
-export function updateTask(
-  storeDir: string, taskId: string,
-  change: { status?: TaskStatus; scope?: string[]; note?: string },
-): void {
+export function updateTask(storeDir: string, taskId: string, change: TaskChange): void {
   appendJournal(taskFile(storeDir), {
     type: 'task_updated', taskId, ...change, at: new Date().toISOString(),
   });
@@ -238,10 +265,19 @@ export function assertScopeAvailable(storeDir: string, scope: string[], excludeT
   }
 }
 
+/** A literal scope covers its descendants; wildcards must match by regex. */
+function scopeCovers(pattern: string, file: string): boolean {
+  const scope = normalizePath(pattern);
+  const path = normalizePath(file);
+  if (scope === '.') return true;
+  if (undecidable(scope)) return false;
+  if (!hasWildcard(scope)) return isPrefix(scope, path);
+  const re = makeRe(scope);
+  return re ? re.test(path) : false;
+}
+
 /** Changed files (repo-relative) that no lease for that branch covers. */
 export function uncoveredFiles(tasks: Task[], files: string[]): string[] {
-  return files.filter((file) => !tasks.some((task) => task.scope.some((pattern) => {
-    const re = makeRe(normalizePath(pattern));
-    return re ? re.test(normalizePath(file)) : false;
-  })));
+  return files.filter((file) => !tasks.some((task) =>
+    task.scope.some((pattern) => scopeCovers(pattern, file))));
 }

@@ -27,7 +27,11 @@ function task(store: string, id: string, scope: string[]): Task {
 test('normalizePath is repo-relative and deterministic', () => {
   assert.equal(normalizePath('./src//foo/'), 'src/foo');
   assert.equal(normalizePath('src\\foo'), 'src/foo');
-  for (const bad of ['/abs', '../up', 'src/../x', 'C:\\x']) {
+  assert.equal(normalizePath('src/./a.ts'), 'src/a.ts');
+  assert.equal(normalizePath('./src/././a.ts'), 'src/a.ts');
+  assert.equal(normalizePath('.//src/a.ts'), 'src/a.ts');
+  assert.equal(normalizePath('.'), '.');
+  for (const bad of ['/abs', '../up', 'src/../x', 'src/./../x', 'C:\\x']) {
     assert.throws(() => normalizePath(bad), (e: unknown) =>
       e instanceof ArtinareyError && e.code === 'INVALID_INPUT');
   }
@@ -44,6 +48,13 @@ test('overlap: plain globs are resolved, not guessed', () => {
   assert.equal(scopeOverlap(['src/*.ts'], ['src/a.ts']).overlap, true);
   assert.equal(scopeOverlap(['src/*.ts'], ['src/a.md']).overlap, false);
   assert.equal(scopeOverlap(['src/a*.ts'], ['src/b.ts']).overlap, false);
+});
+
+test('overlap: two wildcards are conservative unless disjointness is proven', () => {
+  assert.equal(scopeOverlap(['src/a*.ts'], ['src/ab*.ts']).overlap, true);
+  assert.equal(scopeOverlap(['src/*.ts'], ['src/*.md']).overlap, true);
+  assert.equal(scopeOverlap(['src/a*.ts'], ['src/b*.ts']).overlap, false);
+  assert.equal(scopeOverlap(['src/foo/*.ts'], ['docs/bar/*.ts']).overlap, false);
 });
 
 test('overlap: undecidable globs count as overlap', () => {
@@ -73,6 +84,24 @@ test('task journal replays creates and updates', () => {
   assert.deepEqual(readTasks(store).find((t) => t.id === 'T-2')?.status, 'done');
 });
 
+test('updateTask applies worktreeId without dropping other fields', () => {
+  const store = tempStore();
+  const created = task(store, 'T-1', ['src/a.ts']);
+  updateTask(store, 'T-1', { status: 'blocked', worktreeId: 'W-1', note: 'moved' });
+  const updated = readTasks(store).find((t) => t.id === 'T-1');
+  assert.equal(updated?.worktreeId, 'W-1');
+  assert.equal(updated?.status, 'blocked');
+  assert.deepEqual(updated?.scope, ['src/a.ts']);
+  assert.equal(updated?.title, created.title);
+  assert.equal(updated?.assignee, created.assignee);
+  assert.equal(updated?.branch, created.branch);
+
+  updateTask(store, 'T-1', { worktreeId: null });
+  const cleared = readTasks(store).find((t) => t.id === 'T-1');
+  assert.equal(cleared?.worktreeId, null);
+  assert.equal(cleared?.status, 'blocked');
+});
+
 test('assertScopeAvailable rejects a colliding lease', () => {
   const store = tempStore();
   task(store, 'T-1', ['src/a.ts']);
@@ -98,4 +127,13 @@ test('uncoveredFiles flags edits outside every lease', () => {
   const store = tempStore();
   const tasks = [task(store, 'T-1', ['src/*.ts'])];
   assert.deepEqual(uncoveredFiles(tasks, ['src/a.ts', 'docs/x.md']), ['docs/x.md']);
+});
+
+test('uncoveredFiles covers literal directory scopes and wildcards', () => {
+  const store = tempStore();
+  const tasks = [task(store, 'T-1', ['src/*.ts']), task(store, 'T-2', ['docs'])];
+  assert.deepEqual(
+    uncoveredFiles(tasks, ['src/a.ts', 'docs/x.md', 'docs/deep/y.md', 'other/z.ts', 'srcx/w.ts']),
+    ['other/z.ts', 'srcx/w.ts'],
+  );
 });
