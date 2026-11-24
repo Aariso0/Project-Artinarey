@@ -41,7 +41,7 @@ No personal access token or other secret is used. Unspecified permissions are im
 - There is no `pull_request_target` event in the new workflow.
 - Checkout uses `ref: main` with `persist-credentials: false`.
 - The workflow does not check out, import, build, or execute Dependabot PR code. It reads PR metadata through the GitHub API and renders it with deterministic local JavaScript.
-- PR titles, bodies, file names, and check names are treated as untrusted data. HTML tags and `<details>` blocks are stripped, the excerpt is capped, and at most three URLs are included.
+- PR titles, bodies, file names, file paths, check names, and URLs are treated as untrusted data. HTML tags and `<details>` blocks are stripped from the displayed excerpt, Markdown metacharacters and `@` mentions are escaped, the excerpt is capped, and at most three URLs are included.
 - The only repository write is `issues.createComment` on the PR.
 
 ## What the comment contains
@@ -58,7 +58,7 @@ The generated comment includes:
 - a sanitized excerpt and relevant links from Dependabot's description
 - a concise overall summary
 
-Versions are classified from explicit Dependabot table types when available, otherwise from semantic version components. Grouped Dependabot updates are supported.
+Versions are classified from explicit Dependabot table types when available, otherwise from semantic version components. Grouped Dependabot updates are supported. The dependency table shows up to 50 rows and reports any omitted count so the comment stays readable. Changelog and compare URLs are extracted from the raw Dependabot body, including links inside `<details>` blocks.
 
 ## Duplicate handling
 

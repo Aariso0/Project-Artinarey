@@ -113,8 +113,24 @@ function parseDependencyUpdates(input = {}) {
   return updates;
 }
 
-function escapeCell(value) {
-  return String(value ?? '').replace(/\|/g, '\\|');
+function escapeMarkdown(value) {
+  return String(value ?? '')
+    .replace(/\\/g, '\\\\')
+    .replace(/`/g, '\\`')
+    .replace(/\*/g, '\\*')
+    .replace(/_/g, '\\_')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]')
+    .replace(/\|/g, '\\|')
+    .replace(/@/g, '&#64;')
+    .replace(/\r?\n/g, ' ');
+}
+
+function escapeMarkdownBlock(value) {
+  return String(value ?? '')
+    .split(/\r?\n/)
+    .map((line) => escapeMarkdown(line))
+    .join('\n');
 }
 
 function sanitizeDescription(description, maxLength = 1200) {
@@ -131,8 +147,8 @@ function sanitizeDescription(description, maxLength = 1200) {
 function extractUrls(text) {
   const urls = [];
   const seen = new Set();
-  for (const match of text.matchAll(/https?:\/\/[^\s<>]+/g)) {
-    const url = match[0].replace(/[.,;)]+$/, '');
+  for (const match of text.matchAll(/https?:\/\/[^\s<>"'`]+/g)) {
+    const url = match[0].replace(/[.,;)'"`]+$/, '');
     if (!seen.has(url)) {
       seen.add(url);
       urls.push(url);
@@ -148,8 +164,9 @@ function buildComment(input = {}) {
   const files = Array.isArray(input.files) ? input.files : [];
   const checks = Array.isArray(input.checks) ? input.checks : [];
   const run = input.run ?? {};
-  const description = sanitizeDescription(input.description);
-  const urls = extractUrls(description);
+  const rawDescription = typeof input.description === 'string' ? input.description : '';
+  const description = sanitizeDescription(rawDescription);
+  const urls = extractUrls(rawDescription).map(escapeMarkdown);
   const counts = updates.reduce((acc, update) => {
     const key = ['patch', 'minor', 'major', 'unknown'].includes(update.classification)
       ? update.classification
@@ -157,6 +174,8 @@ function buildComment(input = {}) {
     acc[key] += 1;
     return acc;
   }, { patch: 0, minor: 0, major: 0, unknown: 0 });
+  const shownUpdates = updates.slice(0, 50);
+  const omittedUpdates = updates.length - shownUpdates.length;
   const shownFiles = files.slice(0, 20);
   const omittedFiles = files.length - shownFiles.length;
 
@@ -167,19 +186,20 @@ function buildComment(input = {}) {
     '',
     '**Dependabot Update Completed**',
     '',
-    `- **PR:** [#${pr.number ?? '?'} — ${pr.title ?? 'Untitled update'}](${pr.html_url ?? '#'})`,
-    `- **Run:** [${run.html_url ?? 'CI run'}](${run.html_url ?? '#'})`,
+    `- **PR:** [#${pr.number ?? '?'} — ${escapeMarkdown(pr.title ?? 'Untitled update')}](${escapeMarkdown(pr.html_url ?? '#')})`,
+    `- **Run:** [${escapeMarkdown(run.html_url ?? 'CI run')}](${escapeMarkdown(run.html_url ?? '#')})`,
     '',
     '| Dependency | From | To | Classification |',
     '| --- | --- | --- | --- |',
   ];
 
-  if (updates.length === 0) {
+  if (shownUpdates.length === 0) {
     lines.push('| _No dependency versions parsed_ | — | — | unknown |');
   } else {
-    for (const update of updates) {
-      lines.push(`| ${escapeCell(update.name)} | ${escapeCell(update.from)} | ${escapeCell(update.to)} | ${escapeCell(update.classification)} |`);
+    for (const update of shownUpdates) {
+      lines.push(`| ${escapeMarkdown(update.name)} | ${escapeMarkdown(update.from)} | ${escapeMarkdown(update.to)} | ${escapeMarkdown(update.classification)} |`);
     }
+    if (omittedUpdates > 0) lines.push(`| _…and ${omittedUpdates} more update(s)_ | — | — | — |`);
   }
 
   lines.push(
@@ -193,28 +213,28 @@ function buildComment(input = {}) {
     lines.push('- _No changed files reported_');
   } else {
     for (const file of shownFiles) {
-      lines.push(`- \`${file.filename}\` (+${file.additions ?? 0}/-${file.deletions ?? 0})`);
+      lines.push(`- ${escapeMarkdown(file.filename)} (+${file.additions ?? 0}/-${file.deletions ?? 0})`);
     }
     if (omittedFiles > 0) lines.push(`- _…and ${omittedFiles} more file(s)_`);
   }
 
-  lines.push('', '### CI status', 'All required CI checks completed successfully.');
+  lines.push('', '### CI status', 'CI workflow run concluded: success.');
   if (checks.length === 0) {
     lines.push('- _No check runs reported by the API_');
   } else {
     for (const check of checks) {
-      lines.push(`- ${check.name}: ${check.conclusion ?? 'unknown'}`);
+      lines.push(`- ${escapeMarkdown(check.name)}: ${escapeMarkdown(check.conclusion ?? 'unknown')}`);
     }
   }
 
   lines.push('', '### From Dependabot');
-  lines.push(description || '_No description provided_');
+  lines.push(description ? escapeMarkdownBlock(description) : '_No description provided_');
   if (urls.length > 0) lines.push('', `Relevant links: ${urls.join(' ')}`);
 
   lines.push(
     '',
     '### Summary',
-    `This update changes ${updates.length} dependenc${updates.length === 1 ? 'y' : 'ies'} (${counts.major} major, ${counts.minor} minor, ${counts.patch} patch). CI passed for commit \`${run.head_sha ?? 'unknown'}\`.`,
+    `This update changes ${updates.length} dependenc${updates.length === 1 ? 'y' : 'ies'} (${counts.major} major, ${counts.minor} minor, ${counts.patch} patch). CI passed for commit \`${escapeMarkdown(run.head_sha ?? 'unknown')}\`.`,
   );
 
   return lines.join('\n');

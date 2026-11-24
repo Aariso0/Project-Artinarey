@@ -206,3 +206,70 @@ test('main falls back to pulls.list when workflow_run.pull_requests is empty', a
   await main(h);
   assert.equal(h.calls.comments, 1);
 });
+
+test('buildComment keeps changelog and compare URLs from details blocks', () => {
+  const body = buildComment({
+    pr: { title: 'chore(deps): bump axios from 1.2.3 to 1.3.0', number: 1, html_url: 'https://example.test/pull/1' },
+    updates: [{ name: 'axios', from: '1.2.3', to: '1.3.0', classification: 'minor' }],
+    files: [],
+    checks: [],
+    run: { html_url: 'https://example.test/runs/1', head_sha: 'abc123' },
+    description: [
+      'Bumps [axios](https://github.com/axios/axios) from 1.2.3 to 1.3.0.',
+      '<details>',
+      '<summary>Changelog</summary>',
+      'Release: https://github.com/axios/axios/releases/tag/v1.3.0',
+      'Compare: https://github.com/axios/axios/compare/v1.2.3...v1.3.0',
+      '</details>',
+    ].join('\n'),
+  });
+  assert.match(body, /https:\/\/github\.com\/axios\/axios\/releases\/tag\/v1\.3\.0/);
+  assert.match(body, /https:\/\/github\.com\/axios\/axios\/compare\/v1\.2\.3\.\.\.v1\.3\.0/);
+});
+
+test('buildComment escapes untrusted markdown and mentions', () => {
+  const body = buildComment({
+    pr: { title: 'bump axios [fake](http://evil)', number: 2, html_url: 'https://example.test/pull/2' },
+    updates: [{ name: 'axios', from: '1.2.3', to: '1.3.0', classification: 'minor' }],
+    files: [{ filename: 'a`b', additions: 1, deletions: 0 }],
+    checks: [{ name: 'node [fake](http://evil)', conclusion: 'success' }],
+    run: { html_url: 'https://example.test/runs/2', head_sha: 'def456' },
+    description: 'See [click](http://evil) and @someone.',
+  });
+  assert.doesNotMatch(body, /\[fake\]\(http:\/\/evil\)/);
+  assert.doesNotMatch(body, /\[click\]\(http:\/\/evil\)/);
+  assert.doesNotMatch(body, /@someone/);
+  assert.match(body, /&#64;someone/);
+  assert.doesNotMatch(body, /`a`b`/);
+});
+
+test('buildComment caps dependency rows and reports omitted count', () => {
+  const updates = Array.from({ length: 60 }, (_, index) => ({
+    name: `dep-${index}`, from: '1.0.0', to: '1.0.1', classification: 'patch',
+  }));
+  const body = buildComment({
+    pr: { title: 'grouped updates', number: 3, html_url: 'https://example.test/pull/3' },
+    updates,
+    files: [],
+    checks: [],
+    run: { html_url: 'https://example.test/runs/3', head_sha: 'ghi789' },
+    description: '',
+  });
+  assert.equal((body.match(/^\| dep-\d+ \|/gm) || []).length, 50);
+  assert.match(body, /and 10 more/);
+  assert.ok(body.length < 5000);
+});
+
+test('buildComment does not claim all required checks passed', () => {
+  const body = buildComment({
+    pr: { title: 'bump axios from 1 to 2', number: 4, html_url: 'https://example.test/pull/4' },
+    updates: [{ name: 'axios', from: '1', to: '2', classification: 'major' }],
+    files: [],
+    checks: [{ name: 'node', conclusion: 'skipped' }],
+    run: { html_url: 'https://example.test/runs/4', head_sha: 'jkl012' },
+    description: '',
+  });
+  assert.doesNotMatch(body, /All required CI checks completed successfully/);
+  assert.match(body, /CI workflow run concluded: success/);
+  assert.match(body, /node: skipped/);
+});
