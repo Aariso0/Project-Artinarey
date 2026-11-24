@@ -1,7 +1,5 @@
 # Dependabot PR Completion Notifications Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Post one deterministic, detailed `@Aariso0` notification on a Dependabot PR targeting `main` after the existing `CI` workflow succeeds for that PR's exact head SHA.
 
 **Architecture:** A trusted `workflow_run` workflow reacts to the existing `CI` workflow's completion. It checks out only `main` to load a helper module (never Dependabot PR code), validates the PR author/base/head/event, then uses `GITHUB_TOKEN` APIs to read PR metadata, files, check runs, and comments before posting a comment with a hidden per-SHA dedupe marker.
@@ -20,7 +18,7 @@
 - No `pull_request_target` event anywhere in the new workflow.
 - No paid AI API, external service, or network call except GitHub APIs.
 - No approval, merge, rebase, label, or other modification of Dependabot PRs; the only write is creating one PR comment.
-- Docs and plans live under `docs/plans/`. Do not create `docs/superpowers/`.
+- Docs and plans live under `docs/plans/`. Do not create a separate helper-doc folder.
 - Treat all GitHub-provided text as untrusted data; strip HTML, cap excerpt length, and never evaluate it.
 
 ## Review Focus

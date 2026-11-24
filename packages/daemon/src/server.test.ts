@@ -6,6 +6,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Registry, XdgPaths } from '@artinarey/core';
 import { createRpcServer, handleRequest, type RpcResponse } from './server.ts';
+import type { RpcContext } from './tools.ts';
+
+const OPERATOR_TOKEN = 'test-operator-token';
 
 function socketPath(): string {
   return join(tmpdir(), `artinarey-sock-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`);
@@ -99,7 +102,7 @@ test('handleRequest answers ping, status, and unknown methods', () => {
 
 test('server answers over a unix socket with mode 0600 and shutdown closes it', async () => {
   const path = socketPath();
-  const server = createRpcServer(path);
+  const server = createRpcServer(path, undefined, undefined, undefined, OPERATOR_TOKEN);
   try {
     await server.start();
     assert.equal(existsSync(path), true);
@@ -114,7 +117,9 @@ test('server answers over a unix socket with mode 0600 and shutdown closes it', 
     assert.equal(unknown.ok, false);
     if (!unknown.ok) assert.equal(unknown.error.code, 'NOT_FOUND');
 
-    const shutdown = await rpc(path, { id: '3', method: 'shutdown' });
+    const shutdown = await rpc(path, {
+      id: '3', method: 'shutdown', operatorToken: OPERATOR_TOKEN,
+    });
     assert.equal(shutdown.ok, true);
     await waitFor(() => !existsSync(path));
     assert.equal(existsSync(path), false, 'shutdown RPC actually closes the listener');
@@ -125,10 +130,10 @@ test('server answers over a unix socket with mode 0600 and shutdown closes it', 
 
 test('an invalid shutdown request leaves the listener running', async () => {
   const path = socketPath();
-  const server = createRpcServer(path);
+  const server = createRpcServer(path, undefined, undefined, undefined, OPERATOR_TOKEN);
   try {
     await server.start();
-    const response = await rpc(path, { method: 'shutdown' });
+    const response = await rpc(path, { method: 'shutdown', operatorToken: OPERATOR_TOKEN });
     assert.equal(response.ok, false);
     if (!response.ok) assert.equal(response.error.code, 'INVALID_INPUT');
 
@@ -234,5 +239,65 @@ test('a client socket error does not terminate the daemon', async () => {
     assert.equal(pong.ok, true);
   } finally {
     await server.close();
+  }
+});
+
+test('close waits for a queued stop_session before onShutdown', async () => {
+  const path = socketPath();
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  let releaseInterrupt!: () => void;
+  let interruptSettled = false;
+  const interrupt = new Promise<boolean>((resolve) => {
+    releaseInterrupt = () => { interruptSettled = true; resolve(true); };
+  });
+  const order: string[] = [];
+  let shutdownCalls = 0;
+  let shutdownSawSettled = false;
+  const shared = {
+    registry: {} as Registry,
+    paths: {} as XdgPaths,
+    supervisor: {
+      stopSession: () => { markStarted(); return interrupt; },
+    },
+  } as unknown as RpcContext;
+  const server = createRpcServer(
+    path,
+    () => {
+      shutdownCalls++;
+      shutdownSawSettled = interruptSettled;
+      order.push('shutdown');
+    },
+    shared,
+    () => { order.push('connection-closed'); },
+    OPERATOR_TOKEN,
+  );
+  await server.start();
+  const client = connect(path);
+  await new Promise<void>((resolve, reject) => {
+    client.once('connect', resolve);
+    client.once('error', reject);
+  });
+  client.on('error', () => {});
+  try {
+    client.write(`${JSON.stringify({
+      id: 'stop-1', method: 'stop_session', params: { id: 's1' },
+      operatorToken: OPERATOR_TOKEN,
+    })}\n`);
+    await started;
+    const closing = server.close();
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(shutdownCalls, 0, 'onShutdown must wait for the queued stop_session');
+    } finally {
+      releaseInterrupt();
+      await closing;
+    }
+    assert.equal(shutdownCalls, 1);
+    assert.equal(shutdownSawSettled, true, 'the interrupt must settle before registry shutdown');
+    assert.deepEqual(order, ['connection-closed', 'shutdown']);
+  } finally {
+    client.destroy();
+    await server.close().catch(() => {});
   }
 });

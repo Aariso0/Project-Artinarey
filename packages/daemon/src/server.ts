@@ -1,11 +1,17 @@
 import { chmodSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
 import { dirname } from 'node:path';
+import { authorizeOperator, isOperatorMethod } from './operator.ts';
 import {
   dispatchTool, invalidateWorktree, isToolMethod, releaseConnection, type RpcContext,
 } from './tools.ts';
 
-export type RpcRequest = { id: string; method: string; params?: unknown };
+export type RpcRequest = {
+  id: string;
+  method: string;
+  params?: unknown;
+  operatorToken?: string;
+};
 export type RpcResponse =
   | { id: string; ok: true; result: unknown }
   | { id: string; ok: false; error: { code: string; message: string } };
@@ -43,8 +49,126 @@ function isControl(method: string): boolean {
   return method === 'ping' || method === 'status' || method === 'shutdown';
 }
 
-async function dispatchRequest(request: RpcRequest, ctx?: RpcContext): Promise<RpcResponse> {
+const SUPERVISOR_METHODS = new Set([
+  'approvals', 'approval_status', 'approve', 'auto_approve', 'sessions', 'stop_session',
+  'evaluate_permission',
+]);
+
+export function isSupervisorMethod(method: string): boolean {
+  return SUPERVISOR_METHODS.has(method);
+}
+
+function str(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+/** User/CLI-facing control methods. They never read a per-connection identity. */
+export async function handleSupervisorRequest(
+  request: RpcRequest,
+  ctx?: RpcContext,
+): Promise<RpcResponse> {
+  const supervisor = ctx?.supervisor;
+  if (!supervisor) {
+    return {
+      id: request.id, ok: false,
+      error: { code: 'NO_PROJECT', message: 'session supervisor is unavailable' },
+    };
+  }
+  const params = request.params && typeof request.params === 'object'
+    ? request.params as Record<string, unknown> : {};
+  try {
+    switch (request.method) {
+      case 'approvals':
+        return {
+          id: request.id, ok: true,
+          result: { approvals: supervisor.approvals(str(params.projectId)) },
+        };
+      case 'approval_status': {
+        const id = str(params.id);
+        if (!id) throw new Error('approval_status needs an id');
+        const approval = supervisor.approvals().find((a) => a.id === id);
+        return {
+          id: request.id, ok: true,
+          result: { status: approval?.status ?? 'unknown', approval: approval ?? null },
+        };
+      }
+      case 'approve': {
+        const id = str(params.id);
+        const by = str(params.by);
+        if (!id || !by) throw new Error('approve needs an id and an actor');
+        const decision = params.decision === 'rejected' ? 'rejected' : 'approved';
+        const result = await supervisor.approve(id, decision, by);
+        return { id: request.id, ok: true, result };
+      }
+      case 'auto_approve': {
+        const worktreeId = str(params.worktreeId);
+        if (!worktreeId || typeof params.enabled !== 'boolean') {
+          throw new Error('auto_approve needs worktreeId and enabled');
+        }
+        supervisor.toggle(worktreeId, params.enabled);
+        return { id: request.id, ok: true, result: { worktreeId, enabled: params.enabled } };
+      }
+      case 'sessions': {
+        const projectId = str(params.projectId);
+        if (!projectId) throw new Error('sessions needs a projectId');
+        return { id: request.id, ok: true, result: { sessions: supervisor.sessions(projectId) } };
+      }
+      case 'stop_session': {
+        const id = str(params.id);
+        if (!id) throw new Error('stop_session needs an id');
+        return { id: request.id, ok: true, result: { stopped: await supervisor.stopSession(id) } };
+      }
+      case 'evaluate_permission': {
+        const projectId = str(params.projectId);
+        const worktreeId = str(params.worktreeId);
+        const sessionId = str(params.sessionId);
+        if (!projectId || !worktreeId || !sessionId) {
+          throw new Error('evaluate_permission needs projectId, worktreeId and sessionId');
+        }
+        return {
+          id: request.id, ok: true,
+          result: supervisor.evaluatePermission({
+            projectId, worktreeId, sessionId,
+            action: str(params.action),
+            resources: Array.isArray(params.resources)
+              ? params.resources.filter((r): r is string => typeof r === 'string') : [],
+            command: str(params.command),
+          }),
+        };
+      }
+      default:
+        return {
+          id: request.id, ok: false,
+          error: { code: 'NOT_FOUND', message: `unknown method: ${request.method}` },
+        };
+    }
+  } catch (err) {
+    return {
+      id: request.id, ok: false,
+      error: {
+        code: (err as { code?: string }).code ?? 'INVALID_INPUT',
+        message: (err as Error).message ?? 'request failed',
+      },
+    };
+  }
+}
+
+async function dispatchRequest(
+  request: RpcRequest,
+  ctx?: RpcContext,
+  shared?: RpcContext,
+  operatorToken?: string,
+): Promise<RpcResponse> {
+  if (isOperatorMethod(request.method)
+      && (!operatorToken || !authorizeOperator(request.operatorToken, operatorToken))) {
+    return {
+      id: request.id,
+      ok: false,
+      error: { code: 'FORBIDDEN', message: 'operator authorization required' },
+    };
+  }
   if (isControl(request.method)) return handleRequest(request);
+  if (isSupervisorMethod(request.method)) return handleSupervisorRequest(request, ctx ?? shared);
   if (!ctx) {
     if (!isToolMethod(request.method)) return handleRequest(request);
     return {
@@ -63,6 +187,7 @@ export function createRpcServer(
   shared?: RpcContext,
   /** Test seam: fires after per-connection cleanup, including when release fails. */
   onConnectionClosed?: () => void,
+  operatorToken?: string,
 ): RpcServer {
   let server: Server | undefined;
   let closePromise: Promise<void> | undefined;
@@ -70,6 +195,7 @@ export function createRpcServer(
   const sockets = new Set<Socket>();
   const contexts = new Set<RpcContext>();
   const closed = new Set<Promise<void>>();
+  const dispatches = new Set<Promise<void>>();
 
   const rpcServer: RpcServer = {
     socketPath,
@@ -120,7 +246,7 @@ export function createRpcServer(
 
         socket.on('data', (chunk: string) => {
           buffer += chunk;
-          queued = queued.then(async () => {
+          const pending = queued.then(async () => {
             let end: number;
             while (!socket.destroyed && (end = buffer.indexOf('\n')) >= 0) {
               const line = buffer.slice(0, end);
@@ -144,7 +270,7 @@ export function createRpcServer(
                 continue;
               }
               try {
-                response = await dispatchRequest(request, ctx);
+                response = await dispatchRequest(request, ctx, shared, operatorToken);
                 shutdown = response.ok && request?.method === 'shutdown';
               } catch (err) {
                 response = {
@@ -167,6 +293,12 @@ export function createRpcServer(
           }).catch((err) => {
             console.error(`request failed: ${(err as Error).message ?? String(err)}`);
           });
+          queued = pending;
+          dispatches.add(pending);
+          void pending.then(
+            () => { dispatches.delete(pending); },
+            () => { dispatches.delete(pending); },
+          );
         });
       });
 
@@ -195,6 +327,8 @@ export function createRpcServer(
           // Every close handler must release its binding before the registry closes.
           await Promise.allSettled([...closed]);
           closed.clear();
+          // In-flight dispatch must settle before the registry closes.
+          await Promise.allSettled([...dispatches]);
           try {
             if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
             if (existsSync(socketPath)) unlinkSync(socketPath);

@@ -11,7 +11,7 @@ import {
   claimPersona, createPersona, findMarker, isUlid, lockGitWorktree, newId, openRegistry,
   readPersona, releasePersona, resolveIdentity, resolveXdgPaths, writeMarker, writePersona,
 } from '@artinarey/core';
-import { createRpcServer } from '@artinarey/daemon';
+import { createRpcServer, loadOrCreateOperatorToken, type RpcContext } from '@artinarey/daemon';
 import { main } from './index.ts';
 
 function root(): string {
@@ -132,6 +132,7 @@ test('connect opencode writes an MCP entry and allow rules without clobbering co
   for (const tool of [
     'check_in', 'claim_persona', 'inbox', 'read_mail',
     'send_mail', 'mark_done', 'report', 'worktrees',
+    'task_update', 'request_scope', 'assign_task',
   ]) {
     assert.ok(allowed.includes(`artinarey_${tool}`), `missing allow rule for ${tool}`);
   }
@@ -277,7 +278,8 @@ test('release <worktree> --force frees a binding through the daemon', async () =
   const persona = createPersona(registry, project.storeDir, project.id, 'dev-a', 'Dev A');
   registry.bindings.bind(persona, worktreeId);
 
-  const server = createRpcServer(paths.socketPath, undefined, { registry, paths });
+  const server = createRpcServer(paths.socketPath, undefined, { registry, paths },
+    undefined, loadOrCreateOperatorToken(paths));
   await server.start();
 
   const original = console.log;
@@ -1341,4 +1343,30 @@ test('run rejects unknown vendors, a missing --persona and unmanaged worktrees',
   assert.equal(registry.bindings.forWorktree(looseId), undefined);
   assert.equal(registry.sessions.list(project.id).length, 0);
   registry.close();
+});
+
+test('approve waits longer than the default call timeout for a cold vendor start', async () => {
+  const dir = root();
+  const env = envFor(dir);
+  const paths = resolveXdgPaths(env);
+  const registry = openRegistry(paths.registryFile);
+  const supervisor = {
+    approve: async () => {
+      // Longer than callDaemon's 2000 ms default, shorter than approve's 30000 ms.
+      await new Promise((resolve) => setTimeout(resolve, 2100));
+      return { approval: { id: 'approval-1', status: 'approved' } };
+    },
+  } as unknown as RpcContext['supervisor'];
+  const server = createRpcServer(paths.socketPath, undefined,
+    { registry, paths, supervisor }, undefined, loadOrCreateOperatorToken(paths));
+  await server.start();
+  try {
+    const result = await captureMain(['approve', 'approval-1'], env, join(dir, 'worktree'));
+    assert.equal(result.code, 0, `${result.err}${result.out}`);
+    assert.match(result.out, /approval-1: approved/);
+    assert.doesNotMatch(result.err, /timed out/);
+  } finally {
+    await server.close();
+    registry.close();
+  }
 });

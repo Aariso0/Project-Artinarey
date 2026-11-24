@@ -40,7 +40,7 @@ Done when:
 | Validation | `zod@4.6.7` (`import * as z from 'zod/v4'` is not needed; top-level `z` works) |
 | Node | v26.13.1 |
 
-**Deviation to record:** Node 26 exposes no pidfd API (`process.pidfd` / `node:process` Pidfd are absent). The plan's settled *intent* — liveness tied to the session, not the parent pid — is met with a dedicated long-lived shim→daemon connection: the daemon releases the binding when that socket closes (EOF) and cross-checks the forwarded pid with `process.kill(pid, 0)`. This is event-driven rather than polled and is at least as strong as pidfd for release-on-exit. Record as an implementation deviation in chatter; no design decision changes.
+**Deviation to record:** Node 26 exposes no pidfd API (`process.pidfd` / `node:process` Pidfd are absent). The plan's settled *intent* — liveness tied to the session, not the parent pid — is met with a dedicated long-lived shim→daemon connection: the daemon releases the binding when that socket closes (EOF) and cross-checks the forwarded pid with `process.kill(pid, 0)`. This is event-driven rather than polled and is at least as strong as pidfd for release-on-exit. Record as an implementation deviation in the project notes; no design decision changes.
 
 ---
 
@@ -172,7 +172,7 @@ Record a separate `DIRECTORY_BUSY` run with the same directory claimed twice.
 
 ### Task 9 — Final verification and docs
 
-Gates green; tick M2 boxes and mark status ✅ in `plan.md`; progress board and README; chatter log + decision record for the pidfd deviation; confirm no `opencode.json` tracked.
+Gates green; tick M2 boxes and mark status ✅ in `plan.md`; progress board and README; implementation note + decision record for the pidfd deviation; confirm no `opencode.json` tracked.
 
 Commit `docs: mark M2 complete`.
 

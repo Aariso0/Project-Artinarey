@@ -109,6 +109,10 @@ const SCHEMA = `
     to_root TEXT NOT NULL,
     moved_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
 `;
 
 type ProjectRow = {
@@ -178,6 +182,8 @@ export type Registry = {
     create(input: PersonaInput): Persona;
     get(id: string): Persona | undefined;
     list(projectId: string): Persona[];
+    /** Records the vendor session id from a daemon-launched session. */
+    setVendor(id: string, vendor: string, vendorSessionId: string): void;
     delete(id: string): void;
   };
   bindings: {
@@ -194,6 +200,11 @@ export type Registry = {
   moves: {
     append(event: MoveInput): void;
     list(projectId: string): MoveEvent[];
+  };
+  /** Local per-worktree toggles. Pending approvals live in the project's store. */
+  settings: {
+    get(key: string): string | undefined;
+    set(key: string, value: string): void;
   };
   close(): void;
 };
@@ -266,6 +277,10 @@ export function openRegistry(file: string): Registry {
         return (db.prepare('SELECT * FROM personas WHERE project_id = ? ORDER BY id')
           .all(projectId) as PersonaRow[]).map(toPersona);
       },
+      setVendor(id, vendor, vendorSessionId) {
+        db.prepare(`UPDATE personas SET vendor = ?, last_vendor_session_id = ? WHERE id = ?`)
+          .run(vendor, vendorSessionId, id);
+      },
       delete(id) {
         db.prepare('DELETE FROM personas WHERE id = ?').run(id);
       },
@@ -323,6 +338,17 @@ export function openRegistry(file: string): Registry {
       list(projectId) {
         return (db.prepare('SELECT * FROM moves WHERE project_id = ? ORDER BY id')
           .all(projectId) as MoveRow[]).map(toMove);
+      },
+    },
+    settings: {
+      get(key) {
+        const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as
+          { value: string } | undefined;
+        return row?.value;
+      },
+      set(key, value) {
+        db.prepare(`INSERT INTO settings (key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
       },
     },
     close() {
