@@ -12,6 +12,8 @@ const WRITE_ACTIONS = new Set(['edit', 'write', 'patch', 'multiedit', 'apply_pat
 const SHELL_ACTIONS = new Set(['shell', 'bash']);
 
 type Evaluation = {
+  /** OpenCode's permission hook data identifies the caller with `sessionID`. */
+  readonly sessionID: string;
   readonly action: string;
   readonly resources: readonly string[];
   effect: 'allow' | 'ask' | 'deny';
@@ -97,6 +99,7 @@ export async function evaluateRiskyCall(
   const decision = await deps.call('evaluate_permission', {
     projectId: marker.projectId,
     worktreeId: marker.worktreeId,
+    sessionId: event.sessionID,
     action: event.action,
     resources: [...event.resources],
     command: event.resources.join(' '),

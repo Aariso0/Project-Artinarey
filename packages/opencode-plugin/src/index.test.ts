@@ -13,14 +13,19 @@ const marker = { projectId: 'p', worktreeId: 'wt' };
 const dir = join(tmpdir(), 'project', 'worktree');
 
 type Event = {
+  sessionID: string;
   action: string;
   resources: string[];
   effect: 'allow' | 'ask' | 'deny';
   message?: string;
 };
 
-function event(action = 'shell', resources = ['curl https://example.com']): Event {
-  return { action, resources, effect: 'allow' };
+function event(
+  action = 'shell',
+  resources = ['curl https://example.com'],
+  sessionID = 'session-1',
+): Event {
+  return { sessionID, action, resources, effect: 'allow' };
 }
 
 function fakeDaemon(
@@ -85,6 +90,15 @@ test('an ask blocks until the user approves, then allows', async () => {
   assert.equal((calls[0]!.params.worktreeId), 'wt');
 });
 
+test('the plugin forwards event.sessionID in the fake-daemon path', async () => {
+  const { call, calls } = fakeDaemon({ effect: 'allow' });
+  const e = event('shell', ['curl https://example.com'], 'session-fake');
+  await evaluateRiskyCall(e as never, marker, dir, { call, sleep: noSleep });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.method, 'evaluate_permission');
+  assert.equal(calls[0]!.params.sessionId, e.sessionID);
+});
+
 test('an ask that the user rejects denies the call', async () => {
   const { call } = fakeDaemon(
     { effect: 'ask', message: 'approval a2', approvalId: 'a2' },
@@ -126,14 +140,15 @@ test('the plugin evaluates a risky call through the socket without an operator t
     server = createRpcServer(paths.socketPath, undefined,
       { supervisor } as unknown as RpcContext);
     await server.start();
-    const e = event();
+    const e = event('shell', ['curl https://example.com'], 'session-socket');
     await evaluateRiskyCall(e as never, marker, dir, {
       call: (method, params) => callDaemon(paths, method, params),
       sleep: noSleep,
     });
     assert.equal(e.effect, 'allow');
     assert.deepEqual(forwarded, {
-      projectId: marker.projectId, worktreeId: marker.worktreeId, action: 'shell',
+      projectId: marker.projectId, worktreeId: marker.worktreeId,
+      sessionId: e.sessionID, action: 'shell',
       resources: ['curl https://example.com'], command: 'curl https://example.com',
     });
   } finally {

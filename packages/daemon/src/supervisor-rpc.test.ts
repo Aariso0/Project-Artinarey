@@ -89,9 +89,14 @@ test('auto_approve requires a worktree and a boolean', async () => {
 });
 
 test('sessions and stop_session require ids', async () => {
+  let interruptResolved = false;
   const ctx = context({
     sessions: () => [{ id: 's1', status: 'running' }],
-    stopSession: (id: string) => id === 's1',
+    stopSession: async (id: string) => {
+      await Promise.resolve();
+      interruptResolved = true;
+      return id === 's1';
+    },
   });
   const missingProject = await handleSupervisorRequest({
     id: '1', method: 'sessions',
@@ -111,10 +116,11 @@ test('sessions and stop_session require ids', async () => {
     id: '4', method: 'stop_session', params: { id: 's1' },
   }, ctx);
   assert.equal(stopped.ok, true);
+  assert.equal(interruptResolved, true, 'stop_session awaits the interrupt before replying');
   if (stopped.ok) assert.equal((stopped.result as { stopped: boolean }).stopped, true);
 });
 
-test('evaluate_permission requires project and worktree and forwards resources', async () => {
+test('evaluate_permission requires project, worktree and session and forwards resources', async () => {
   let forwarded: unknown;
   const ctx = context({
     evaluatePermission: (input: unknown) => {
@@ -126,15 +132,30 @@ test('evaluate_permission requires project and worktree and forwards resources',
     id: '1', method: 'evaluate_permission', params: { projectId: 'p' },
   }, ctx);
   assert.equal(bad.ok, false);
+  for (const params of [
+    { projectId: 'p', worktreeId: 'wt' },
+    { projectId: 'p', worktreeId: 'wt', sessionId: '' },
+    { projectId: 'p', worktreeId: 'wt', sessionId: 42 },
+  ]) {
+    const missingSession = await handleSupervisorRequest({
+      id: 'bad-session', method: 'evaluate_permission', params,
+    }, ctx);
+    assert.equal(missingSession.ok, false);
+    if (!missingSession.ok) {
+      assert.equal(missingSession.error.code, 'INVALID_INPUT');
+      assert.match(missingSession.error.message, /sessionId/);
+    }
+  }
+  assert.equal(forwarded, undefined, 'a rejected request never reaches the supervisor');
   const response = await handleSupervisorRequest({
     id: '2', method: 'evaluate_permission', params: {
-      projectId: 'p', worktreeId: 'wt', action: 'shell',
+      projectId: 'p', worktreeId: 'wt', sessionId: 's1', action: 'shell',
       resources: ['curl https://x.test', 42], command: 'curl https://x.test',
     },
   }, ctx);
   assert.equal(response.ok, true);
   assert.deepEqual(forwarded, {
-    projectId: 'p', worktreeId: 'wt', action: 'shell',
+    projectId: 'p', worktreeId: 'wt', sessionId: 's1', action: 'shell',
     resources: ['curl https://x.test'], command: 'curl https://x.test',
   });
 });

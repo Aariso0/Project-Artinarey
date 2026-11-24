@@ -10,8 +10,8 @@ import { dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
 import {
   buildIndex, createPersona, findMarker, listGitWorktrees, newId, openRegistry,
-  queryMail, readPersona, readTasks, resolveXdgPaths, serializeMail, validateMail,
-  withProjectLock, writeMarker, type Registry,
+  queryMail, readPersona, readTasks, releaseShared, resolveXdgPaths, serializeMail,
+  updateTask, validateMail, withProjectLock, writeMarker, type Registry,
 } from '@artinarey/core';
 import { createRpcServer, type RpcResponse, type RpcServer } from './server.ts';
 import { releaseConnection, type RpcContext } from './tools.ts';
@@ -1210,4 +1210,130 @@ test('only the senior dev may assign; only the assignee may update or request sc
     task_id: taskId, paths: ['docs/x.md'], reason: 'need docs',
   });
   assert.equal(scoped.ok, true, JSON.stringify(scoped));
+});
+
+test('assign_task names the committed task on mail failure and recovers with task_id', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev', 'Dev');
+  const lead = createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, lead);
+
+  const args = { persona_id: dev, title: 'retry me', scope: ['src/a.ts'] };
+  const failed = await client.call('assign_task', { ...args, body: 'API_KEY=do-not-send' });
+  assert.equal(failed.ok, false, JSON.stringify(failed));
+  if (failed.ok) return;
+  assert.equal(failed.error.code, 'MAIL_REJECTED');
+  const taskId = (failed.error as { taskId?: string }).taskId;
+  assert.ok(taskId, 'the committed task id must be returned');
+  assert.match(failed.error.message, new RegExp(taskId));
+  assert.match(failed.error.message, /task_id/);
+  assert.equal(readTasks(s.project.storeDir).length, 1, 'the task survived the mail failure');
+
+  const unknown = await client.call('assign_task', {
+    ...args, body: 'do it', task_id: 'missing-task',
+  });
+  assert.equal(unknown.ok, false);
+  if (!unknown.ok) assert.equal(unknown.error.code, 'NOT_FOUND');
+  assert.equal(readTasks(s.project.storeDir).length, 1, 'recovery must not create a task');
+
+  const recovered = await client.call('assign_task', {
+    ...args, body: 'do it', task_id: taskId,
+  });
+  assert.equal(recovered.ok, true, JSON.stringify(recovered));
+  if (recovered.ok) assert.match((recovered.result as { text: string }).text, new RegExp(taskId));
+  assert.equal(readTasks(s.project.storeDir).length, 1);
+  reindex(s);
+  const tasks = queryMail(join(s.paths.cacheRoot, s.project.id, 'index.sqlite'))
+    .filter((mail) => mail.kind === 'task' && mail.subject === 'Task: retry me');
+  assert.equal(tasks.length, 1, 'recovery must send exactly one notification');
+  assert.match(readFileSync(tasks[0]!.file, 'utf8'), new RegExp(`in_reply_to: ${taskId}`));
+});
+
+test('assign_task names the committed task on index failure and only reindexes on recovery', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev', 'Dev');
+  const lead = createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, lead);
+
+  const index = join(s.paths.cacheRoot, s.project.id, 'index.sqlite');
+  mkdirSync(index, { recursive: true }); // buildIndex cannot open a directory as a DB
+  const args = { persona_id: dev, title: 'index me', scope: ['docs/a.md'], body: 'do it' };
+  const failed = await client.call('assign_task', args);
+  assert.equal(failed.ok, false, JSON.stringify(failed));
+  if (failed.ok) return;
+  assert.equal(failed.error.code, 'INDEX_ERROR');
+  const taskId = (failed.error as { taskId?: string }).taskId;
+  assert.ok(taskId);
+  assert.match(failed.error.message, new RegExp(taskId));
+  assert.equal(readTasks(s.project.storeDir).length, 1);
+
+  rmSync(index, { recursive: true, force: true });
+  const recovered = await client.call('assign_task', { ...args, task_id: taskId });
+  assert.equal(recovered.ok, true, JSON.stringify(recovered));
+  assert.equal(readTasks(s.project.storeDir).length, 1);
+  const mails = queryMail(index).filter((mail) => mail.kind === 'task');
+  assert.equal(mails.length, 1, 'recovery must not resend the committed notification');
+  assert.equal(mails[0]?.subject, 'Task: index me');
+});
+
+test('task_update from done reclaims the lease before reactivating', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev', 'Dev');
+  const other = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-2', 'Dev Two');
+  const lead = createPersona(s.registry, s.project.storeDir, s.project.id, 'senior-dev', 'Lead');
+  const cleanup = track(t, s);
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const leadClient = await openClient(started.socketPath);
+  const worker = await openClient(started.socketPath);
+  cleanup.clients.push(leadClient, worker);
+  await attach(leadClient, s.worktrees[0]!);
+  await claim(leadClient, lead);
+  await attach(worker, s.worktrees[1]!);
+  await claim(worker, dev);
+
+  const created = await leadClient.call('assign_task', {
+    persona_id: dev, title: 'first', scope: ['package.json'], body: 'do it',
+  });
+  assert.equal(created.ok, true, JSON.stringify(created));
+  const taskId = readTasks(s.project.storeDir).find((task) => task.title === 'first')!.id;
+  const done = await worker.call('task_update', { task_id: taskId, status: 'done', note: 'finished' });
+  assert.equal(done.ok, true, JSON.stringify(done));
+
+  // A different task now owns the shared file; reactivation must not steal it.
+  const second = await leadClient.call('assign_task', {
+    persona_id: other, title: 'second', scope: ['package.json'], body: 'do it',
+  });
+  assert.equal(second.ok, true, JSON.stringify(second));
+  const secondId = readTasks(s.project.storeDir).find((task) => task.title === 'second')!.id;
+  const blocked = await worker.call('task_update', {
+    task_id: taskId, status: 'in_progress', note: 'resume',
+  });
+  assert.equal(blocked.ok, false, JSON.stringify(blocked));
+  if (!blocked.ok) assert.equal(blocked.error.code, 'LEASE_OVERLAP');
+  assert.equal(readTasks(s.project.storeDir).find((task) => task.id === taskId)!.status, 'done');
+
+  updateTask(s.project.storeDir, secondId, { status: 'done' });
+  releaseShared(s.project.storeDir, secondId);
+  const retried = await worker.call('task_update', {
+    task_id: taskId, status: 'in_progress', note: 'resume',
+  });
+  assert.equal(retried.ok, true, JSON.stringify(retried));
+  assert.equal(readTasks(s.project.storeDir).find((task) => task.id === taskId)!.status, 'in_progress');
+  const claims = readFileSync(join(s.project.storeDir, 'events', 'leases.jsonl'), 'utf8')
+    .split('\n').filter((line) => line.includes('"type":"shared_claim"')
+      && line.includes(`"taskId":"${taskId}"`));
+  assert.equal(claims.length, 2, 'reactivation must reclaim the shared lease');
 });

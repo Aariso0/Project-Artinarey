@@ -119,7 +119,9 @@ test('a raw socket with the operator token reaches an operator method', async ()
     // Agent/plugin calls stay available without the operator token.
     const evaluated = await rawRpc(paths.socketPath, {
       id: 'e1', method: 'evaluate_permission',
-      params: { projectId: 'p', worktreeId: 'wt', action: 'shell', resources: [] },
+      params: {
+        projectId: 'p', worktreeId: 'wt', sessionId: 'session-1', action: 'shell', resources: [],
+      },
     });
     assert.equal(evaluated.ok, true, JSON.stringify(evaluated));
     if (evaluated.ok) assert.deepEqual(evaluated.result, { effect: 'allow' });

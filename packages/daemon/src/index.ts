@@ -145,10 +145,11 @@ export function callDaemon(
   paths: XdgPaths,
   method: string,
   params: Record<string, unknown> = {},
+  timeoutMs = 2000,
 ): Promise<RpcResponse> {
   const operatorToken = isOperatorMethod(method)
     ? loadOrCreateOperatorToken(paths) : undefined;
-  return rpcCall(daemonPaths(paths).socketPath, method, params, 2000, operatorToken);
+  return rpcCall(daemonPaths(paths).socketPath, method, params, timeoutMs, operatorToken);
 }
 
 export async function daemonStatus(paths: XdgPaths): Promise<unknown | undefined> {

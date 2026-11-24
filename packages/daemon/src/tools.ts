@@ -76,6 +76,23 @@ function toolFail(id: string, code: ArtinareyErrorCode, message: string): RpcRes
   return { id, ok: false, error: { code, message: fail(code, message).text } };
 }
 
+/** A committed task survives a later mail/index failure; expose its id for retry. */
+export type TaskFailureResponse = {
+  id: string;
+  ok: false;
+  error: { code: ArtinareyErrorCode; message: string; taskId: string };
+};
+
+function taskFail(
+  id: string, code: ArtinareyErrorCode, message: string, taskId: string,
+): TaskFailureResponse {
+  const hint = code === 'INDEX_ERROR'
+    ? `task ${taskId} is committed; retry assign_task with task_id to rebuild the index`
+    : `task ${taskId} is committed; retry assign_task with task_id to finish the notification`;
+  const text = fail(code, `${message} (${hint})`).text;
+  return { id, ok: false, error: { code, message: text, taskId } };
+}
+
 function indexFile(ctx: RpcContext, projectId: string): string {
   return join(ctx.paths.cacheRoot, projectId, 'index.sqlite');
 }
@@ -189,6 +206,17 @@ function receiptExists(storeDir: string, mailId: string, role: string): boolean 
     if (!String(entry).endsWith('.md')) return false;
     const fields = frontmatter(readFileSync(join(root, String(entry)), 'utf8'));
     return fields.kind === 'receipt' && fields.in_reply_to === mailId && fields.from === role;
+  });
+}
+
+/** The assignment notification carries the task id so recovery cannot duplicate it. */
+function taskMailExists(storeDir: string, taskId: string): boolean {
+  const root = join(storeDir, 'mail');
+  if (!existsSync(root)) return false;
+  return readdirSync(root, { recursive: true }).some((entry) => {
+    if (!String(entry).endsWith('.md')) return false;
+    const fields = frontmatter(readFileSync(join(root, String(entry)), 'utf8'));
+    return fields.kind === 'task' && fields.in_reply_to === taskId;
   });
 }
 
@@ -576,29 +604,52 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
     }
     const persona = ctx.registry.personas.list(identity.projectId).find((p) => p.id === assignee);
     if (!persona) return toolFail(id, 'NOT_FOUND', `unknown persona: ${assignee}`);
-    try {
-      assertScopeAvailable(identity.storeDir, scope);
-    } catch (err) {
-      const e = err as { code?: ArtinareyErrorCode; message?: string };
-      return toolFail(id, e.code ?? 'LEASE_OVERLAP', e.message ?? 'scope overlaps a lease');
+    const recoveryId = str(params.task_id);
+    let taskId = recoveryId;
+    if (recoveryId) {
+      // A committed task is reused verbatim: never recreate its lease or audit line.
+      const committed = readTasks(identity.storeDir).find((t) => t.id === recoveryId);
+      if (!committed) return toolFail(id, 'NOT_FOUND', `no task with id ${recoveryId}`);
+      if (committed.assignee !== persona.role) {
+        return toolFail(id, 'FORBIDDEN_ROLE', 'the committed task belongs to another persona');
+      }
+      if (committed.scope.length !== scope.length
+          || scope.some((path) => !committed.scope.includes(path))) {
+        return toolFail(id, 'INVALID_INPUT', 'scope must match the committed task');
+      }
+    } else {
+      try {
+        assertScopeAvailable(identity.storeDir, scope);
+      } catch (err) {
+        const e = err as { code?: ArtinareyErrorCode; message?: string };
+        return toolFail(id, e.code ?? 'LEASE_OVERLAP', e.message ?? 'scope overlaps a lease');
+      }
+      taskId = newId();
+      const worktree = ctx.registry.worktrees.list(identity.projectId)
+        .find((wt) => ctx.registry.bindings.forWorktree(wt.id)?.id === assignee);
+      createTask(identity.storeDir, {
+        id: taskId, projectId: identity.projectId, title, scope, assignee: persona.role,
+        status: 'in_progress', worktreeId: worktree?.id ?? null,
+        branch: worktree?.branch ?? null, createdAt: new Date().toISOString(),
+      });
+      claimShared(identity.storeDir, taskId, scope);
     }
-    const taskId = newId();
-    const worktree = ctx.registry.worktrees.list(identity.projectId)
-      .find((wt) => ctx.registry.bindings.forWorktree(wt.id)?.id === assignee);
-    createTask(identity.storeDir, {
-      id: taskId, projectId: identity.projectId, title, scope, assignee: persona.role,
-      status: 'in_progress', worktreeId: worktree?.id ?? null,
-      branch: worktree?.branch ?? null, createdAt: new Date().toISOString(),
-    });
-    claimShared(identity.storeDir, taskId, scope);
+    if (!taskMailExists(identity.storeDir, taskId!)) {
+      try {
+        await sendMail(identity.storeDir, {
+          from: identity.role!, to: [persona.role], subject: `Task: ${title}`,
+          kind: 'task', action: body, body, in_reply_to: taskId,
+        }, { knownPersonas: knownRoles(ctx, identity.projectId), role: identity.role!, sharedTasks: [] });
+      } catch (err) {
+        const e = err as { code?: ArtinareyErrorCode; message?: string };
+        const code = e.code === 'MAIL_PARTIAL' ? 'MAIL_PARTIAL' : 'MAIL_REJECTED';
+        return taskFail(id, code, e.message ?? 'mail rejected', taskId!);
+      }
+    }
     try {
-      await sendMail(identity.storeDir, {
-        from: identity.role!, to: [persona.role], subject: `Task: ${title}`,
-        kind: 'task', action: body, body,
-      }, { knownPersonas: knownRoles(ctx, identity.projectId), role: identity.role!, sharedTasks: [] });
       buildIndex(indexFile(ctx, identity.projectId), identity.storeDir);
     } catch (err) {
-      return toolFail(id, 'MAIL_REJECTED', (err as Error).message);
+      return taskFail(id, 'INDEX_ERROR', (err as Error).message, taskId!);
     }
     return toolOk(id, ok(`Assigned ${taskId} to ${persona.role}.`, unread(ctx, identity), 'inbox'));
   }
@@ -676,6 +727,16 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
     if (!task) return toolFail(id, 'NOT_FOUND', `no task with id ${taskId}`);
     if (task.assignee !== identity.role) {
       return toolFail(id, 'FORBIDDEN_ROLE', 'only the assignee may update a task');
+    }
+    if (task.status === 'done' && status !== 'done') {
+      // Done released the lease; reactivation must win it back before status changes.
+      try {
+        assertScopeAvailable(identity.storeDir, task.scope, taskId);
+        claimShared(identity.storeDir, taskId, task.scope);
+      } catch (err) {
+        const e = err as { code?: ArtinareyErrorCode; message?: string };
+        return toolFail(id, e.code ?? 'LEASE_OVERLAP', e.message ?? 'scope overlaps a lease');
+      }
     }
     updateTask(identity.storeDir, taskId, { status, note });
     if (status === 'done') releaseShared(identity.storeDir, taskId);

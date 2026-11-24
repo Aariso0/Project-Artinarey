@@ -25,6 +25,7 @@ export type FetchFn = (url: string, init?: {
   method?: string;
   headers?: Record<string, string>;
   body?: string;
+  signal?: AbortSignal;
 }) => Promise<HttpResponse>;
 
 export type SpawnedProcess = {
@@ -55,6 +56,25 @@ function authHeader(password: string): Record<string, string> {
   return { Authorization: `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}` };
 }
 
+/** Every fetch gets a deadline, so a hung adapter cannot pin a daemon request. */
+function deadlineSignal(timeoutMs: number): {
+  signal: AbortSignal;
+  abort(): void;
+  clear(): void;
+} {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return {
+    signal: controller.signal,
+    abort: () => controller.abort(),
+    clear: () => clearTimeout(timer),
+  };
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 async function freePort(): Promise<number> {
   const probe = createServer();
   await new Promise<void>((resolve, reject) => {
@@ -78,6 +98,7 @@ export class OpencodeAdapter {
   private readonly pickPort: () => Promise<number>;
   private readonly password: () => string;
   private readonly readyTimeoutMs: number;
+  private pendingServe?: Promise<ServeState>;
 
   constructor(options: OpencodeAdapterOptions) {
     this.stateFile = options.stateFile;
@@ -95,57 +116,105 @@ export class OpencodeAdapter {
     return `http://127.0.0.1:${state.port}`;
   }
 
-  async reachable(state: ServeState): Promise<boolean> {
+  /** A caller-supplied signal shares the remaining readiness deadline. */
+  async reachable(state: ServeState, signal?: AbortSignal): Promise<boolean> {
     if (!isProcessAlive(state.pid)) return false;
+    const deadline = signal ? undefined : deadlineSignal(this.readyTimeoutMs);
     try {
       const response = await this.fetchImpl(`${this.base(state)}/api/info`, {
         headers: authHeader(state.password),
+        signal: signal ?? deadline!.signal,
       });
       return response.ok;
     } catch {
       return false;
+    } finally {
+      deadline?.clear();
     }
   }
 
-  /** Reuse a live server, otherwise start a new one and persist its handle. */
+  /** Concurrent callers share one start attempt instead of spawning rivals. */
   async ensureServe(): Promise<ServeState> {
+    if (this.pendingServe) return this.pendingServe;
+    const pending = this.startServe();
+    this.pendingServe = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this.pendingServe === pending) this.pendingServe = undefined;
+    }
+  }
+
+  private launchFailure(message: string, pid?: number): ArtinareyError {
+    if (pid) {
+      try { process.kill(pid); } catch { /* it may already be gone */ }
+    }
+    return new ArtinareyError('STORE_OFFLINE', message);
+  }
+
+  private async startServe(): Promise<ServeState> {
     const existing = readServeState(this.stateFile);
     if (existing && await this.reachable(existing)) return existing;
     const port = await this.pickPort();
     const password = this.password();
     const log = join(this.logDir, 'opencode-serve.log');
     const logFd = openSync(log, 'a');
-    let child: SpawnedProcess;
+    const deadline = deadlineSignal(this.readyTimeoutMs);
+    let child: SpawnedProcess | undefined;
+    let childError: unknown;
     try {
-      child = this.spawnImpl(this.command,
-        ['serve', '--hostname', '127.0.0.1', '--port', String(port)],
-        {
-          cwd: this.logDir,
-          env: { ...this.env, OPENCODE_PASSWORD: password },
-          stdio: ['ignore', logFd, logFd],
-          detached: true,
-        });
+      try {
+        child = this.spawnImpl(this.command,
+          ['serve', '--hostname', '127.0.0.1', '--port', String(port)],
+          {
+            cwd: this.logDir,
+            env: { ...this.env, OPENCODE_PASSWORD: password },
+            stdio: ['ignore', logFd, logFd],
+            detached: true,
+          });
+      } catch (err) {
+        throw this.launchFailure(`opencode serve failed to spawn: ${errorMessage(err)}`);
+      }
+      // The child emits `error` asynchronously; without this listener Node exits.
+      child.once('error', (arg: unknown) => {
+        childError = arg ?? new Error('opencode serve emitted an error');
+        deadline.abort();
+      });
+      if (childError) {
+        throw this.launchFailure(`opencode serve failed to start: ${errorMessage(childError)}`, child.pid);
+      }
+      if (!child.pid) {
+        throw this.launchFailure('opencode serve did not report a pid', child.pid);
+      }
+      const state: ServeState = {
+        pid: child.pid, port, password, startedAt: new Date().toISOString(),
+      };
+      const until = Date.now() + this.readyTimeoutMs;
+      let ready = false;
+      while (Date.now() < until && !deadline.signal.aborted) {
+        if (childError) {
+          throw this.launchFailure(`opencode serve failed to start: ${errorMessage(childError)}`, child.pid);
+        }
+        if (await this.reachable(state, deadline.signal)) { ready = true; break; }
+        if (childError) {
+          throw this.launchFailure(`opencode serve failed to start: ${errorMessage(childError)}`, child.pid);
+        }
+        await new Promise((resolve) => setTimeout(resolve, Math.min(25, until - Date.now())));
+      }
+      if (childError) {
+        throw this.launchFailure(`opencode serve failed to start: ${errorMessage(childError)}`, child.pid);
+      }
+      if (!ready) {
+        throw this.launchFailure('opencode serve did not become ready', child.pid);
+      }
+      writeServeState(this.stateFile, state);
+      child.unref?.();
+      return state;
     } finally {
       // The child inherits its own descriptor after spawn; the parent closes its copy.
       closeSync(logFd);
+      deadline.clear();
     }
-    if (!child.pid) throw new ArtinareyError('STORE_OFFLINE', 'opencode serve did not report a pid');
-    const state: ServeState = {
-      pid: child.pid, port, password, startedAt: new Date().toISOString(),
-    };
-    const deadline = Date.now() + this.readyTimeoutMs;
-    let ready = false;
-    while (Date.now() < deadline) {
-      if (await this.reachable(state)) { ready = true; break; }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    if (!ready) {
-      try { process.kill(child.pid); } catch { /* it may already be gone */ }
-      throw new ArtinareyError('STORE_OFFLINE', 'opencode serve did not become ready');
-    }
-    writeServeState(this.stateFile, state);
-    child.unref?.();
-    return state;
   }
 
   private async request(
@@ -154,16 +223,26 @@ export class OpencodeAdapter {
     method: 'GET' | 'POST',
     body?: unknown,
   ): Promise<unknown> {
-    const response = await this.fetchImpl(`${this.base(state)}${path}`, {
-      method,
-      headers: { ...authHeader(state.password), 'Content-Type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    if (!response.ok) {
+    const deadline = deadlineSignal(this.readyTimeoutMs);
+    try {
+      const response = await this.fetchImpl(`${this.base(state)}${path}`, {
+        method,
+        headers: { ...authHeader(state.password), 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: deadline.signal,
+      });
+      if (!response.ok) {
+        throw new ArtinareyError('STORE_OFFLINE',
+          `opencode ${method} ${path} failed with HTTP ${response.status}`);
+      }
+      return await response.json();
+    } catch (err) {
+      if (err instanceof ArtinareyError) throw err;
       throw new ArtinareyError('STORE_OFFLINE',
-        `opencode ${method} ${path} failed with HTTP ${response.status}`);
+        `opencode ${method} ${path} failed: ${errorMessage(err)}`);
+    } finally {
+      deadline.clear();
     }
-    return response.json();
   }
 
   /** The directory travels in the body; the SDK's create() has no such field. */
@@ -185,6 +264,13 @@ export class OpencodeAdapter {
 
   async interrupt(state: ServeState, sessionId: string): Promise<void> {
     await this.request(state, `/api/session/${encodeURIComponent(sessionId)}/interrupt`, 'POST', {});
+  }
+
+  /** Supervisor seam: resolve the persisted serve handle before interrupting. */
+  async interruptSession(sessionId: string): Promise<void> {
+    const state = readServeState(this.stateFile);
+    if (!state) throw new ArtinareyError('STORE_OFFLINE', 'opencode serve is not running');
+    await this.interrupt(state, sessionId);
   }
 
   /** Operator-only teardown of the shared server; daemon shutdown leaves it detached. */

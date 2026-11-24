@@ -4,13 +4,19 @@ import { mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  fileMode, newId, readServeState, serveStateFile, writeServeState, type ServeState,
+  ArtinareyError, fileMode, newId, readServeState, serveStateFile, writeServeState, type ServeState,
 } from '@artinarey/core';
 import {
-  OpencodeAdapter, type FetchFn, type SpawnFn, type SpawnedProcess,
+  OpencodeAdapter, type FetchFn, type HttpResponse, type SpawnFn, type SpawnedProcess,
 } from './opencode.ts';
 
-type Call = { url: string; method?: string; headers?: Record<string, string>; body?: string };
+type Call = {
+  url: string;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  signal?: AbortSignal;
+};
 
 function setup() {
   const root = join(tmpdir(), `artinarey-adapter-${newId()}`);
@@ -26,7 +32,7 @@ function fakeFetch(handler: (call: Call) => { ok: boolean; status: number; body:
   const calls: Call[] = [];
   const fetchImpl: FetchFn = async (url, init) => {
     const call: Call = {
-      url, method: init?.method, headers: init?.headers, body: init?.body,
+      url, method: init?.method, headers: init?.headers, body: init?.body, signal: init?.signal,
     };
     calls.push(call);
     const result = handler(call);
@@ -172,3 +178,169 @@ test('stopServe kills the recorded pid and clears the handle', async () => {
 function fetchCalls(calls: Call[], suffix: string): Call[] {
   return calls.filter((call) => call.url.endsWith(suffix));
 }
+
+function hangingFetch(onCall?: (init?: Parameters<FetchFn>[1]) => void): FetchFn {
+  return (_url, init) => new Promise<HttpResponse>((_resolve, reject) => {
+    if (init?.signal?.aborted) { reject(new Error('aborted')); return; }
+    // Register before onCall: the callback may abort synchronously.
+    init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+    onCall?.(init);
+  });
+}
+
+/** A fake child uses this process's live pid; suppress the real signal. */
+async function withoutKill<T>(run: () => Promise<T>): Promise<T> {
+  const original = process.kill;
+  (process as { kill: typeof process.kill }).kill = (() => true) as typeof process.kill;
+  try {
+    return await run();
+  } finally {
+    (process as { kill: typeof process.kill }).kill = original;
+  }
+}
+
+test('a hung readiness fetch is aborted at the deadline with a typed error', async () => {
+  const s = setup();
+  try {
+    const signals: Array<AbortSignal | undefined> = [];
+    const serve = new OpencodeAdapter({
+      stateFile: s.stateFile, logDir: s.logDir,
+      fetchImpl: hangingFetch((init) => signals.push(init?.signal)),
+      spawnImpl: fakeSpawn(process.pid).spawnImpl,
+      pickPort: async () => 45679, password: () => 'pw', readyTimeoutMs: 40,
+    });
+    const started = Date.now();
+    await withoutKill(() => assert.rejects(serve.ensureServe(), (err: unknown) => err instanceof ArtinareyError
+      && err.code === 'STORE_OFFLINE' && /did not become ready/.test(err.message)));
+    assert.ok(Date.now() - started < 1000, 'the deadline must bound the readiness check');
+    assert.ok(signals.length > 0, 'readiness must pass a signal to fetch');
+    assert.ok(signals.every((signal) => signal?.aborted === true));
+    assert.equal(readServeState(s.stateFile), undefined);
+  } finally {
+    rmSync(s.root, { recursive: true, force: true });
+  }
+});
+
+test('request fetches are bounded too and surface STORE_OFFLINE', async () => {
+  const s = setup();
+  try {
+    const signals: Array<AbortSignal | undefined> = [];
+    const serve = new OpencodeAdapter({
+      stateFile: s.stateFile, logDir: s.logDir,
+      fetchImpl: hangingFetch((init) => signals.push(init?.signal)),
+      readyTimeoutMs: 30,
+    });
+    await assert.rejects(
+      serve.createSession({
+        pid: process.pid, port: 45680, password: 'pw', startedAt: 'now',
+      }, '/worktrees/dev'),
+      (err: unknown) => err instanceof ArtinareyError
+        && err.code === 'STORE_OFFLINE' && /aborted/.test(err.message),
+    );
+    assert.ok(signals.length > 0);
+    assert.equal(signals[0]?.aborted, true);
+  } finally {
+    rmSync(s.root, { recursive: true, force: true });
+  }
+});
+
+test('an async spawn error takes the STORE_OFFLINE launch failure path', async () => {
+  const s = setup();
+  try {
+    let emitError: ((err: Error) => void) | undefined;
+    const spawnImpl: SpawnFn = () => {
+      const child: SpawnedProcess = {
+        pid: process.pid,
+        once(event, listener) {
+          if (event === 'error') emitError = listener as (err: Error) => void;
+          return child;
+        },
+        unref() { return child; },
+      };
+      return child;
+    };
+    const serve = new OpencodeAdapter({
+      stateFile: s.stateFile, logDir: s.logDir,
+      fetchImpl: hangingFetch(() => emitError?.(new Error('spawn exploded'))),
+      spawnImpl, pickPort: async () => 45681, password: () => 'pw', readyTimeoutMs: 1000,
+    });
+    await withoutKill(() => assert.rejects(serve.ensureServe(), (err: unknown) => err instanceof ArtinareyError
+      && err.code === 'STORE_OFFLINE' && /spawn exploded/.test(err.message)));
+    assert.equal(readServeState(s.stateFile), undefined);
+  } finally {
+    rmSync(s.root, { recursive: true, force: true });
+  }
+});
+
+test('a synchronous spawn throw is a typed launch failure', async () => {
+  const s = setup();
+  try {
+    const spawnImpl: SpawnFn = () => { throw new Error('ENOENT opencode'); };
+    const serve = new OpencodeAdapter({
+      stateFile: s.stateFile, logDir: s.logDir,
+      fetchImpl: fakeFetch(() => ({ ok: true, status: 200, body: {} })).fetchImpl,
+      spawnImpl, pickPort: async () => 45682, password: () => 'pw',
+    });
+    await assert.rejects(serve.ensureServe(), (err: unknown) => err instanceof ArtinareyError
+      && err.code === 'STORE_OFFLINE' && /failed to spawn/.test(err.message));
+    assert.equal(readServeState(s.stateFile), undefined);
+  } finally {
+    rmSync(s.root, { recursive: true, force: true });
+  }
+});
+
+test('concurrent ensureServe calls share one start and the guard clears', async () => {
+  const s = setup();
+  try {
+    const { fetchImpl } = fakeFetch(() => ({ ok: true, status: 200, body: {} }));
+    const { spawnImpl, calls: spawns } = fakeSpawn(process.pid);
+    let releasePort!: (port: number) => void;
+    let portCalls = 0;
+    const pickPort = () => {
+      portCalls++;
+      return portCalls === 1
+        ? new Promise<number>((resolve) => { releasePort = resolve; })
+        : Promise.resolve(45685);
+    };
+    const serve = new OpencodeAdapter({
+      stateFile: s.stateFile, logDir: s.logDir, fetchImpl, spawnImpl, pickPort,
+      password: () => 'pw', readyTimeoutMs: 100,
+    });
+    const first = serve.ensureServe();
+    const second = serve.ensureServe();
+    releasePort(45683);
+    const [one, two] = await Promise.all([first, second]);
+    assert.strictEqual(one, two);
+    assert.equal(spawns.length, 1);
+
+    // Once settled, a dead handle may start a fresh server again.
+    writeServeState(s.stateFile, {
+      pid: 99999999, port: 1, password: 'old', startedAt: 'old',
+    });
+    await serve.ensureServe();
+    assert.equal(spawns.length, 2);
+  } finally {
+    rmSync(s.root, { recursive: true, force: true });
+  }
+});
+
+test('interruptSession uses the persisted serve state', async () => {
+  const s = setup();
+  try {
+    const { fetchImpl, calls } = fakeFetch(() => ({ ok: true, status: 200, body: {} }));
+    const serve = new OpencodeAdapter({ stateFile: s.stateFile, logDir: s.logDir, fetchImpl });
+    writeServeState(s.stateFile, {
+      pid: process.pid, port: 45684, password: 'pw', startedAt: 'now',
+    });
+    await serve.interruptSession('session 1');
+    const interrupt = fetchCalls(calls, '/api/session/session%201/interrupt')[0]!;
+    assert.equal(interrupt.method, 'POST');
+    assert.deepEqual(JSON.parse(interrupt.body ?? '{}'), {});
+
+    rmSync(s.stateFile, { force: true });
+    await assert.rejects(serve.interruptSession('session 1'), (err: unknown) => err instanceof ArtinareyError
+      && err.code === 'STORE_OFFLINE' && /not running/.test(err.message));
+  } finally {
+    rmSync(s.root, { recursive: true, force: true });
+  }
+});

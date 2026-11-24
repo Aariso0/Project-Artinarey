@@ -1,12 +1,12 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join, resolve, sep } from 'node:path';
 import {
-  appendSession, ArtinareyError, buildFirstPrompt, claimPersona, createApproval,
-  endSession, getAutoApprove, isProcessAlive, newId, pendingApproval, readApprovals,
-  readRoleCard, readSessions, readTasks, releasePersona, resolveApproval,
-  resolveIdentity, riskyReasons, sessionLogFile, setAutoApprove,
-  type Approval, type ApprovalKind, type ArtinareyErrorCode, type Identity,
+  approvalFingerprint, appendSession, ArtinareyError, buildFirstPrompt, claimPersona,
+  createApproval, endSession, getAutoApprove, isProcessAlive, newId, pendingApproval, readApprovals,
+  readPersona, readRoleCard, readSessions, readTasks, resolveApproval,
+  resolveIdentity, riskyReasons, rollbackFailedClaim, sessionLogFile, setAutoApprove,
+  updateTask, type Approval, type ApprovalKind, type ArtinareyErrorCode, type Identity,
   type Registry, type SessionSummary, type XdgPaths,
 } from '@artinarey/core';
 
@@ -33,6 +33,7 @@ export type SpawnResult =
 export type PermissionRequest = {
   projectId: string;
   worktreeId: string;
+  sessionId: string;
   action?: string;
   resources?: string[];
   command?: string;
@@ -44,12 +45,15 @@ export type PermissionDecision = {
   approvalId?: string;
 };
 
+type ServeState = { pid: number; port: number; password: string; startedAt: string };
+
 /** The subset of OpencodeAdapter the supervisor needs; lets tests inject a fake. */
 export type SessionAdapter = {
-  ensureServe(): Promise<{ pid: number; port: number; password: string; startedAt: string }>;
-  createSession(state: { pid: number; port: number; password: string; startedAt: string }, directory: string): Promise<string>;
-  sendPrompt(state: { pid: number; port: number; password: string; startedAt: string }, sessionId: string, text: string, id?: string): Promise<void>;
-  interrupt(state: { pid: number; port: number; password: string; startedAt: string }, sessionId: string): Promise<void>;
+  ensureServe(): Promise<ServeState>;
+  createSession(state: ServeState, directory: string): Promise<string>;
+  sendPrompt(state: ServeState, sessionId: string, text: string, id?: string): Promise<void>;
+  interrupt(state: ServeState, sessionId: string): Promise<void>;
+  interruptSession(sessionId: string): Promise<void>;
 };
 
 export type Notifier = (message: string) => void;
@@ -68,14 +72,23 @@ export type SupervisorOptions = {
   timers?: TimerApi;
 };
 
-const defaultNotifier: Notifier = (message) => {
-  try {
-    const child = spawn('/usr/bin/notify-send', ['Artinarey', message], {
-      stdio: 'ignore', detached: true,
-    });
-    child.unref();
-  } catch {
+/** Test seam: the async error listener must exist before unref, or ENOENT kills the daemon. */
+export function spawnNotifier(message: string): ChildProcess {
+  const child = spawn('/usr/bin/notify-send', ['Artinarey', message], {
+    stdio: 'ignore', detached: true,
+  });
+  child.on('error', () => {
     // A missing desktop notifier must never block an agent or an approval.
+  });
+  child.unref();
+  return child;
+}
+
+export const defaultNotifier: Notifier = (message) => {
+  try {
+    spawnNotifier(message);
+  } catch {
+    // Synchronous spawn failures are equally non-fatal.
   }
 };
 
@@ -88,6 +101,10 @@ function fail(code: ArtinareyErrorCode, message: string, approvalId?: string): S
   return { ok: false, code, message, ...(approvalId ? { approvalId } : {}) };
 }
 
+function inside(root: string, target: string): boolean {
+  return target === root || target.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
+}
+
 export class SessionSupervisor {
   private readonly registry: Registry;
   private readonly paths: XdgPaths;
@@ -97,6 +114,11 @@ export class SessionSupervisor {
   private readonly notify: Notifier;
   private readonly timers: TimerApi;
   private readonly reminders = new Map<string, unknown[]>();
+  /** In-flight launches reserve capacity and persona ownership before any await. */
+  private readonly reservedByProject = new Map<string, number>();
+  private readonly reservedPersonas = new Set<string>();
+  /** Reservations kept after an unconfirmed vendor cleanup stay owned by the session. */
+  private readonly heldBySession = new Map<string, { projectId: string; personaId: string }>();
 
   constructor(options: SupervisorOptions) {
     this.registry = options.registry;
@@ -118,6 +140,29 @@ export class SessionSupervisor {
     return sessionLogFile(this.paths.cacheRoot, projectId);
   }
 
+  private reserve(projectId: string, personaId: string): void {
+    this.reservedByProject.set(projectId, (this.reservedByProject.get(projectId) ?? 0) + 1);
+    this.reservedPersonas.add(personaId);
+  }
+
+  private releaseReservation(projectId: string, personaId: string): void {
+    const remaining = (this.reservedByProject.get(projectId) ?? 0) - 1;
+    if (remaining > 0) this.reservedByProject.set(projectId, remaining);
+    else this.reservedByProject.delete(projectId);
+    this.reservedPersonas.delete(personaId);
+  }
+
+  private boundWorktree(personaId: string): { id: string; path: string } | undefined {
+    for (const project of this.registry.projects.list()) {
+      for (const worktree of this.registry.worktrees.list(project.id)) {
+        if (this.registry.bindings.forWorktree(worktree.id)?.id === personaId) {
+          return { id: worktree.id, path: worktree.path };
+        }
+      }
+    }
+    return undefined;
+  }
+
   /** Dead handles are failed once at startup; live ones keep their registry session. */
   adopt(): void {
     for (const project of this.registry.projects.list()) {
@@ -132,11 +177,24 @@ export class SessionSupervisor {
   }
 
   sessions(projectId: string): SessionSummary[] {
-    return readSessions(this.summaryFile(projectId));
+    const file = this.summaryFile(projectId);
+    const summaries = readSessions(file);
+    const ended = new Set(this.registry.sessions.list(projectId)
+      .filter((session) => session.endedAt).map((session) => session.id));
+    let reconciled = false;
+    for (const summary of summaries) {
+      // Only a registry-ended session is authoritative; no agent-exit guess here.
+      if (summary.status === 'running' && ended.has(summary.id)) {
+        endSession(file, summary.id, 'failed');
+        reconciled = true;
+      }
+    }
+    return reconciled ? readSessions(file) : summaries;
   }
 
   liveCount(projectId: string): number {
-    return this.registry.sessions.list(projectId).filter((session) => !session.endedAt).length;
+    return this.registry.sessions.list(projectId).filter((session) => !session.endedAt).length
+      + (this.reservedByProject.get(projectId) ?? 0);
   }
 
   approvals(projectId?: string): Approval[] {
@@ -207,28 +265,44 @@ export class SessionSupervisor {
     const worktree = this.registry.worktrees.list(input.projectId)
       .find((wt) => wt.id === input.worktreeId);
     if (!worktree) return { effect: 'deny', message: 'unknown worktree for this session' };
+    const root = resolve(worktree.path);
     const resources = input.resources ?? [];
     const outside = resources.filter((resource) => {
-      const target = resource.startsWith('/') ? resource : join(worktree.path, resource);
-      return !target.startsWith(`${worktree.path}/`) && target !== worktree.path;
+      const target = resolve(isAbsolute(resource) ? resource : join(root, resource));
+      return !inside(root, target);
     });
     const reasons = riskyReasons(input.command ?? '', worktree.path);
     if (outside.length > 0) reasons.push(`outside worktree: ${outside.join(', ')}`);
     if (reasons.length === 0) return { effect: 'allow' };
     if (this.isAutoApprove(worktree.id)
-        && !reasons.some((reason) => reason.startsWith('outside worktree'))) {
+        && !reasons.some((reason) => reason.includes('outside worktree'))) {
       return { effect: 'allow' };
     }
     const storeDir = this.storeOf(input.projectId);
+    const fingerprint = approvalFingerprint({
+      projectId: input.projectId,
+      worktreeId: worktree.id,
+      action: input.action,
+      resources,
+      command: input.command,
+      sessionId: input.sessionId,
+    });
     const key = { projectId: input.projectId, kind: 'risky_call' as ApprovalKind,
-      worktreeId: worktree.id };
+      worktreeId: worktree.id, fingerprint };
     const existing = pendingApproval(storeDir, key);
+    const summary = `${worktree.path} [sessionId=${input.sessionId} action=${input.action ?? ''} resources=${JSON.stringify(resources)} command=${input.command ?? ''}]: ${reasons.join('; ')}`;
     const approval = existing ?? createApproval(storeDir, {
       ...key,
       id: newId(),
-      summary: `${worktree.path}: ${reasons.join('; ')}`,
+      summary,
+      payload: {
+        action: input.action ?? '',
+        resources: [...resources],
+        command: input.command ?? '',
+        sessionId: input.sessionId,
+      },
     });
-    if (!existing) this.schedule(approval.id, approval.summary);
+    if (!existing) this.schedule(approval.id, summary);
     return {
       effect: 'ask',
       approvalId: approval.id,
@@ -289,6 +363,15 @@ export class SessionSupervisor {
         ?? worktrees.find((wt) => wt.branch === task.branch)
         ?? worktrees.find((wt) => wt.id === caller.worktreeId));
     if (!worktree) return fail('NOT_FOUND', 'task has no registered worktree');
+    if (input.worktree_id) {
+      if (task.worktreeId && worktree.id !== task.worktreeId) {
+        return fail('INVALID_INPUT', 'explicit worktree does not match the task lease');
+      }
+      if (!task.worktreeId && task.branch && worktree.branch !== task.branch) {
+        return fail('INVALID_INPUT', 'explicit worktree does not match the task branch');
+      }
+    }
+    updateTask(storeDir, task.id, { worktreeId: worktree.id });
 
     const personas = this.registry.personas.list(caller.projectId);
     const persona = (input.persona_id
@@ -308,7 +391,8 @@ export class SessionSupervisor {
         `${worktree.path} has pending work for another persona`);
     }
     const liveElsewhere = this.registry.sessions.list(caller.projectId)
-      .some((session) => !session.endedAt && session.personaId === persona.id);
+      .some((session) => !session.endedAt && session.personaId === persona.id)
+      || this.reservedPersonas.has(persona.id);
     if (liveElsewhere) return fail('DIRECTORY_BUSY', `${persona.role} already has a live session`);
 
     if (!options.approved && this.liveCount(caller.projectId) >= this.spawnCap) {
@@ -329,16 +413,51 @@ export class SessionSupervisor {
 
     const target = resolveIdentity(this.registry, worktree.path);
     if (!target.ok) return fail(target.code, target.message);
+
+    // Snapshot first: claimPersona may bind, lock and write persona state before
+    // its audit append throws. The same snapshot restores a failed launch.
+    const previousBinding = this.registry.bindings.forWorktree(target.identity.worktreeId)?.id;
+    const previousState = readPersona(storeDir, persona.id);
+    const originalWorktree = this.boundWorktree(persona.id);
+    this.reserve(caller.projectId, persona.id);
+    let reservationHeld = true;
+    const release = () => {
+      if (!reservationHeld) return;
+      reservationHeld = false;
+      this.releaseReservation(caller.projectId, persona.id);
+    };
+    const rollbackClaim = () => {
+      try {
+        rollbackFailedClaim(this.registry, target.identity, persona.id,
+          previousBinding, previousState, originalWorktree, false);
+      } catch {
+        // Rollback itself must never mask the original failure.
+      }
+    };
+
     // The senior dev is exempt from the home-worktree confirmation (plan.md §6).
-    const claim = claimPersona(this.registry, storeDir, target.identity, {
-      personaId: persona.id, confirmMove: true,
-    });
-    if (!claim.ok) return fail(claim.code, claim.message);
+    let claim;
+    try {
+      claim = claimPersona(this.registry, storeDir, target.identity, {
+        personaId: persona.id, confirmMove: true,
+      });
+    } catch (err) {
+      rollbackClaim();
+      release();
+      return fail('STORE_OFFLINE', `spawn failed: ${(err as Error).message ?? String(err)}`);
+    }
+    if (!claim.ok) {
+      rollbackClaim();
+      release();
+      return fail(claim.code, claim.message);
+    }
 
     let sessionId: string | undefined;
+    let vendorSessionId: string | undefined;
+    let summary: SessionSummary | undefined;
+    let summaryAppended = false;
     try {
       const serve = await this.adapter.ensureServe();
-      const vendorSessionId = await this.adapter.createSession(serve, worktree.path);
       sessionId = this.registry.sessions.append({
         projectId: caller.projectId,
         worktreeId: worktree.id,
@@ -348,6 +467,23 @@ export class SessionSupervisor {
         createdBinding: !bound,
       });
       const logFile = join(this.paths.cacheRoot, 'logs', `${sessionId}.log`);
+      summary = {
+        id: sessionId,
+        projectId: caller.projectId,
+        worktreeId: worktree.id,
+        personaId: persona.id,
+        vendor: input.vendor ?? 'opencode',
+        vendorSessionId: null,
+        pid: serve.pid,
+        startedAt: new Date().toISOString(),
+        endedAt: null,
+        status: 'running',
+        logFile,
+      };
+      vendorSessionId = await this.adapter.createSession(serve, worktree.path);
+      summary.vendorSessionId = vendorSessionId;
+      appendSession(this.summaryFile(caller.projectId), summary);
+      summaryAppended = true;
       mkdirSync(join(this.paths.cacheRoot, 'logs'), { recursive: true });
       const handoffFile = join(storeDir, 'personas', persona.id, 'handoff.md');
       const prompt = buildFirstPrompt({
@@ -356,23 +492,10 @@ export class SessionSupervisor {
         handoff: existsSync(handoffFile) ? readFileSync(handoffFile, 'utf8').trim() : '',
         task: { id: task.id, title: task.title, scope: task.scope, body: '' },
       });
-      const summary: SessionSummary = {
-        id: sessionId,
-        projectId: caller.projectId,
-        worktreeId: worktree.id,
-        personaId: persona.id,
-        vendor: input.vendor ?? 'opencode',
-        vendorSessionId,
-        pid: serve.pid,
-        startedAt: new Date().toISOString(),
-        endedAt: null,
-        status: 'running',
-        logFile,
-      };
-      appendSession(this.summaryFile(caller.projectId), summary);
       appendFileSync(logFile, `> first prompt (session ${vendorSessionId})\n${prompt}\n`);
       await this.adapter.sendPrompt(serve, vendorSessionId, prompt, `${sessionId}-first`);
       this.registry.personas.setVendor(persona.id, summary.vendor, vendorSessionId);
+      release();
       return {
         ok: true,
         session: summary,
@@ -380,21 +503,59 @@ export class SessionSupervisor {
         message: `Started ${persona.role} in ${worktree.path} (session ${vendorSessionId}).`,
       };
     } catch (err) {
-      if (sessionId) this.registry.sessions.end(sessionId, new Date().toISOString());
-      if (!bound) {
-        try { releasePersona(this.registry, storeDir, persona.id); } catch { /* best effort */ }
+      // A vendor session created before the failure must be reconciled first;
+      // an unconfirmed interrupt leaves the execution visible and owned.
+      let cleanupConfirmed = true;
+      if (vendorSessionId) {
+        try {
+          await this.adapter.interruptSession(vendorSessionId);
+        } catch {
+          cleanupConfirmed = false;
+        }
+      }
+      if (cleanupConfirmed) {
+        try { if (sessionId) this.registry.sessions.end(sessionId, new Date().toISOString()); } catch { /* best effort */ }
+        try {
+          if (sessionId && summary && summaryAppended) {
+            endSession(this.summaryFile(caller.projectId), sessionId, 'failed');
+          }
+        } catch { /* best effort */ }
+        rollbackClaim();
+        release();
+      } else {
+        try {
+          if (summary && !summaryAppended) {
+            appendSession(this.summaryFile(caller.projectId), summary);
+            summaryAppended = true;
+          }
+        } catch { /* registry row already keeps the launch visible */ }
+        if (sessionId) {
+          this.heldBySession.set(sessionId, { projectId: caller.projectId, personaId: persona.id });
+        }
       }
       return fail('STORE_OFFLINE', `spawn failed: ${(err as Error).message ?? String(err)}`);
     }
   }
 
-  stopSession(id: string): boolean {
+  async stopSession(id: string): Promise<boolean> {
     const summaries = this.registry.projects.list()
       .flatMap((project) => readSessions(this.summaryFile(project.id)));
     const session = summaries.find((s) => s.id === id && s.status === 'running');
     if (!session) return false;
+    if (session.vendorSessionId) {
+      try {
+        await this.adapter.interruptSession(session.vendorSessionId);
+      } catch {
+        return false;
+      }
+    }
     endSession(this.summaryFile(session.projectId), id, 'stopped');
     this.registry.sessions.end(id, new Date().toISOString());
+    const held = this.heldBySession.get(id);
+    if (held) {
+      this.releaseReservation(held.projectId, held.personaId);
+      this.heldBySession.delete(id);
+    }
     return true;
   }
 }

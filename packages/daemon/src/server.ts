@@ -116,18 +116,19 @@ export async function handleSupervisorRequest(
       case 'stop_session': {
         const id = str(params.id);
         if (!id) throw new Error('stop_session needs an id');
-        return { id: request.id, ok: true, result: { stopped: supervisor.stopSession(id) } };
+        return { id: request.id, ok: true, result: { stopped: await supervisor.stopSession(id) } };
       }
       case 'evaluate_permission': {
         const projectId = str(params.projectId);
         const worktreeId = str(params.worktreeId);
-        if (!projectId || !worktreeId) {
-          throw new Error('evaluate_permission needs projectId and worktreeId');
+        const sessionId = str(params.sessionId);
+        if (!projectId || !worktreeId || !sessionId) {
+          throw new Error('evaluate_permission needs projectId, worktreeId and sessionId');
         }
         return {
           id: request.id, ok: true,
           result: supervisor.evaluatePermission({
-            projectId, worktreeId,
+            projectId, worktreeId, sessionId,
             action: str(params.action),
             resources: Array.isArray(params.resources)
               ? params.resources.filter((r): r is string => typeof r === 'string') : [],

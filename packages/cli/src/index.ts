@@ -685,7 +685,8 @@ export async function main(
     }
     const paths = resolveXdgPaths(env);
     try {
-      const response = await callDaemon(paths, 'approve', { id, decision, by: 'user' });
+      // Approving can wait for a cold `opencode serve` start inside the supervisor.
+      const response = await callDaemon(paths, 'approve', { id, decision, by: 'user' }, 30000);
       if (!response.ok) {
         console.error(`approve failed: ${response.error.message}`);
         return 1;
