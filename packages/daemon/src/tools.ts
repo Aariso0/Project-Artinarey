@@ -337,7 +337,7 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
         .find((persona) => !peopleBefore.has(persona.id) && persona.role === newRole)?.id;
       try {
         rollbackFailedClaim(ctx.registry, identity, requestedId ?? createdId,
-          alreadyBound, stateBefore, originalWorktree);
+          alreadyBound, stateBefore, originalWorktree, Boolean(createdId));
       } catch (rollbackErr) {
         console.error(`claim rollback failed: ${(rollbackErr as Error).message ?? String(rollbackErr)}`);
       }

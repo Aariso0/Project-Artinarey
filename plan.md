@@ -1,7 +1,7 @@
 # Project-Artinarey: Plan
 
-> **Next action:** run **M0, the spike** (section 15, M0). About 2 hours. It checks the identity assumption against real tools.
-> **Status:** design settled, implementation unverified. Nothing is built. Plan date: 2026-11-23. All 15 design questions, the 3 open questions and the 14 unverified assumptions were resolved on 2026-11-23; several answers changed the design (section 17).
+> **Next action:** start **M4, leases and enforcement** (section 15, M4). M0–M3 are implemented and verified; no M4+ work is started here.
+> **Status:** design settled; M0–M3 built and verified, M4+ not started. Plan date: 2026-11-23. All 15 design questions, the 3 open questions and the 14 unverified assumptions were resolved on 2026-11-23; several answers changed the design (section 17).
 > **Estimates** are my guesses, not measurements. Treat them as ±50%.
 > **Evidence** for every checked assumption is in section 17. Where evidence contradicted the design, the decision log (section 2) records what replaced it.
 

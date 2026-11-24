@@ -403,18 +403,29 @@ export function rollbackFailedClaim(
   previousBinding: string | undefined,
   previousState: PersonaState,
   originalWorktree: { id: string; path: string } | undefined,
+  created: boolean,
 ): void {
-  if (!personaId || registry.bindings.forWorktree(identity.worktreeId)?.id !== personaId) return;
+  if (!personaId) return;
+  const boundHere = registry.bindings.forWorktree(identity.worktreeId)?.id === personaId;
   try {
-    writePersona(identity.storeDir, personaId, previousState);
+    if (boundHere) writePersona(identity.storeDir, personaId, previousState);
   } finally {
-    // Only undo resources this attempt acquired; keep a binding/lock that predated it.
-    if (previousBinding !== personaId) {
-      registry.bindings.release(personaId);
-      unlockGitWorktree(identity.markerDir);
-      if (originalWorktree && originalWorktree.id !== identity.worktreeId) {
-        registry.bindings.bind(personaId, originalWorktree.id);
-        lockGitWorktree(originalWorktree.path, registry.personas.get(personaId)?.role ?? personaId);
+    try {
+      // Only undo resources this attempt acquired; keep a binding/lock that predated it.
+      if (boundHere && previousBinding !== personaId) {
+        registry.bindings.release(personaId);
+        unlockGitWorktree(identity.markerDir);
+        if (originalWorktree && originalWorktree.id !== identity.worktreeId) {
+          registry.bindings.bind(personaId, originalWorktree.id);
+          lockGitWorktree(originalWorktree.path, registry.personas.get(personaId)?.role ?? personaId);
+        }
+      }
+    } finally {
+      // A persona created by this attempt must not survive as an ambiguous role,
+      // even when the claim failed before binding or another rollback step threw.
+      if (created) {
+        registry.personas.delete(personaId);
+        rmSync(personaDir(identity.storeDir, personaId), { recursive: true, force: true });
       }
     }
   }

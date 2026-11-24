@@ -1005,6 +1005,98 @@ test('mark_done completes when the original sender is unknown and validation sta
   if (!checked.ok) assert.match(checked.reason, /unknown recipient: ghost/);
 });
 
+test('a failed new-role claim leaves no orphan persona behind', async (t) => {
+  const s = setup();
+  const repo = join(s.root, 'repo');
+  const worktree = join(s.root, 'git-wt');
+  mkdirSync(repo, { recursive: true });
+  git(['init', '-q'], repo);
+  git(['-c', 'user.name=Tester', '-c', 'user.email=tester@example.com',
+    'commit', '--allow-empty', '-q', '-m', 'init'], repo);
+  git(['worktree', 'add', '-q', '-b', 'feature/orphan', worktree], repo);
+  const worktreeId = newId();
+  s.registry.worktrees.upsert({
+    id: worktreeId, projectId: s.project.id, path: worktree, branch: 'feature/orphan',
+  });
+  writeMarker(worktree, s.project.id, worktreeId);
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  const attached = await client.call('attach', { cwd: worktree, pid: process.pid });
+  assert.equal(attached.ok, true, JSON.stringify(attached));
+
+  const audit = join(s.project.storeDir, 'events', 'audit.jsonl');
+  const role = 'dev-orphan';
+  // Let createPersona's own audit succeed, then fail only the claim audit after
+  // binding/lock/persona state have been committed.
+  const originalBind = s.registry.bindings.bind;
+  let createdId: string | undefined;
+  s.registry.bindings.bind = ((...args: Parameters<typeof originalBind>) => {
+    createdId = args[0];
+    const bound = originalBind(...args);
+    rmSync(audit, { force: true });
+    mkdirSync(audit, { recursive: true });
+    return bound;
+  }) as typeof originalBind;
+  const failed = await client.call('claim_persona', { new_role: role, name: 'Orphan' });
+  s.registry.bindings.bind = originalBind;
+  assert.equal(failed.ok, false, JSON.stringify(failed));
+  assert.ok(createdId, 'the claim should have reached binding');
+  assert.equal(s.registry.personas.list(s.project.id).filter((persona) => persona.role === role).length, 0,
+    'a failed new-role claim must not leave a persona row');
+  assert.equal(existsSync(join(s.project.storeDir, 'personas', createdId)), false,
+    'a failed new-role claim must not leave a persona directory');
+
+  rmSync(audit, { recursive: true, force: true });
+  const retried = await client.call('claim_persona', { new_role: role, name: 'Orphan' });
+  assert.equal(retried.ok, true, JSON.stringify(retried));
+  assert.equal(s.registry.personas.list(s.project.id).filter((persona) => persona.role === role).length, 1,
+    'a retry must not see an ambiguous role');
+});
+
+test('a failed new-role claim before binding leaves no orphan persona behind', async (t) => {
+  const s = setup();
+  const repo = join(s.root, 'repo');
+  const worktree = join(s.root, 'git-wt');
+  mkdirSync(repo, { recursive: true });
+  git(['init', '-q'], repo);
+  git(['-c', 'user.name=Tester', '-c', 'user.email=tester@example.com',
+    'commit', '--allow-empty', '-q', '-m', 'init'], repo);
+  git(['worktree', 'add', '-q', '-b', 'feature/orphan-prebind', worktree], repo);
+  const worktreeId = newId();
+  s.registry.worktrees.upsert({
+    id: worktreeId, projectId: s.project.id, path: worktree, branch: 'feature/orphan-prebind',
+  });
+  writeMarker(worktree, s.project.id, worktreeId);
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  const attached = await client.call('attach', { cwd: worktree, pid: process.pid });
+  assert.equal(attached.ok, true, JSON.stringify(attached));
+
+  const role = 'dev-orphan-prebind';
+  const originalBind = s.registry.bindings.bind;
+  let createdId: string | undefined;
+  s.registry.bindings.bind = ((...args: Parameters<typeof originalBind>) => {
+    createdId = args[0];
+    throw new Error('bind failed');
+  }) as typeof originalBind;
+  const failed = await client.call('claim_persona', { new_role: role, name: 'Orphan' });
+  s.registry.bindings.bind = originalBind;
+  assert.equal(failed.ok, false, JSON.stringify(failed));
+  assert.ok(createdId, 'the claim should have reached binding');
+  assert.equal(s.registry.personas.list(s.project.id).some((persona) => persona.id === createdId), false,
+    'a pre-bind failure must not leave a persona row');
+  assert.equal(existsSync(join(s.project.storeDir, 'personas', createdId)), false,
+    'a pre-bind failure must not leave a persona directory');
+});
+
 test('a failed claim audit rolls back binding, persona state and worktree lock', async (t) => {
   const s = setup();
   const repo = join(s.root, 'repo');

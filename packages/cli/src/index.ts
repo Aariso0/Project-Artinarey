@@ -484,7 +484,7 @@ export async function main(
           return claimPersona(db, identity.storeDir, identity, claimOptions);
         } catch (err) {
           rollbackFailedClaim(
-            db, identity, personaId, previousBinding, previousState, originalWorktree,
+            db, identity, personaId, previousBinding, previousState, originalWorktree, false,
           );
           throw err;
         }
