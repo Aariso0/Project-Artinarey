@@ -15,7 +15,75 @@ concurrency:
   queue: max
 
 jobs:
+  verify:
+    name: Verify all other checks
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      RUN_URL: /actions/runs/${{ github.run_id }}/
+    steps:
+      - name: Require every other check on the release commit to pass
+        shell: bash
+        run: |
+          set -euo pipefail
+          passed=false
+          for attempt in $(seq 1 60); do
+            pending=0
+            failed=0
+            seen=0
+            while IFS=$'\t' read -r status conclusion name url; do
+              # Ignore checks from this release run so it cannot gate on itself.
+              case "$url" in
+                *"$RUN_URL"*) continue ;;
+              esac
+              seen=$((seen + 1))
+              case "$status" in
+                completed)
+                  case "$conclusion" in
+                    success|skipped|neutral) ;;
+                    *)
+                      failed=$((failed + 1))
+                      echo "Blocking check: $name ($conclusion)" >&2
+                      ;;
+                  esac
+                  ;;
+                *)
+                  pending=$((pending + 1))
+                  ;;
+              esac
+            done < <(
+              gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs?per_page=100" \
+                --paginate \
+                --jq '.check_runs[] | [.status, (.conclusion // "none"), .name, .details_url] | @tsv'
+            )
+            if [ "$failed" -gt 0 ]; then
+              echo "Other checks failed; refusing to publish ${SHA}." >&2
+              exit 1
+            fi
+            if [ "$seen" -gt 0 ] && [ "$pending" -eq 0 ]; then
+              passed=true
+              break
+            fi
+            echo "Waiting for ${pending} check(s) on ${SHA} (attempt ${attempt}/60)..."
+            sleep 15
+          done
+          if [ "$passed" != true ]; then
+            echo "Timed out waiting for other checks on ${SHA}." >&2
+            exit 1
+          fi
+          echo "All ${seen} other checks passed for ${SHA}."
+
   prepare:
+    needs: verify
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_branch == 'main' &&
@@ -132,7 +200,7 @@ jobs:
           mkdir -p release-assets
           find apps/gui/src-tauri/target/release/bundle -type f \
             \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) \
-            -exec cp {} release-assets/ +
+            -exec cp {} release-assets/ \;
       - name: Stage macOS bundles
         if: matrix.platform == 'macos'
         shell: bash
@@ -141,7 +209,7 @@ jobs:
           mkdir -p release-assets
           assets_dir="$PWD/release-assets"
           bundle_dir="apps/gui/src-tauri/target/release/bundle"
-          find "$bundle_dir" -type f -name '*.dmg' -exec cp {} release-assets/ +
+          find "$bundle_dir" -type f -name '*.dmg' -exec cp {} release-assets/ \;
           while IFS= read -r -d '' app; do
             name="$(basename "$app")"
             parent="$(dirname "$app")"
@@ -155,7 +223,7 @@ jobs:
           mkdir -p release-assets
           find apps/gui/src-tauri/target/release/bundle -type f \
             \( -name '*.msi' -o \( -path '*/nsis/*' -name '*.exe' \) \) \
-            -exec cp {} release-assets/ +
+            -exec cp {} release-assets/ \;
       - uses: actions/upload-artifact@v4
         with:
           name: bundles-${{ matrix.platform }}

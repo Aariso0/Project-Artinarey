@@ -21,7 +21,7 @@ The README should describe the shipped M7/M8 app and how to run it. CI should en
 
 ## Constraints
 
-- Keep the existing `CI` workflow as the required quality gate.
+- Keep the existing `CI` workflow as the required quality gate. Publishing also requires every other check on the release commit to be green, not just the `CI` workflow conclusion.
 - Never put secrets in code or workflow files; use the repository `GITHUB_TOKEN`.
 - Release workflow must check out the exact `workflow_run.head_sha`, not the moving `main` ref.
 - Tauri builds need system dependencies on Linux and native runners for macOS/Windows bundles.
@@ -41,12 +41,16 @@ The README should describe the shipped M7/M8 app and how to run it. CI should en
 - `.github/scripts/app-version.cjs`: read/validate versions, compare semantic versions, and expose CLI helpers.
 - `.github/scripts/app-version.test.cjs`: unit tests for valid/invalid versions, comparisons, and version agreement across manifests.
 - `.github/workflows/ci.yml`: add audit, whitespace check, version-script test, and manifest-version agreement check; keep existing gates.
-- `.github/workflows/release.yml`: `workflow_run` on successful `CI`; prepare job checks branch, version, and tag; matrix build jobs produce Tauri bundles; publish job creates `v<version>` GitHub Release with artifacts.
+- `.github/workflows/release.yml`: `workflow_run` on successful `CI`; a verify job waits for every other check on the commit to settle and refuses to publish on any failure; prepare job checks branch, version, and tag; matrix build jobs produce Tauri bundles; publish job creates `v<version>` GitHub Release with artifacts.
 - `README.md`: replace stale M0–M6/planned wording with current M0–M8 status, real quick-start commands, run/test gates, and release behaviour.
 
 ### Release decision
 
 `prepare` reads the root version, requires a clean `MAJOR.MINOR.PATCH`, checks that `apps/gui/package.json` and `apps/gui/src-tauri/Cargo.toml` agree, and uses the authenticated GitHub API to check for `refs/tags/v<version>`. If the tag exists, all downstream jobs skip. Otherwise, build matrix artifacts from the CI head SHA, stage only releasable files (zipping macOS `.app` directories), then publish with `gh release create v<version> --target <head-sha> --generate-notes`, attaching all bundle artifacts. The explicit target keeps the tag on the verified commit if `main` moves before publish.
+
+### Check gate
+
+`verify` runs before `prepare` and lists all check-runs for `github.event.workflow_run.head_sha`, excluding check-runs from the current release run so the workflow cannot gate on itself. It waits while any other check is queued or in progress, then fails on any conclusion other than `success`, `skipped`, or `neutral`. `prepare`, `bundles`, and `publish` are downstream of this gate, so no version work, build, or upload happens until every other check passes. A timeout stops a release whose checks never settle.
 
 ### Builder calls made here
 
