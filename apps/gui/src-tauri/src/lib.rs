@@ -32,13 +32,14 @@ static DAEMON_SPAWN: Mutex<()> = Mutex::new(());
 static DAEMON_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 /// Every method the webview can reach. The daemon re-checks the `gui.` prefix
 /// and its own method table; native code is the only place that adds a method.
-const ALLOWED_GUI_METHODS: [&str; 24] = [
+const ALLOWED_GUI_METHODS: [&str; 26] = [
     "gui.projects", "gui.personas", "gui.worktrees", "gui.mail",
     "gui.tasks", "gui.leases", "gui.sessions", "gui.preMerge", "gui.audit",
     "gui.approvals", "gui.approve", "gui.autoApprove", "gui.stopSession",
     "gui.createWorktree", "gui.adoptWorktree", "gui.setHomeWorktree", "gui.chat",
     "gui.storage", "gui.setStorage", "gui.movePreflight", "gui.moveStart",
     "gui.moveStatus", "gui.moveUndo", "gui.moveDeleteOld",
+    "gui.openProject", "gui.cloneProject",
 ];
 
 /// The only error shape crossing the native boundary: `{ code, message }`.

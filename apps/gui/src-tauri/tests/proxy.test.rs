@@ -171,6 +171,7 @@ fn only_the_deliberately_listed_gui_methods_are_accepted_locally() {
         "gui.createWorktree", "gui.adoptWorktree", "gui.setHomeWorktree", "gui.chat",
         "gui.storage", "gui.setStorage", "gui.movePreflight", "gui.moveStart",
         "gui.moveStatus", "gui.moveUndo", "gui.moveDeleteOld",
+        "gui.openProject", "gui.cloneProject",
     ] {
         assert!(validate_gui_method(method).is_ok(), "{method}");
     }
