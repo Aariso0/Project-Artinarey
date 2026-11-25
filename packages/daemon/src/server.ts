@@ -138,8 +138,10 @@ export async function handleSupervisorRequest(
         const id = str(params.id);
         const by = str(params.by);
         if (!id || !by) throw new Error('approve needs an id and an actor');
-        const decision = params.decision === 'rejected' ? 'rejected' : 'approved';
-        const result = await supervisor.approve(id, decision, by);
+        if (params.decision !== 'approved' && params.decision !== 'rejected') {
+          throw new Error('approve needs a decision of approved or rejected');
+        }
+        const result = await supervisor.approve(id, params.decision, by);
         return { id: request.id, ok: true, result };
       }
       case 'auto_approve': {
