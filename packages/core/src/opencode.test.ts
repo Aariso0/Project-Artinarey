@@ -1,9 +1,9 @@
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import os, { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   connectOpencodeAt, mergeOpencodeConfig, opencodeGlobalConfigPath, opencodeInstalled,
@@ -122,4 +122,25 @@ test('global config path ignores APPDATA and honours XDG and legacy HOME file', 
   const legacy = join(dir, '.opencode.json');
   writeFileSync(legacy, '{}');
   assert.equal(opencodeGlobalConfigPath({ HOME: dir }), legacy);
+});
+
+test('global config and detection fall back to USERPROFILE via os.homedir', (t) => {
+  const dir = scratch();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fakeHome = join(dir, 'home');
+  mkdirSync(fakeHome);
+  // Windows os.homedir() uses USERPROFILE when HOME is unset. Mock it so the
+  // Windows-specific path contract is exercised on every platform.
+  const homedir = mock.method(os, 'homedir', () => fakeHome);
+  t.after(() => homedir.mock.restore());
+
+  const env = { USERPROFILE: fakeHome, APPDATA: join(dir, 'appdata') };
+  assert.equal(
+    opencodeGlobalConfigPath(env),
+    join(fakeHome, '.config', 'opencode', 'opencode.json'),
+  );
+  assert.equal(opencodeInstalled(env), false);
+
+  mkdirSync(join(fakeHome, '.config', 'opencode'), { recursive: true });
+  assert.equal(opencodeInstalled(env), true);
 });

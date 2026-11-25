@@ -38,9 +38,10 @@ the server command points at the current bundle.
 ## Paths
 
 - Global config: `$XDG_CONFIG_HOME/opencode/opencode.json`, falling back to
-  `$HOME/.config/opencode/opencode.json` on every platform; OpenCode does not
-  read `%APPDATA%`. A legacy `$HOME/.opencode.json` is reused if it is the only
-  file present. Existing file modes are preserved; new configs use `0600`.
+  `$HOME/.config/opencode/opencode.json`, then the OS home directory (which
+  honours `USERPROFILE` on Windows), on every platform; OpenCode does not read
+  `%APPDATA%`. A legacy `~/.opencode.json` is reused if it is the only file
+  present. Existing file modes are preserved; new configs use `0600`.
 - Project config (existing command): `<cwd>/opencode.json`.
 - Marker: `<artinarey configDir>/opencode-autoconnect.json`.
 

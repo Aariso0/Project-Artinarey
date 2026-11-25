@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
+import os from 'node:os';
 import { delimiter, isAbsolute, join } from 'node:path';
 import { atomicWrite } from './store.ts';
 
@@ -58,9 +59,15 @@ function absolute(value: string | undefined): string | undefined {
   return value && isAbsolute(value) ? value : undefined;
 }
 
+// OpenCode resolves its config through xdg-basedir, which uses os.homedir()
+// when HOME is unset; on Windows that honours USERPROFILE.
+function homeDirectory(env: NodeJS.ProcessEnv): string | undefined {
+  return absolute(env.HOME) ?? absolute(os.homedir());
+}
+
 /** Where a released app should write the global OpenCode config. */
 export function opencodeGlobalConfigPath(env: NodeJS.ProcessEnv): string | undefined {
-  const home = absolute(env.HOME);
+  const home = homeDirectory(env);
   const preferred = absolute(env.XDG_CONFIG_HOME)
     ? join(env.XDG_CONFIG_HOME as string, 'opencode', 'opencode.json')
     : home ? join(home, '.config', 'opencode', 'opencode.json') : undefined;
@@ -92,7 +99,7 @@ function existsOnPath(env: NodeJS.ProcessEnv): boolean {
 /** OpenCode is installed if its binary is reachable or it has a config dir. */
 export function opencodeInstalled(env: NodeJS.ProcessEnv): boolean {
   if (existsOnPath(env)) return true;
-  const home = absolute(env.HOME);
+  const home = homeDirectory(env);
   const candidates = [
     absolute(env.XDG_CONFIG_HOME) && join(env.XDG_CONFIG_HOME as string, 'opencode'),
     home && join(home, '.config', 'opencode'),
