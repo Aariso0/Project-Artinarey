@@ -593,7 +593,7 @@ export async function handleGuiRequest(request: RpcRequest, ctx: RpcContext): Pr
           action: 'reply in the next session',
           body: message,
         }, {
-          knownPersonas: ['user', ...personas.map((persona) => persona.role)],
+          knownPersonas: ['user', 'senior-dev', ...personas.map((persona) => persona.role)],
           role: 'user',
         });
         buildIndex(join(ctx.paths.cacheRoot, project.id, 'index.sqlite'), project.storeDir);

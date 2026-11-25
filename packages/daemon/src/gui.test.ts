@@ -577,6 +577,28 @@ test('chat reaches a live vendor session and falls back to durable mail', async 
   assert.equal((queued.ok ? queued.result as { queued: boolean } : null)?.queued, true);
 });
 
+test('chat queues mail to senior-dev before any persona is registered', async (t) => {
+  const s = setup();
+  track(t, s);
+  const fresh = s.registry.projects.create({
+    name: 'Fresh', repoCommonDir: join(s.root, 'fresh', '.git'),
+    storeDir: join(s.paths.dataRoot, 'fresh'),
+  });
+  assert.equal(s.registry.personas.list(fresh.id).length, 0);
+
+  const reply = await handleGuiRequest({
+    id: '1', method: 'gui.chat',
+    params: { projectId: fresh.id, message: 'Hello before any session' },
+  }, ctx(s));
+  assert.equal(reply.ok, true, reply.ok ? '' : reply.error.message);
+  assert.equal((reply.ok ? reply.result as { queued: boolean } : null)?.queued, true);
+
+  const mail = await handleGuiRequest({
+    id: '2', method: 'gui.mail', params: { projectId: fresh.id },
+  }, ctx(s));
+  assert.equal((mail.ok ? mail.result as unknown[] : []).length, 1);
+});
+
 test('Move preflight is read-only; a crash mid-copy resumes and verifies', async (t) => {
   const s = setupAcceptance(t);
   const sourceFile = join(s.project.storeDir, 'project.json');
