@@ -104,12 +104,18 @@ export class ModelAdapterClient {
     });
     this.child = child;
     child.once('error', (err) => {
-      this.set({ state: 'offline', error: err.message });
+      this.set({ state: 'offline', error: err.message, pid: null });
     });
     child.once('exit', () => {
-      if (this.child === child) this.child = undefined;
+      // A crashed child cannot clean up its own socket; leave no stale pid or
+      // socket behind so callers get a typed offline error, not an OS error.
+      if (this.child !== child) return;
+      this.child = undefined;
+      if (existsSync(this.socketPath)) {
+        try { unlinkSync(this.socketPath); } catch { /* already removed */ }
+      }
       if (this.current.state !== 'not_configured') {
-        this.set({ state: 'offline', error: 'model adapter process exited' });
+        this.set({ state: 'offline', error: 'model adapter process exited', pid: null });
       }
     });
 
@@ -204,7 +210,7 @@ export class ModelAdapterClient {
           finish(new Error('model adapter sent malformed JSON'));
         }
       });
-      socket.on('error', (err) => finish(err));
+      socket.on('error', (err) => finish(Object.assign(err, { code: 'ADAPTER_OFFLINE' })));
       socket.on('close', () => finish(new Error('model adapter closed the connection')));
     });
   }

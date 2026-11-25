@@ -1,6 +1,6 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, mkdirSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, rmSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -258,6 +258,36 @@ test('a stopped adapter is a typed ADAPTER_OFFLINE error, not an empty result', 
   });
   assert.equal((await client.start()).state, 'ready');
   await client.stop();
+  const error = await errorFrom(client.prompt({ prompt: 'hello' }));
+  assert.equal(error.code, 'ADAPTER_OFFLINE');
+});
+
+test('a crashed adapter clears its socket and pid and returns typed ADAPTER_OFFLINE', async (t) => {
+  const api = await fakeApi();
+  t.after(() => closeApi(api));
+  const s = fixture(t);
+  const socketPath = join(s.paths.configDir, 'model-adapter.sock');
+  const client = new ModelAdapterClient({
+    socketPath,
+    env: { ...LOCAL_ENV, ARTINAREY_MODEL_BASE_URL: `http://127.0.0.1:${api.port}/v1` },
+    readyTimeoutMs: 8_000,
+  });
+  t.after(() => client.stop());
+  const started = await client.start();
+  assert.equal(started.state, 'ready');
+  assert.ok(started.pid);
+
+  // Crash the child as kill -9 would; stop() is deliberately not used here.
+  process.kill(started.pid!, 'SIGKILL');
+  const deadline = Date.now() + 2_000;
+  while (client.status().state !== 'offline' && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const status = client.status();
+  assert.equal(status.state, 'offline');
+  assert.equal(status.pid, null);
+  assert.equal(existsSync(socketPath), false);
+
   const error = await errorFrom(client.prompt({ prompt: 'hello' }));
   assert.equal(error.code, 'ADAPTER_OFFLINE');
 });
