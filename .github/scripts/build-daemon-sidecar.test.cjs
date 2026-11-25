@@ -24,6 +24,7 @@ test('sidecar bundle has a runnable node, daemon entry and loadable SQLite addon
 
   const manifest = JSON.parse(fs.readFileSync(path.join(out, 'manifest.json'), 'utf8'));
   assert.equal(manifest.entry, 'daemon.mjs');
+  assert.equal(manifest.shimEntry, 'shim.mjs');
   assert.equal(manifest.platform, process.platform);
   assert.equal(manifest.arch, process.arch);
   assert.equal(manifest.addon, prebuildName());
@@ -31,6 +32,9 @@ test('sidecar bundle has a runnable node, daemon entry and loadable SQLite addon
   const script = fs.readFileSync(path.join(out, manifest.entry), 'utf8');
   assert.ok(script.includes('artinarey daemon ready'));
   assert.ok(!script.includes("from './index.ts'"), 'TypeScript imports must be bundled away');
+
+  const shim = fs.readFileSync(path.join(out, manifest.shimEntry), 'utf8');
+  assert.ok(shim.includes('serveStdio'), 'the MCP shim must ship with the release');
 
   const node = path.join(out, manifest.nodeBinary);
   assert.ok(fs.existsSync(node));

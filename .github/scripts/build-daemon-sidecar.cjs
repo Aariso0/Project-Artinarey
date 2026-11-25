@@ -7,6 +7,7 @@ const path = require('node:path');
 const root = path.resolve(__dirname, '..', '..');
 const defaultOut = path.join(root, 'apps', 'gui', 'src-tauri', 'resources', 'daemon');
 const entry = path.join(root, 'packages', 'daemon', 'src', 'sidecar.ts');
+const shimEntry = path.join(root, 'packages', 'shim', 'src', 'index.ts');
 
 function parseArgs(argv) {
   let out = defaultOut;
@@ -55,6 +56,7 @@ function findInstalledPackage(name) {
 
 function build(out = defaultOut) {
   if (!fs.existsSync(entry)) throw new Error(`missing sidecar entry: ${entry}`);
+  if (!fs.existsSync(shimEntry)) throw new Error(`missing shim entry: ${shimEntry}`);
   const sqlite = findInstalledPackage('better-sqlite3');
   const addon = prebuildName();
   if (!fs.existsSync(path.join(sqlite, 'prebuilds', addon))) {
@@ -76,6 +78,19 @@ function build(out = defaultOut) {
     logLevel: 'warning',
   });
 
+  // The release app starts the MCP shim with the bundled Node runtime, so the
+  // first-run OpenCode config can point at a file that ships inside the bundle.
+  buildSync({
+    entryPoints: [shimEntry],
+    bundle: true,
+    platform: 'node',
+    format: 'esm',
+    target: 'node22',
+    outfile: path.join(out, 'shim.mjs'),
+    external: ['better-sqlite3'],
+    logLevel: 'warning',
+  });
+
   fs.copyFileSync(path.join(sqlite, 'package.json'), path.join(sqliteOut, 'package.json'));
   fs.cpSync(path.join(sqlite, 'lib'), path.join(sqliteOut, 'lib'), { recursive: true });
   fs.copyFileSync(path.join(sqlite, 'prebuilds', addon), path.join(sqliteOut, 'prebuilds', addon));
@@ -92,6 +107,7 @@ function build(out = defaultOut) {
     arch: process.arch,
     addon,
     entry: 'daemon.mjs',
+    shimEntry: 'shim.mjs',
     nodeBinary,
   }, null, 2)}\n`);
 
