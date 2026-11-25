@@ -3,12 +3,13 @@ import { AnimatePresence, motion } from 'motion/react';
 import { Bell, ChatCircle, Gear, SquaresFour } from '@phosphor-icons/react';
 import type {
   GuiApproval, GuiAudit, GuiChatReply, GuiLease, GuiMail, GuiMoveStatus, GuiPersona,
-  GuiPreMerge, GuiProject, GuiSession, GuiStorage, GuiTask, GuiWorktree,
+  GuiPreMerge, GuiProject, GuiProjectSetup, GuiSession, GuiStorage, GuiTask, GuiWorktree,
 } from './api.ts';
 import { type DaemonError, type GuiApi, type MailQuery } from './api.ts';
 import {
   AdoptDialog, ApprovalsView, AuditView, BlockerModal, ChatView, Logo, NewWorktreeDialog,
-  PersonaView, PreMergeView, ProjectView, SessionsView, StorageView, TasksView, WorktreeView,
+  PersonaView, PreMergeView, ProjectSetupDialog, ProjectView, SessionsView, StorageView,
+  TasksView, WorktreeView,
 } from './components.tsx';
 import { Button, ErrorBanner, Select, Skeleton, TabBar, type TabItem } from './ui.tsx';
 import { useMotionTransition } from './motion.ts';
@@ -190,6 +191,7 @@ export function AppView({
   const [chatBusy, setChatBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [target, setTarget] = useState('');
+  const [setup, setSetup] = useState(false);
   const [newWorktree, setNewWorktree] = useState(false);
   const [adopt, setAdopt] = useState(false);
   const [blocker, setBlocker] = useState<Blocker | null>(null);
@@ -231,6 +233,20 @@ export function AppView({
       const found = parseBlocker(typed);
       if (found) setBlocker(found);
       else onActionError(typed);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addProject(action: () => Promise<GuiProjectSetup>) {
+    setBusy(true);
+    try {
+      const result = await action();
+      setNotice(`Project ${result.name} added.`);
+      onChooseProject(result.projectId);
+      onRefresh();
+    } catch (err) {
+      onActionError(typedError(err));
     } finally {
       setBusy(false);
     }
@@ -345,6 +361,7 @@ export function AppView({
             </p>
           </div>
           <div className="header-actions">
+            <Button onClick={() => setSetup(true)}>Add project</Button>
             <Button onClick={() => setNewWorktree(true)} disabled={!projectId}>New worktree</Button>
             <Button onClick={() => setAdopt(true)} disabled={!projectId}>Adopt</Button>
           </div>
@@ -432,6 +449,12 @@ export function AppView({
         )}
       </main>
 
+      <ProjectSetupDialog
+        open={setup}
+        onOpenChange={setSetup}
+        onOpenProject={(path) => void addProject(() => api.openProject(path))}
+        onCloneProject={(url, target) => void addProject(() => api.cloneProject(url, target))}
+      />
       <NewWorktreeDialog
         open={newWorktree}
         onOpenChange={setNewWorktree}

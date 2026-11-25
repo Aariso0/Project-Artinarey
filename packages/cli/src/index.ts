@@ -1,15 +1,16 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { basename, dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   adoptWorktree, atomicWrite, branchChangedFiles, buildIndex, changedFiles, claimPersona,
-  createWorktree, ensureExcludeBlock, findMarker, globalIgnoreCoverage, installHooks,
-  listGitWorktrees, loadConfig, newId, openRegistry, planWorktree, projectStore, readPersona, readTasks,
+  createWorktree, findMarker,
+  listGitWorktrees, loadConfig, openRegistry, planWorktree, readPersona, readTasks,
   reconcileWorktrees, rehomePersona, releasePersona, removeWorktree, resolveIdentity, resolveRepo,
-  resolveXdgPaths, roster, rollbackFailedClaim, saveConfig, uncoveredFiles, writeMarker,
+  resolveXdgPaths, roster, rollbackFailedClaim, saveConfig, uncoveredFiles,
+  cloneProjectInto, registerProjectAt,
 } from '@artinarey/core';
 import { callDaemon, daemonStatus, startDaemon, stopDaemon } from '@artinarey/daemon';
 
@@ -145,50 +146,48 @@ export async function main(
 
   if (command === 'init') {
     try {
-      const { root, commonDir } = resolveRepo(cwd);
-      ensureExcludeBlock(commonDir);
-      const hooks = installHooks(root, commonDir);
-      console.log(`hooks: ${hooks.note}`);
-      const coverage = globalIgnoreCoverage(root);
-      const paths = resolveXdgPaths(env);
-      const registry = openRegistry(paths.registryFile);
-      try {
-        let project = registry.projects.list().find((p) => p.repoCommonDir === commonDir);
-        if (!project) {
-          project = registry.projects.create({
-            name: basename(root),
-            repoCommonDir: commonDir,
-            storeDir: projectStore(
-              loadConfig(join(paths.configDir, 'config.json')).dataRoot || paths.dataRoot,
-              newId(),
-            ),
-          });
-          mkdirSync(project.storeDir, { recursive: true });
-        }
-
-        const marker = findMarker(root);
-        const registered = registry.worktrees.list(project.id);
-        const fromMarker = marker?.dir === root && marker.marker.project_id === project.id
-          ? registered.find((wt) => wt.id === marker.marker.worktree_id && wt.path === root)
-          : undefined;
-        const worktree = fromMarker ?? registered.find((wt) => wt.path === root);
-        const worktreeId = worktree?.id ?? newId();
-        const branch = listGitWorktrees(root).find((wt) => wt.path === root)?.branch ?? null;
-        registry.worktrees.upsert({ id: worktreeId, projectId: project.id, path: root, branch });
-        writeMarker(root, project.id, worktreeId);
-
-        const detail = coverage.globalFile === null
-          ? 'no global excludes file'
-          : coverage.coversWorktrees
-            ? `covers .worktrees/ via ${coverage.globalFile}`
-            : `does not cover .worktrees/ (${coverage.globalFile})`;
-        console.log(`global ignore: ${detail}`);
-        return 0;
-      } finally {
-        registry.close();
-      }
+      const result = registerProjectAt(cwd, env);
+      console.log(`hooks: ${result.hooksNote}`);
+      console.log(`global ignore: ${result.globalIgnore}`);
+      return 0;
     } catch (err) {
       console.error(`init failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
+  if (command === 'project' && args[0] === 'open') {
+    const path = args[1];
+    if (!path) {
+      console.error('usage: artinarey project open <path>');
+      return 2;
+    }
+    try {
+      const result = registerProjectAt(path, env);
+      console.log(`project ${result.name}: ${result.path}`);
+      console.log(`hooks: ${result.hooksNote}`);
+      console.log(`global ignore: ${result.globalIgnore}`);
+      return 0;
+    } catch (err) {
+      console.error(`project open failed: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
+  if (command === 'project' && args[0] === 'clone') {
+    const [url, target] = args.slice(1);
+    if (!url || !target) {
+      console.error('usage: artinarey project clone <url> <folder>');
+      return 2;
+    }
+    try {
+      const result = cloneProjectInto(url, target, env, cwd);
+      console.log(`project ${result.name}: ${result.path}`);
+      console.log(`hooks: ${result.hooksNote}`);
+      console.log(`global ignore: ${result.globalIgnore}`);
+      return 0;
+    } catch (err) {
+      console.error(`project clone failed: ${(err as Error).message}`);
       return 1;
     }
   }

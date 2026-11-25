@@ -8,7 +8,7 @@ import type {
   GuiProject, GuiSession, GuiStorage, GuiTask, GuiWorktree,
 } from './api.ts';
 import {
-  Button, Chip, EmptyState, IconButton, Modal, TextField, Toggle,
+  Button, Chip, EmptyState, IconButton, Modal, Select, TextField, Toggle,
 } from './ui.tsx';
 
 export function Logo() {
@@ -508,6 +508,91 @@ export function AdoptDialog({ open, onOpenChange, onAdopt }: {
         onChange={setPath}
         placeholder="/absolute/path/to/worktree"
       />
+    </Modal>
+  );
+}
+
+type ProjectSetupMode = 'open' | 'clone';
+
+export function ProjectSetupDialog({ open, onOpenChange, onOpenProject, onCloneProject }: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onOpenProject: (path: string) => void;
+  onCloneProject: (url: string, target: string) => void;
+}) {
+  const [mode, setMode] = useState<ProjectSetupMode>('open');
+  const [path, setPath] = useState('');
+  const [url, setUrl] = useState('');
+  const [target, setTarget] = useState('');
+
+  function close() {
+    setPath('');
+    setUrl('');
+    setTarget('');
+    onOpenChange(false);
+  }
+
+  const valid = mode === 'open'
+    ? Boolean(path.trim())
+    : Boolean(url.trim() && target.trim());
+
+  return (
+    <Modal
+      open={open}
+      onOpenChange={(next) => { if (next) onOpenChange(true); else close(); }}
+      title="Add project"
+      description="Open a repository you already have, or clone one into a new folder."
+      footer={<>
+        <Button onClick={close}>Cancel</Button>
+        <Button
+          variant="primary"
+          disabled={!valid}
+          onClick={() => {
+            if (mode === 'open') onOpenProject(path.trim());
+            else onCloneProject(url.trim(), target.trim());
+            close();
+          }}
+        >{mode === 'open' ? 'Open project' : 'Clone project'}</Button>
+      </>}
+    >
+      <Select
+        id="project-setup-mode"
+        label="How would you like to add it?"
+        value={mode}
+        options={[
+          { value: 'open', label: 'Open an existing repository' },
+          { value: 'clone', label: 'Clone into a new folder' },
+        ]}
+        onChange={(value) => setMode(value as ProjectSetupMode)}
+      />
+      {mode === 'open' ? (
+        <TextField
+          id="project-setup-path"
+          label="Repository path"
+          value={path}
+          onChange={setPath}
+          placeholder="/absolute/path/to/repository"
+          hint="The repository's main worktree is registered."
+        />
+      ) : (
+        <>
+          <TextField
+            id="project-setup-url"
+            label="Repository URL"
+            value={url}
+            onChange={setUrl}
+            placeholder="https://example.com/team/repo.git"
+          />
+          <TextField
+            id="project-setup-target"
+            label="New folder"
+            value={target}
+            onChange={setTarget}
+            placeholder="/absolute/path/to/new-folder"
+            hint="The folder must be empty or not exist yet."
+          />
+        </>
+      )}
     </Modal>
   );
 }

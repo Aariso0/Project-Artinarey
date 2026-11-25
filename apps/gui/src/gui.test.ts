@@ -110,7 +110,7 @@ test('the full window renders real state, controls and the four workspace tabs',
     assert.ok(html.includes(value), `${value} is visible`);
   }
   for (const label of ['Overview', 'Chat', 'Approvals', 'Storage',
-    'Tasks &amp; leases', 'Sessions', 'Pre-merge', 'Audit', 'New worktree', 'Adopt']) {
+    'Tasks &amp; leases', 'Sessions', 'Pre-merge', 'Audit', 'Add project', 'New worktree', 'Adopt']) {
     assert.ok(html.includes(label), `${label} is present`);
   }
   assert.equal(html.match(/role="tab"/g)?.length, 4);
@@ -235,6 +235,8 @@ test('createApi invokes only the daemon_call command for every feature', async (
   await api.approve('approval-1', 'approved', 'user');
   await api.autoApprove('worktree-1', true);
   await api.stopSession('session-1');
+  await api.openProject('/tmp/existing');
+  await api.cloneProject('https://example.com/repo.git', '/tmp/fresh');
   await api.createWorktree('project-1', 'artinarey/dev2');
   await api.adoptWorktree('project-1', '/tmp/wt');
   await api.setHomeWorktree('project-1', 'agent-1', 'worktree-1');
@@ -247,8 +249,16 @@ test('createApi invokes only the daemon_call command for every feature', async (
   await api.moveUndo('project-1');
   await api.moveDeleteOld('project-1');
 
-  assert.equal(calls.length, 24);
+  assert.equal(calls.length, 26);
   assert.deepEqual([...new Set(calls.map((call) => call.command))], ['daemon_call']);
+  assert.deepEqual(calls[13], {
+    command: 'daemon_call', args: { method: 'gui.openProject', params: { path: '/tmp/existing' } },
+  });
+  assert.deepEqual(calls[14], {
+    command: 'daemon_call', args: {
+      method: 'gui.cloneProject', params: { url: 'https://example.com/repo.git', target: '/tmp/fresh' },
+    },
+  });
   assert.deepEqual(calls.slice(0, 4), [
     { command: 'daemon_call', args: { method: 'gui.projects', params: {} } },
     { command: 'daemon_call', args: { method: 'gui.personas', params: { projectId: 'project-1' } } },
@@ -258,7 +268,7 @@ test('createApi invokes only the daemon_call command for every feature', async (
   assert.deepEqual(calls[10], {
     command: 'daemon_call', args: { method: 'gui.approve', params: { id: 'approval-1', decision: 'approved', by: 'user' } },
   });
-  assert.deepEqual(calls[17], {
+  assert.deepEqual(calls[19], {
     command: 'daemon_call', args: { method: 'gui.storage', params: {} },
   });
 });
@@ -386,10 +396,10 @@ test('frontend sources keep the webview free of credentials, ports and HTTP', ()
   const apiSource = readFileSync(join(here, 'api.ts'), 'utf8');
   const methods = [...new Set([...apiSource.matchAll(/get(?:<[^>]*>)?\('([^']+)'/g)].map((match) => match[1]))].sort();
   assert.deepEqual(methods, [
-    'approvals', 'approve', 'audit', 'autoApprove', 'chat', 'createWorktree', 'adoptWorktree',
-    'leases', 'mail', 'moveDeleteOld', 'movePreflight', 'moveStart', 'moveStatus', 'moveUndo',
-    'personas', 'preMerge', 'projects', 'sessions', 'setHomeWorktree', 'setStorage',
-    'stopSession', 'storage', 'tasks', 'worktrees',
+    'approvals', 'approve', 'audit', 'autoApprove', 'chat', 'cloneProject', 'createWorktree',
+    'adoptWorktree', 'leases', 'mail', 'moveDeleteOld', 'movePreflight', 'moveStart', 'moveStatus',
+    'moveUndo', 'openProject', 'personas', 'preMerge', 'projects', 'sessions', 'setHomeWorktree',
+    'setStorage', 'stopSession', 'storage', 'tasks', 'worktrees',
   ].sort());
   assert.doesNotMatch(apiSource, /\b(token|port|fetch|localStorage|http|rpc|apiKey|api_key)\b/i);
 

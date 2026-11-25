@@ -158,6 +158,56 @@ function assertReadOnlyResponse(response: RpcResponse): void {
   assert.doesNotMatch(JSON.stringify(rows), /private body/i);
 }
 
+function gitIn(cwd: string, ...args: string[]): void {
+  execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' });
+}
+
+test('gui.openProject and gui.cloneProject register both setup paths', async (t) => {
+  const s = setup();
+  track(t, s);
+  const source = join(s.root, 'source');
+  mkdirSync(source);
+  gitIn(source, 'init', '-q', '-b', 'main');
+  gitIn(source, 'config', 'user.email', 'test@example.com');
+  gitIn(source, 'config', 'user.name', 'Test');
+  writeFileSync(join(source, 'README.md'), 'hello\n');
+  gitIn(source, 'add', 'README.md');
+  gitIn(source, 'commit', '-q', '-m', 'initial');
+
+  const opened = await handleGuiRequest({
+    id: '1', method: 'gui.openProject', params: { path: source },
+  }, ctx(s));
+  assertReadOnlyResponse(opened);
+  const first = opened.ok ? opened.result as { projectId: string; path: string; name: string } : null;
+  assert.ok(first);
+  assert.equal(first.path, source);
+  assert.equal(first.name, 'source');
+  assert.ok(s.registry.worktrees.list(first.projectId).some((row) => row.path === source));
+
+  const target = join(s.root, 'fresh', 'copy');
+  const cloned = await handleGuiRequest({
+    id: '2', method: 'gui.cloneProject', params: { url: source, target },
+  }, ctx(s));
+  assertReadOnlyResponse(cloned);
+  const second = cloned.ok ? cloned.result as { projectId: string; path: string } : null;
+  assert.ok(second);
+  assert.equal(second.path, target);
+  assert.ok(s.registry.worktrees.list(second.projectId).some((row) => row.path === target));
+
+  const projects = s.registry.projects.list();
+  assert.equal(projects.length, 3, 'the seeded project plus both setup paths');
+});
+
+test('project setup methods reject missing input with a typed error', async (t) => {
+  const s = setup();
+  track(t, s);
+  for (const method of ['gui.openProject', 'gui.cloneProject']) {
+    const reply = await handleGuiRequest({ id: '1', method, params: {} }, ctx(s));
+    assert.equal(reply.ok, false);
+    if (!reply.ok) assert.equal(reply.error.code, 'INVALID_INPUT');
+  }
+});
+
 test('gui.projects marks a missing store offline and rejects non-gui methods', async (t) => {
   const s = setup();
   track(t, s);

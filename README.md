@@ -109,7 +109,7 @@ Artinarey is the office that fixes that. Each agent gets a private desk, an inte
                    the only outbound caller
 ```
 
-1. **Open a project.** Artinarey reads `git worktree list`, so worktrees made by other tools show up too.
+1. **Add a project.** In the window use **Add project** to open an existing repository or clone one into a new folder. From the CLI use `artinarey project open <path>` or `artinarey project clone <url> <folder>` (`init` still registers the current directory). Worktrees stay under `.worktrees/`. Artinarey reads `git worktree list`, so worktrees made by other tools show up too.
 2. **Start a persona.** Pick a worktree. If that persona last worked somewhere else, you get a warning first.
 3. **The agent connects over MCP.** The folder it runs in tells Artinarey who it is.
 4. **Work gets assigned.** The senior dev splits a task, or you assign it directly. Overlapping scopes are rejected by code, and an idle persona on the same branch gets priority over a new session.
@@ -225,12 +225,19 @@ Install dependencies from the Artinarey repository root:
 pnpm install
 ```
 
-Register your own project from that project's directory, using the absolute path to the CLI:
+Register your own project, using the absolute path to the CLI. Either open a repository you already have:
 
 ```bash
-cd /path/to/your-project
-node /path/to/Project-Artinarey/packages/cli/bin/artinarey init
+node /path/to/Project-Artinarey/packages/cli/bin/artinarey project open /path/to/your-project
 ```
+
+or clone one into a new folder:
+
+```bash
+node /path/to/Project-Artinarey/packages/cli/bin/artinarey project clone https://example.com/team/repo.git /path/to/new-folder
+```
+
+`init` is still available from inside a repository and does the same registration as `project open .`. The compiled window offers both paths under **Add project**.
 
 Start the daemon in its own terminal (it runs in the foreground and does not return):
 

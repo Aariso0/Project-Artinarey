@@ -5,7 +5,8 @@ import {
   listGitWorktrees, loadConfig, newId, queryMail, readApprovals, readSessions, readTasks,
   rehomePersona, resolveRepo, saveConfig, sendMail, sessionLogFile, setAutoApprove,
   adoptWorktree as coreAdoptWorktree, createWorktree as coreCreateWorktree, planWorktree,
-  uncoveredFiles, type Project, type SessionSummary,
+  cloneProjectInto, registerProjectAt, uncoveredFiles, type Project, type SessionSummary,
+  type XdgPaths,
 } from '@artinarey/core';
 import {
   deleteOldStore, preflightMove, readMove, startMove, undoMove,
@@ -331,6 +332,17 @@ function preMergeRows(ctx: RpcContext, project: Project): GuiPreMerge[] {
   });
 }
 
+/** Rebuild the XDG environment from the daemon's resolved paths so project setup
+ * registers into the same registry the window is reading. */
+function setupEnv(paths: XdgPaths): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    XDG_CONFIG_HOME: dirname(paths.configDir),
+    XDG_CACHE_HOME: dirname(paths.cacheRoot),
+    XDG_RUNTIME_DIR: dirname(dirname(paths.socketPath)),
+  };
+}
+
 /**
  * The GUI surface is a different door from agent tools: every method starts
  * with `gui.`, and the HTTP proxy checks auth, Host, Origin and body size first.
@@ -504,6 +516,19 @@ export async function handleGuiRequest(request: RpcRequest, ctx: RpcContext): Pr
         const id = str(params.id);
         if (!id) throw new ArtinareyError('INVALID_INPUT', 'stopSession needs an id');
         return ok(request.id, { stopped: await ctx.supervisor.stopSession(id) });
+      }
+      case 'gui.openProject': {
+        const path = str(params.path);
+        if (!path) throw new ArtinareyError('INVALID_INPUT', 'openProject needs a path');
+        return ok(request.id, registerProjectAt(path, setupEnv(ctx.paths)));
+      }
+      case 'gui.cloneProject': {
+        const url = str(params.url);
+        const target = str(params.target);
+        if (!url || !target) {
+          throw new ArtinareyError('INVALID_INPUT', 'cloneProject needs a URL and a target folder');
+        }
+        return ok(request.id, cloneProjectInto(url, target, setupEnv(ctx.paths)));
       }
       case 'gui.createWorktree': {
         const project = knownProject(ctx, params.projectId);

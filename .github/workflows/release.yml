@@ -206,6 +206,8 @@ jobs:
           cargo --version
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build:gui
+      - name: Bundle the daemon sidecar
+        run: node .github/scripts/build-daemon-sidecar.cjs
       - name: Build Linux bundles
         if: matrix.platform == 'linux'
         working-directory: apps/gui

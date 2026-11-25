@@ -5,6 +5,15 @@ export type {
   GuiMail, GuiPersona, GuiProject, GuiWorktree,
 } from '../../../packages/daemon/src/gui.ts';
 
+export type GuiProjectSetup = {
+  projectId: string;
+  worktreeId: string;
+  path: string;
+  name: string;
+  hooksNote: string;
+  globalIgnore: string;
+};
+
 export type DaemonError = { code: string; message: string };
 
 type Envelope<T> = { ok: true; result: T } | { ok: false; error: DaemonError };
@@ -76,6 +85,8 @@ export type GuiApi = {
   approve(id: string, decision: 'approved' | 'rejected', by: string): Promise<{ id: string; status: string }>;
   autoApprove(worktreeId: string, enabled: boolean): Promise<{ worktreeId: string; enabled: boolean }>;
   stopSession(id: string): Promise<{ stopped: boolean }>;
+  openProject(path: string): Promise<GuiProjectSetup>;
+  cloneProject(url: string, target: string): Promise<GuiProjectSetup>;
   createWorktree(projectId: string, branch: string, path?: string): Promise<{ id: string; path: string }>;
   adoptWorktree(projectId: string, path: string): Promise<{ id: string; path: string }>;
   setHomeWorktree(projectId: string, personaId: string, worktreeId: string): Promise<{ ok: true }>;
@@ -168,6 +179,8 @@ export function createApi(invokeFn: InvokeFn): GuiApi {
     approve: (id, decision, by) => get('approve', { id, decision, by }),
     autoApprove: (worktreeId, enabled) => get('autoApprove', { worktreeId, enabled }),
     stopSession: (id) => get('stopSession', { id }),
+    openProject: (path) => get<GuiProjectSetup>('openProject', { path }),
+    cloneProject: (url, target) => get<GuiProjectSetup>('cloneProject', { url, target }),
     createWorktree: (projectId, branch, path) =>
       get('createWorktree', { projectId, branch, ...(path ? { path } : {}) }),
     adoptWorktree: (projectId, path) => get('adoptWorktree', { projectId, path }),

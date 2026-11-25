@@ -18,9 +18,22 @@ cd apps/gui
 pnpm exec tauri info
 ```
 
+## Add a project
+
+Both the CLI and the window offer the same two setup paths. Opening registers the repository you already have, including its main worktree; cloning creates a new folder first and then registers it. Both are idempotent for an already registered repository, install the hooks and report the `.worktrees/` global-exclude state.
+
+```bash
+node packages/cli/bin/artinarey project open /absolute/path/to/repo
+node packages/cli/bin/artinarey project clone <url> /absolute/path/to/new-folder
+```
+
+In the window, use **Add project** in the header and choose *Open an existing repository* or *Clone into a new folder*. The new project becomes the selected scope after setup.
+
 ## Start the daemon
 
-The window reads daemon snapshots over loopback. Start the daemon first, from the repository root:
+Compiled releases bundle the daemon and start it on demand: the native shell spawns the sidecar when no daemon answers on loopback, waits for the token and port files, and reuses an already-running daemon instead of starting a second one. Development builds have no bundled sidecar, so start the daemon manually.
+
+The window reads daemon snapshots over loopback. For development, start the daemon first, from the repository root:
 
 ```bash
 pnpm install
@@ -67,9 +80,12 @@ From the repository root:
 
 ```bash
 pnpm run build:gui
+node .github/scripts/build-daemon-sidecar.cjs
 cd apps/gui
 pnpm exec tauri build
 ```
+
+The sidecar step bundles the Node runtime, the compiled daemon entry and the matching `better-sqlite3` prebuild into `apps/gui/src-tauri/resources/daemon`. That directory is generated and ignored by git; it is a Tauri resource in every bundle format. Without it the window falls back to a daemon started from the CLI.
 
 The release binary is:
 

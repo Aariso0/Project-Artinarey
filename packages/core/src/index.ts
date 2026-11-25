@@ -13,3 +13,4 @@ export * from './worktree.ts';
 export * from './lease.ts';
 export * from './hooks.ts';
 export * from './session.ts';
+export * from './project-setup.ts';

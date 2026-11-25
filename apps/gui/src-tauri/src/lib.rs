@@ -7,13 +7,29 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
+use tauri::{path::BaseDirectory, Manager};
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const HEADER_BUDGET: usize = 16 * 1024;
 const IO_TIMEOUT_SECS: u64 = 5;
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The bundled Node runtime and compiled daemon entry inside the app resources.
+/// Absent in development builds, where the daemon is started from the CLI.
+struct DaemonBundle {
+    node: PathBuf,
+    entry: PathBuf,
+}
+
+static DAEMON_BUNDLE: OnceLock<DaemonBundle> = OnceLock::new();
+static DAEMON_SPAWN: Mutex<()> = Mutex::new(());
+static DAEMON_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 /// Every method the webview can reach. The daemon re-checks the `gui.` prefix
 /// and its own method table; native code is the only place that adds a method.
 const ALLOWED_GUI_METHODS: [&str; 24] = [
@@ -301,6 +317,71 @@ pub fn read_port(dir: &Path) -> Result<u16, GuiError> {
         .ok_or_else(|| GuiError::new("DAEMON_UNREACHABLE", "daemon port is invalid"))
 }
 
+fn node_binary_name() -> &'static str {
+    if cfg!(windows) { "node.exe" } else { "node" }
+}
+
+/// Paths inside the directory declared by `bundle.resources`.
+pub fn bundled_daemon_paths(bundle_dir: &Path) -> (PathBuf, PathBuf) {
+    (bundle_dir.join(node_binary_name()), bundle_dir.join("daemon.mjs"))
+}
+
+/// A port file alone is not enough: a stale daemon.json must not suppress a
+/// fresh sidecar spawn.
+pub fn daemon_reachable(dir: &Path) -> bool {
+    let Ok(port) = read_port(dir) else {
+        return false;
+    };
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
+}
+
+/// Starts the bundled daemon only when one is not already listening. The lock
+/// keeps two webview calls from racing into two daemons on the same port.
+pub fn ensure_daemon_started() -> Result<(), GuiError> {
+    let Some(bundle) = DAEMON_BUNDLE.get() else {
+        return Ok(());
+    };
+    if !bundle.node.is_file() || !bundle.entry.is_file() {
+        return Ok(());
+    }
+    let dir = config_dir_from(&process_env())?;
+    if daemon_reachable(&dir) {
+        return Ok(());
+    }
+    let _guard = DAEMON_SPAWN
+        .lock()
+        .map_err(|_| GuiError::new("INTERNAL_ERROR", "daemon spawn lock is poisoned"))?;
+    if daemon_reachable(&dir) {
+        return Ok(());
+    }
+
+    let child = Command::new(&bundle.node)
+        .arg(&bundle.entry)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            GuiError::new("DAEMON_UNREACHABLE", format!("daemon sidecar failed to start: {error}"))
+        })?;
+    if let Ok(mut slot) = DAEMON_CHILD.lock() {
+        *slot = Some(child);
+    }
+
+    let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+    while Instant::now() < deadline {
+        if daemon_reachable(&dir) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(GuiError::new(
+        "DAEMON_UNREACHABLE",
+        "daemon sidecar did not become ready within 10 seconds",
+    ))
+}
+
 /// Only these deliberately listed `gui.*` methods may cross the native
 /// boundary; a future method is rejected until it is added here.
 pub fn validate_gui_method(method: &str) -> Result<(), GuiError> {
@@ -346,6 +427,7 @@ pub fn build_request(
 /// `method` or `params`. This runs on a blocking executor, never the window thread.
 pub fn blocking_daemon_call(method: String, params: Value) -> Result<Value, GuiError> {
     validate_gui_method(&method)?;
+    ensure_daemon_started()?;
 
     let dir = config_dir_from(&process_env())?;
     let token = read_token(&dir)?;
@@ -395,7 +477,61 @@ async fn daemon_call(method: String, params: Value) -> Result<Value, GuiError> {
 
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            let bundle_dir = app.path().resolve("resources/daemon", BaseDirectory::Resource)?;
+            let (node, entry) = bundled_daemon_paths(&bundle_dir);
+            let _ = DAEMON_BUNDLE.set(DaemonBundle { node, entry });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![daemon_call])
         .run(tauri::generate_context!())
         .expect("error while running Artinarey window");
+}
+
+#[cfg(test)]
+mod sidecar_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
+
+    fn scratch_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "artinarey-sidecar-test-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn bundled_paths_follow_resource_layout() {
+        let (node, entry) = bundled_daemon_paths(Path::new("/app/resources/daemon"));
+        assert_eq!(node, Path::new("/app/resources/daemon/node"));
+        assert_eq!(entry, Path::new("/app/resources/daemon/daemon.mjs"));
+    }
+
+    #[test]
+    fn reachable_needs_both_a_port_file_and_a_live_listener() {
+        let dir = scratch_dir();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        fs::write(dir.join("daemon.json"), format!("{{\"port\":{port}}}")).unwrap();
+        assert!(daemon_reachable(&dir));
+
+        drop(listener);
+        assert!(!daemon_reachable(&dir));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stale_or_missing_port_file_is_not_reachable() {
+        let dir = scratch_dir();
+        assert!(!daemon_reachable(&dir));
+        fs::write(dir.join("daemon.json"), "not json").unwrap();
+        assert!(!daemon_reachable(&dir));
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
