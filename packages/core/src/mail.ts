@@ -152,27 +152,36 @@ function mailIdExists(storeDir: string, id: string): boolean {
     .some((entry) => basename(String(entry)) === `${id}.md`);
 }
 
+export type SendMailOptions = {
+  /** Stable lock key when the store path can switch while a send is queued. */
+  lockKey?: string;
+  /** Resolved inside the lock so a store move cannot happen between lookup and write. */
+  resolveStoreDir?: () => string;
+};
+
 /** Sole-writer entry point: validate, then atomically write mail and audit line. */
 export async function sendMail(
   storeDir: string,
   input: MailInput,
   ctx: MailContext,
+  options: SendMailOptions = {},
 ): Promise<MailRecord> {
-  return withProjectLock(storeDir, async () => {
+  return withProjectLock(options.lockKey ?? storeDir, async () => {
+    const target = options.resolveStoreDir?.() ?? storeDir;
     const result = validateMail(input, ctx);
     if (!result.ok) throw new ArtinareyError('MAIL_REJECTED', result.reason);
 
     const createdAt = (ctx.now ?? new Date()).toISOString().replace(/\.\d{3}Z$/, 'Z');
     const record: MailRecord = { ...result.value, created_at: createdAt };
     const file = join(
-      storeDir,
+      target,
       'mail',
       createdAt.slice(0, 4),
       createdAt.slice(5, 7),
       `${record.id}.md`,
     );
 
-    if (mailIdExists(storeDir, record.id)) {
+    if (mailIdExists(target, record.id)) {
       throw new ArtinareyError('MAIL_REJECTED', `mail id already exists: ${record.id}`);
     }
     try {
@@ -189,7 +198,7 @@ export async function sendMail(
       throw err;
     }
     try {
-      appendJournal(join(storeDir, 'events', 'audit.jsonl'), {
+      appendJournal(join(target, 'events', 'audit.jsonl'), {
         type: 'mail_sent',
         id: record.id,
         thread: record.thread,

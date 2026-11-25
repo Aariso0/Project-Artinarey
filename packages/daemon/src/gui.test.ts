@@ -2,12 +2,13 @@ import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   appendJournal, appendSession, buildIndex, createTask, loadConfig, newId, openRegistry,
-  resolveXdgPaths, serializeMail, sessionLogFile, writeMarker, type SessionSummary,
+  resolveXdgPaths, serializeMail, sessionLogFile, withProjectLock, writeMarker,
+  type SessionSummary,
 } from '@artinarey/core';
 import {
   handleGuiRequest, type GuiMail, type GuiPersona, type GuiProject, type GuiWorktree,
@@ -597,6 +598,54 @@ test('chat queues mail to senior-dev before any persona is registered', async (t
     id: '2', method: 'gui.mail', params: { projectId: fresh.id },
   }, ctx(s));
   assert.equal((mail.ok ? mail.result as unknown[] : []).length, 1);
+});
+
+test('chat resolves the store path under the mail lock during a store switch', async (t) => {
+  const s = setup();
+  track(t, s);
+  const movedStore = join(s.paths.dataRoot, 'moved');
+  mkdirSync(movedStore, { recursive: true });
+
+  let chat!: Promise<RpcResponse>;
+  // Hold the same lock a store switch uses: the chat path must be read after
+  // the registry changes, not from the snapshot taken before the request.
+  await withProjectLock(s.project.id, async () => {
+    chat = handleGuiRequest({
+      id: '1', method: 'gui.chat',
+      params: { projectId: s.project.id, message: 'Hello during a move' },
+    }, ctx(s));
+    s.registry.projects.updateStoreDir(s.project.id, movedStore);
+  });
+
+  const reply = await chat;
+  assert.equal(reply.ok, true, reply.ok ? '' : reply.error.message);
+  const mail = await handleGuiRequest({
+    id: '2', method: 'gui.mail', params: { projectId: s.project.id },
+  }, ctx(s));
+  assert.equal((mail.ok ? mail.result as unknown[] : []).length, 1);
+  assert.equal(existsSync(join(s.project.storeDir, 'mail')), false, 'old store received the mail');
+});
+
+test('chat reports a committed mail when indexing fails after the write', async (t) => {
+  const s = setup();
+  track(t, s);
+  const index = join(s.paths.cacheRoot, s.project.id, 'index.sqlite');
+  mkdirSync(dirname(index), { recursive: true });
+  mkdirSync(index); // buildIndex cannot open a directory as a database
+
+  const reply = await handleGuiRequest({
+    id: '1', method: 'gui.chat',
+    params: { projectId: s.project.id, message: 'Index will fail' },
+  }, ctx(s));
+  assert.equal(reply.ok, false);
+  if (!reply.ok) {
+    assert.equal(reply.error.code, 'MAIL_PARTIAL');
+    assert.match(reply.error.message, /mail \S+ is committed/);
+    assert.match(reply.error.message, /do not resend/);
+    assert.match(reply.error.message, /reindex/);
+  }
+  const files = readdirSync(join(s.project.storeDir, 'mail'), { recursive: true });
+  assert.equal(files.some((file) => String(file).endsWith('.md')), true, 'mail was not committed');
 });
 
 test('Move preflight is read-only; a crash mid-copy resumes and verifies', async (t) => {

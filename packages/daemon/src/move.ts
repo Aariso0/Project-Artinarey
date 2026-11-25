@@ -6,7 +6,7 @@ import {
 import { cp, rename, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import {
-  atomicWrite, buildIndex, type XdgPaths,
+  atomicWrite, buildIndex, withProjectLock, type XdgPaths,
 } from '@artinarey/core';
 import type { RpcContext } from './tools.ts';
 
@@ -280,29 +280,34 @@ async function switchAndFinish(ctx: RpcContext, status: MoveStatus): Promise<Mov
     }
     await rename(paths.incoming, paths.final);
   }
-  ctx.registry.projects.updateStoreDir(status.projectId, paths.final);
-  try {
-    syncLateWrites(status.source, paths.final);
-  } catch (err) {
-    // The switch already happened: fail durably at the switching checkpoint so
-    // a later resume retries the late-write sync instead of indexing and
-    // completing an incomplete destination. The old store stays available.
-    return toOffline(ctx, current, moveError(
-      'STORE_OFFLINE', `late-write sync failed: ${asMoveError(err).message}`,
-    ));
-  }
-  current = writeMove(ctx, { ...current, phase: 'rebuilding' });
-  buildIndex(join(ctx.paths.cacheRoot, status.projectId, 'index.sqlite'), paths.final);
-  current = writeMove(ctx, { ...current, phase: 'resuming' });
-  const recorded = ctx.registry.moves.list(status.projectId)
-    .some((event) => event.fromRoot === status.source && event.toRoot === paths.final);
-  if (!recorded) {
-    ctx.registry.moves.append({
-      projectId: status.projectId, fromRoot: status.source, toRoot: paths.final,
-      movedAt: new Date().toISOString(),
-    });
-  }
-  return writeMove(ctx, { ...current, phase: 'done', error: null });
+  // GUI mail sends resolve their store path under this same project lock. Holding
+  // it across the registry switch and the late-write sync keeps a send from
+  // landing in the old store after the last copy.
+  return withProjectLock(status.projectId, async () => {
+    ctx.registry.projects.updateStoreDir(status.projectId, paths.final);
+    try {
+      syncLateWrites(status.source, paths.final);
+    } catch (err) {
+      // The switch already happened: fail durably at the switching checkpoint so
+      // a later resume retries the late-write sync instead of indexing and
+      // completing an incomplete destination. The old store stays available.
+      return toOffline(ctx, current, moveError(
+        'STORE_OFFLINE', `late-write sync failed: ${asMoveError(err).message}`,
+      ));
+    }
+    current = writeMove(ctx, { ...current, phase: 'rebuilding' });
+    buildIndex(join(ctx.paths.cacheRoot, status.projectId, 'index.sqlite'), paths.final);
+    current = writeMove(ctx, { ...current, phase: 'resuming' });
+    const recorded = ctx.registry.moves.list(status.projectId)
+      .some((event) => event.fromRoot === status.source && event.toRoot === paths.final);
+    if (!recorded) {
+      ctx.registry.moves.append({
+        projectId: status.projectId, fromRoot: status.source, toRoot: paths.final,
+        movedAt: new Date().toISOString(),
+      });
+    }
+    return writeMove(ctx, { ...current, phase: 'done', error: null });
+  });
 }
 
 function toOffline(ctx: RpcContext, status: MoveStatus, error: unknown): MoveStatus {
