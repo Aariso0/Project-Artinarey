@@ -70,7 +70,7 @@ test('normalizeVersion rejects non-semver values', () => {
 
 test('assertVersionsAgree passes only when all manifests match', () => {
   assert.doesNotThrow(() => assertVersionsAgree(fixture));
-  writeFileSync(join(fixture, 'apps/gui/package.json'), '{"version":"0.1.1"}');
+  writeFileSync(join(fixture, 'apps/gui/package.json'), '{"version":"0.1.2"}');
   assert.throws(() => assertVersionsAgree(fixture), /version mismatch/);
 });
 

@@ -32,7 +32,7 @@ function harness(t: TestContext): Harness {
 test('first launch connects, later launches skip, version bump rewrites', (t) => {
   const { env, bundle, config, marker } = harness(t);
 
-  const first = autoConnectOpencode(env, bundle, '0.1.1', '/bundled/node');
+  const first = autoConnectOpencode(env, bundle, '0.1.2', '/bundled/node');
   assert.equal(first.status, 'connected');
   assert.equal(first.file, config);
   const written = JSON.parse(readFileSync(config, 'utf8')) as {
@@ -40,9 +40,9 @@ test('first launch connects, later launches skip, version bump rewrites', (t) =>
   };
   assert.deepEqual(written.mcp.servers.artinarey.command,
     ['/bundled/node', join(bundle, 'shim.mjs')]);
-  assert.equal(JSON.parse(readFileSync(marker, 'utf8')).version, '0.1.1');
+  assert.equal(JSON.parse(readFileSync(marker, 'utf8')).version, '0.1.2');
 
-  assert.deepEqual(autoConnectOpencode(env, bundle, '0.1.1', '/bundled/node'), {
+  assert.deepEqual(autoConnectOpencode(env, bundle, '0.1.2', '/bundled/node'), {
     status: 'skipped', reason: 'already_current', file: config,
   });
 
@@ -56,7 +56,7 @@ test('no OpenCode means no write', (t) => {
   env.PATH = '';
   rmSync(join(env.HOME as string, 'bin', 'opencode'));
 
-  assert.deepEqual(autoConnectOpencode(env, bundle, '0.1.1'), {
+  assert.deepEqual(autoConnectOpencode(env, bundle, '0.1.2'), {
     status: 'skipped', reason: 'opencode_absent',
   });
   assert.equal(existsSync(config), false);
@@ -65,14 +65,14 @@ test('no OpenCode means no write', (t) => {
 test('missing shim and malformed config are skipped without throwing', (t) => {
   const { env, bundle, config, marker } = harness(t);
   rmSync(join(bundle, 'shim.mjs'));
-  assert.deepEqual(autoConnectOpencode(env, bundle, '0.1.1'), {
+  assert.deepEqual(autoConnectOpencode(env, bundle, '0.1.2'), {
     status: 'skipped', reason: 'shim_missing',
   });
 
   writeFileSync(join(bundle, 'shim.mjs'), '');
   mkdirSync(join(env.XDG_CONFIG_HOME as string, 'opencode'), { recursive: true });
   writeFileSync(config, '{not json');
-  assert.deepEqual(autoConnectOpencode(env, bundle, '0.1.1'), {
+  assert.deepEqual(autoConnectOpencode(env, bundle, '0.1.2'), {
     status: 'skipped', reason: 'invalid_config', file: config,
   });
   assert.equal(readFileSync(config, 'utf8'), '{not json');
