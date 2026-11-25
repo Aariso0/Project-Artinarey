@@ -109,12 +109,22 @@ Artinarey is the office that fixes that. Each agent gets a private desk, an inte
                    the only outbound caller
 ```
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:3e1b181acc7062a433a263299433359b59dcc981427773ab2cceb139e5d5c843 -->
+
 1. **Add a project.** In the window use **Add project** to open an existing repository or clone one into a new folder. From the CLI use `artinarey project open <path>` or `artinarey project clone <url> <folder>` (`init` still registers the current directory). Worktrees stay under `.worktrees/`. Artinarey reads `git worktree list`, so worktrees made by other tools show up too.
 2. **Start a persona.** Pick a worktree. If that persona last worked somewhere else, you get a warning first.
-3. **The agent connects over MCP.** The folder it runs in tells Artinarey who it is. On each launch of a released app, until the connection succeeds, Artinarey adds its MCP server and allow rules to your global `opencode.json` (`~/.config/opencode/opencode.json`, or `$XDG_CONFIG_HOME/opencode/opencode.json`) without disturbing existing settings. Set `ARTINAREY_AUTO_CONNECT_OPENCODE=0` to skip that step. If that file is invalid JSON, Artinarey leaves it untouched and the daemon still starts without a visible warning; fix the JSON and relaunch, or run `artinarey connect opencode` in a project to write the entry into that project's `opencode.json`. From a source checkout, use that command too.
+3. **The agent connects over MCP.** The folder it runs in tells Artinarey who it is. When the released app starts its daemon sidecar, Artinarey tries to add its MCP server and allow rules to your global OpenCode config without disturbing existing settings. The preferred file is `~/.config/opencode/opencode.json` (or `$XDG_CONFIG_HOME/opencode/opencode.json` when `XDG_CONFIG_HOME` is an absolute path). If the preferred file is missing and `~/.opencode.json` exists, Artinarey uses that legacy file. Set `ARTINAREY_AUTO_CONNECT_OPENCODE=0` to skip this step.
+
+   If the selected file contains invalid JSON, Artinarey leaves it untouched and the daemon starts without a visible warning. Repair the JSON in the selected file, including `~/.opencode.json` if Artinarey selected it. Quit the GUI, stop the daemon with `artinarey daemon stop`, then relaunch the GUI so the sidecar starts and retries the connection.
+
+   To configure just one project, run `artinarey connect opencode` from the project directory to write the entry into that project's `opencode.json`. Release users need to install or otherwise have access to the Artinarey CLI to run these commands. If you’re using a source checkout, run `node /path/to/Project-Artinarey/packages/cli/bin/artinarey connect opencode` from the project directory. To stop the daemon with the checkout’s CLI, use `node /path/to/Project-Artinarey/packages/cli/bin/artinarey daemon stop`.
 4. **Work gets assigned.** The senior dev splits a task, or you assign it directly. Overlapping scopes are rejected by code, and an idle persona on the same branch gets priority over a new session.
 5. **Risky calls ask you.** Anything that reaches outside the agent's worktree blocks until you approve it.
 6. **Branches are ready. You merge.** Nothing merges itself.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 ---
 

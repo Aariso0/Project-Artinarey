@@ -162,9 +162,9 @@ function readManifest(storeDir: string): MoveManifest | undefined {
 
 /** Only established event journals are append-only; approvals are rewritten on resolve. */
 const APPEND_ONLY_FILES = new Set([
-  'events/audit.jsonl',
-  'events/leases.jsonl',
-  'events/tasks.jsonl',
+  join('events', 'audit.jsonl'),
+  join('events', 'leases.jsonl'),
+  join('events', 'tasks.jsonl'),
 ]);
 
 function isAppendOnly(relative: string): boolean {

@@ -155,7 +155,7 @@ test('installHooks expands ~ in core.hooksPath before checking the hook', () => 
     const result = installHooks(repo, join(repo, '.git'));
     assert.equal(result.installed, false, result.note);
     assert.match(result.note, /already installed/);
-    assert.match(result.note, new RegExp(join(root, 'hooks', 'pre-commit')));
+    assert.ok(result.note.includes(join(root, 'hooks', 'pre-commit')), result.note);
   } finally {
     process.env.HOME = originalHome;
     rmSync(root, { recursive: true, force: true });
