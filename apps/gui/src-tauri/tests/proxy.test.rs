@@ -1,7 +1,7 @@
 use artinarey_gui_lib::{
-    blocking_daemon_call, build_request, config_dir_from, daemon_command, map_status,
-    parse_body_cap, parse_envelope, parse_http_response, platform_origin, read_port, read_token,
-    validate_gui_method,
+    blocking_daemon_call, build_request, config_dir_from, daemon_command, io_timeout_secs,
+    map_status, parse_body_cap, parse_envelope, parse_http_response, platform_origin, read_port,
+    read_token, validate_gui_method,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -39,6 +39,13 @@ fn env_map(entries: &[(&str, &OsStr)]) -> HashMap<String, OsString> {
         .iter()
         .map(|(key, value)| (key.to_string(), value.to_os_string()))
         .collect()
+}
+
+#[test]
+fn clone_calls_get_a_longer_socket_timeout() {
+    assert_eq!(io_timeout_secs("gui.cloneProject"), 300);
+    assert_eq!(io_timeout_secs("gui.openProject"), 5);
+    assert_eq!(io_timeout_secs("gui.chat"), 5);
 }
 
 #[test]
