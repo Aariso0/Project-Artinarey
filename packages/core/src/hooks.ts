@@ -1,37 +1,76 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { ArtinareyError } from './errors.ts';
 
 const HOOK_MARKER = 'artinarey lease-check';
+const HOOK_LINE = `exec ${HOOK_MARKER} --staged`;
+// Only an actual command counts. The template's comment also contains the marker.
+const HOOK_INVOCATION = /^\s*(?:exec\s+)?artinarey\s+lease-check(?:\s|$)/m;
 const PRE_COMMIT = [
   '#!/bin/sh',
   `# ${HOOK_MARKER} — reject files outside the active lease`,
-  'exec artinarey lease-check --staged',
+  HOOK_LINE,
   '',
 ].join('\n');
 
 export type HookInstall = { installed: boolean; note: string };
 
-/** Install the lease-check hook in the shared hooks dir without overriding an existing hooksPath. */
-export function installHooks(repoDir: string, commonDir: string): HookInstall {
-  let configured = '';
+function gitConfig(cwd: string, args: string[]): string {
   try {
-    configured = execFileSync('git', ['config', '--get', 'core.hooksPath'], {
-      cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    return execFileSync('git', args, {
+      cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
   } catch {
-    // core.hooksPath is unset; git uses .git/hooks, which is per-worktree.
+    return '';
   }
+}
+
+function isExecutable(path: string): boolean {
+  // Windows hook execution is not governed by the POSIX executable bit.
+  if (process.platform === 'win32') return true;
+  try {
+    return (statSync(path).mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Install the lease-check hook in the shared hooks dir without overriding an existing hooksPath. */
+export function installHooks(repoDir: string, commonDir: string): HookInstall {
+  const configured = gitConfig(repoDir, ['config', '--get', 'core.hooksPath']);
   if (configured !== '') {
-    const hookPath = resolve(repoDir, configured, 'pre-commit');
-    if (existsSync(hookPath) && readFileSync(hookPath, 'utf8').includes(HOOK_MARKER)) {
-      return { installed: false, note: `lease-check hook already installed at ${hookPath}` };
+    // Git expands ~ when --path is set; resolve() would look under repoDir/~/hooks.
+    const expanded = gitConfig(repoDir, ['config', '--path', '--get', 'core.hooksPath']);
+    const hookPath = resolve(repoDir, expanded || configured, 'pre-commit');
+    let content: string;
+    try {
+      content = readFileSync(hookPath, 'utf8');
+    } catch {
+      return {
+        installed: false,
+        note: `cannot read ${hookPath}; add this line to it: ${HOOK_MARKER}`,
+      };
     }
-    return {
-      installed: false,
-      note: `core.hooksPath is already ${configured}; add this line to it: ${HOOK_MARKER}`,
-    };
+    if (!content.includes(HOOK_MARKER)) {
+      return {
+        installed: false,
+        note: `core.hooksPath is already ${configured}; add this line to it: ${HOOK_MARKER}`,
+      };
+    }
+    if (!HOOK_INVOCATION.test(content)) {
+      return {
+        installed: false,
+        note: `the hook at ${hookPath} only has the marker; restore this line: ${HOOK_LINE}`,
+      };
+    }
+    if (!isExecutable(hookPath)) {
+      return {
+        installed: false,
+        note: `the hook at ${hookPath} is not executable; make it executable with chmod +x`,
+      };
+    }
+    return { installed: false, note: `lease-check hook already installed at ${hookPath}` };
   }
 
   const hooksDir = join(commonDir, 'hooks');

@@ -69,13 +69,26 @@ test('registerProjectAt registers an existing repo and its main worktree once', 
   }
 });
 
-test('cloneProjectInto clones a URL into a new folder and registers it', (t) => {
+test('registerProjectAt completes when the configured hook cannot be read', (t) => {
+  const { dir, env } = workspace();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const repo = repository(dir, 'unreadable-hook');
+  git(repo, 'config', 'core.hooksPath', 'shared-hooks');
+  mkdirSync(join(repo, 'shared-hooks', 'pre-commit'), { recursive: true });
+
+  const result = registerProjectAt(repo, env);
+  assert.equal(result.path, repo);
+  assert.match(result.hooksNote, /cannot read/);
+  assert.match(result.hooksNote, /add this line to it/);
+});
+
+test('cloneProjectInto clones a URL into a new folder and registers it', async (t) => {
   const { dir, env } = workspace();
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const source = repository(dir, 'source');
   const target = join(dir, 'new-folder', 'copy');
 
-  const result = cloneProjectInto(source, target, env, dir);
+  const result = await cloneProjectInto(source, target, env, dir);
   assert.equal(result.path, target);
   assert.ok(existsSync(join(target, '.git')));
   assert.equal(existsSync(join(target, 'README.md')), true);
