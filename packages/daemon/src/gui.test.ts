@@ -2,7 +2,7 @@ import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
@@ -914,9 +914,12 @@ test('a resumed move merges source and destination journal appends after a faile
   // A new append lands in the live store while the move is offline.
   writeFileSync(join(paths.final, journal), base + fresh);
   rmSync(join(paths.final, 'a-late.md'), { recursive: true, force: true });
+  const beforeInode = statSync(join(paths.final, journal)).ino;
 
   const resumed = await resumeMove(ctx(s), s.project.id);
   assert.equal(resumed.phase, 'done', resumed.error ?? '');
+  // A truncated in-place rewrite would keep the inode; atomicWrite replaces it.
+  assert.notEqual(statSync(join(paths.final, journal)).ino, beforeInode);
   assert.deepEqual(
     readFileSync(join(paths.final, journal), 'utf8').trim().split('\n'),
     ['{"event":"base"}', '{"event":"source-late"}', '{"event":"destination-fresh"}'],

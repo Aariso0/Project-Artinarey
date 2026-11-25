@@ -197,7 +197,9 @@ function syncLateWrites(source: string, final: string): void {
     const destination = join(final, relative);
     if (existsSync(destination)) {
       if (isAppendOnly(relative)) {
-        writeFileSync(destination, mergeAppendOnly(file, destination));
+        // The destination holds the only copy of its offline appends: replacing it
+        // must not expose a truncated or partially written journal.
+        atomicWrite(destination, mergeAppendOnly(file, destination));
         manifest.files[relative] = sha256(destination);
         continue;
       }
