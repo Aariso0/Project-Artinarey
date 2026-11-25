@@ -18,7 +18,13 @@ use tauri::{path::BaseDirectory, Manager};
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const HEADER_BUDGET: usize = 16 * 1024;
 const IO_TIMEOUT_SECS: u64 = 5;
+const CLONE_IO_TIMEOUT_SECS: u64 = 300;
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A clone can outlast the short timeout used for every other GUI call.
+pub fn io_timeout_secs(method: &str) -> u64 {
+    if method == "gui.cloneProject" { CLONE_IO_TIMEOUT_SECS } else { IO_TIMEOUT_SECS }
+}
 
 /// The bundled Node runtime and compiled daemon entry inside the app resources.
 /// Absent in development builds, where the daemon is started from the CLI.
@@ -32,13 +38,14 @@ static DAEMON_SPAWN: Mutex<()> = Mutex::new(());
 static DAEMON_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 /// Every method the webview can reach. The daemon re-checks the `gui.` prefix
 /// and its own method table; native code is the only place that adds a method.
-const ALLOWED_GUI_METHODS: [&str; 24] = [
+const ALLOWED_GUI_METHODS: [&str; 26] = [
     "gui.projects", "gui.personas", "gui.worktrees", "gui.mail",
     "gui.tasks", "gui.leases", "gui.sessions", "gui.preMerge", "gui.audit",
     "gui.approvals", "gui.approve", "gui.autoApprove", "gui.stopSession",
     "gui.createWorktree", "gui.adoptWorktree", "gui.setHomeWorktree", "gui.chat",
     "gui.storage", "gui.setStorage", "gui.movePreflight", "gui.moveStart",
     "gui.moveStatus", "gui.moveUndo", "gui.moveDeleteOld",
+    "gui.openProject", "gui.cloneProject",
 ];
 
 /// The only error shape crossing the native boundary: `{ code, message }`.
@@ -440,7 +447,7 @@ pub fn blocking_daemon_call(method: String, params: Value) -> Result<Value, GuiE
 
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .map_err(|_| GuiError::new("DAEMON_UNREACHABLE", "daemon is not reachable on loopback"))?;
-    let timeout = Some(Duration::from_secs(IO_TIMEOUT_SECS));
+    let timeout = Some(Duration::from_secs(io_timeout_secs(&method)));
     stream
         .set_read_timeout(timeout)
         .and_then(|()| stream.set_write_timeout(timeout))

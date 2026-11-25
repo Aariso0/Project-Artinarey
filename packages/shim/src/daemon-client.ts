@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { connect, type Socket } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -72,8 +73,19 @@ function waitForDaemon(path: string, timeoutMs: number, signal: AbortSignal): Pr
 }
 
 function startDaemon(): void {
+  const bundleDir = dirname(fileURLToPath(import.meta.url));
+  const bundledEntry = join(bundleDir, 'daemon.mjs');
+  const bundledNode = join(bundleDir, process.platform === 'win32' ? 'node.exe' : 'node');
+  if (existsSync(bundledEntry) && existsSync(bundledNode)) {
+    const child = spawn(bundledNode, [bundledEntry], {
+      cwd: bundleDir, env: process.env, stdio: 'ignore', detached: true,
+    });
+    child.unref();
+    return;
+  }
+
   const root = process.env.ARTINAREY_ROOT
-    ?? resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+    ?? resolve(bundleDir, '../../..');
   const child = spawn(
     process.execPath,
     ['--import', 'tsx', join(root, 'packages/cli/src/index.ts'), 'daemon', 'start'],

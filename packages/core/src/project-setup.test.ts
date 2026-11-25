@@ -69,13 +69,26 @@ test('registerProjectAt registers an existing repo and its main worktree once', 
   }
 });
 
-test('cloneProjectInto clones a URL into a new folder and registers it', (t) => {
+test('registerProjectAt completes when the configured hook cannot be read', (t) => {
+  const { dir, env } = workspace();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const repo = repository(dir, 'unreadable-hook');
+  git(repo, 'config', 'core.hooksPath', 'shared-hooks');
+  mkdirSync(join(repo, 'shared-hooks', 'pre-commit'), { recursive: true });
+
+  const result = registerProjectAt(repo, env);
+  assert.equal(result.path, repo);
+  assert.match(result.hooksNote, /cannot read/);
+  assert.match(result.hooksNote, /add this line to it/);
+});
+
+test('cloneProjectInto clones a URL into a new folder and registers it', async (t) => {
   const { dir, env } = workspace();
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const source = repository(dir, 'source');
   const target = join(dir, 'new-folder', 'copy');
 
-  const result = cloneProjectInto(source, target, env, dir);
+  const result = await cloneProjectInto(source, target, env, dir);
   assert.equal(result.path, target);
   assert.ok(existsSync(join(target, '.git')));
   assert.equal(existsSync(join(target, 'README.md')), true);
@@ -83,19 +96,19 @@ test('cloneProjectInto clones a URL into a new folder and registers it', (t) => 
   git(target, 'worktree', 'list');
 });
 
-test('cloneProjectInto refuses a non-empty target and hides URL credentials', (t) => {
+test('cloneProjectInto refuses a non-empty target and hides URL credentials', async (t) => {
   const { dir, env } = workspace();
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const target = join(dir, 'occupied');
   mkdirSync(target);
   writeFileSync(join(target, 'keep.txt'), 'mine\n');
-  assert.throws(
-    () => cloneProjectInto('https://example.com/repo.git', target, env, dir),
+  await assert.rejects(
+    cloneProjectInto('https://example.com/repo.git', target, env, dir),
     /target folder is not empty/,
   );
 
-  assert.throws(
-    () => cloneProjectInto(
+  await assert.rejects(
+    cloneProjectInto(
       'https://user:supersecret@127.0.0.1:1/missing.git', join(dir, 'bad'), env, dir,
     ),
     (error: Error) => {
@@ -103,4 +116,28 @@ test('cloneProjectInto refuses a non-empty target and hides URL credentials', (t
       return true;
     },
   );
+});
+
+test('cloneProjectInto leaves the event loop free while Git clones', async (t) => {
+  const { dir, env } = workspace();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const source = repository(dir, 'slow-source');
+  const bin = join(dir, 'bin');
+  mkdirSync(bin, { recursive: true });
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  writeFileSync(join(bin, 'git'), `#!/bin/sh\nif [ "$1" = "clone" ]; then sleep 1; fi\nexec "${realGit}" "$@"\n`, {
+    mode: 0o755,
+  });
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${bin}:${originalPath ?? ''}`;
+  let ticked = false;
+  const timer = setTimeout(() => { ticked = true; }, 50);
+  try {
+    const result = await cloneProjectInto(source, join(dir, 'slow-copy'), env, dir);
+    assert.ok(existsSync(join(result.path, '.git')));
+  } finally {
+    clearTimeout(timer);
+    process.env.PATH = originalPath;
+  }
+  assert.equal(ticked, true, 'a clone must not block unrelated event-loop work');
 });

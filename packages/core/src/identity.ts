@@ -4,6 +4,7 @@ import {
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { ArtinareyError, type ArtinareyErrorCode } from './errors.ts';
+import { newId } from './ids.ts';
 import { personaDir, readPersona, writePersona, type PersonaState } from './persona-store.ts';
 import { appendJournal } from './store.ts';
 import type { Registry } from './registry.ts';
@@ -376,7 +377,7 @@ export function claimPersona(
   const nextHome = options.rehome || !home ? identity.worktreeId : home;
   writePersona(storeDir, personaId, { ...personaState, home_worktree_id: nextHome, state: 'active' });
   try {
-    audit(storeDir, { type: 'persona_claimed', persona_id: personaId,
+    audit(storeDir, { type: 'persona_claimed', claim_id: newId(), persona_id: personaId,
       worktree_id: identity.worktreeId, home_worktree_id: nextHome,
       confirmed_move: Boolean(options.confirmMove), rehome: Boolean(options.rehome) });
   } finally {

@@ -14,3 +14,4 @@ export * from './lease.ts';
 export * from './hooks.ts';
 export * from './session.ts';
 export * from './project-setup.ts';
+export * from './opencode.ts';

@@ -21,6 +21,7 @@ export * from './tools.ts';
 export * from './gui.ts';
 export * from './http.ts';
 export * from './opencode.ts';
+export * from './opencode-autoconnect.ts';
 export * from './sessions.ts';
 export * from './model-client.ts';
 

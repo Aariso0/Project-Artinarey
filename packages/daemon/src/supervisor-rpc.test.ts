@@ -71,7 +71,15 @@ test('approve passes the decision and resolved-by through to the supervisor', as
   }, ctx);
   assert.equal(missingActor.ok, false);
   if (!missingActor.ok) assert.equal(missingActor.error.code, 'INVALID_INPUT');
-  assert.equal(seen.length, 1);
+
+  for (const decision of ['reject', '', undefined, 'APPROVED', 1]) {
+    const bad = await handleSupervisorRequest({
+      id: '3', method: 'approve', params: { id: 'a3', decision, by: 'user' },
+    }, ctx);
+    assert.equal(bad.ok, false, String(decision));
+    if (!bad.ok) assert.equal(bad.error.code, 'INVALID_INPUT', String(decision));
+  }
+  assert.equal(seen.length, 1, 'no invalid decision may reach the supervisor');
 });
 
 test('auto_approve requires a worktree and a boolean', async () => {

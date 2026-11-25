@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -131,5 +131,99 @@ test('installHooks writes the shared pre-commit hook and never overrides hooksPa
 
   const second = installHooks(repo, common);
   assert.equal(second.installed, false);
-  assert.match(second.note, /already/);
+  assert.match(second.note, /already installed/);
+  assert.doesNotMatch(second.note, /add this line/);
+});
+
+function configuredRepo(root: string, hooksPath: string): { repo: string; hook: string } {
+  const repo = join(root, 'repo');
+  mkdirSync(repo, { recursive: true });
+  git(['init', '-q'], repo);
+  git(['config', 'core.hooksPath', hooksPath], repo);
+  const base = hooksPath.startsWith('~/') ? root : repo;
+  return { repo, hook: join(base, hooksPath.replace(/^~\//, ''), 'pre-commit') };
+}
+
+test('installHooks expands ~ in core.hooksPath before checking the hook', () => {
+  const root = join(tmpdir(), `artinarey-hooks-home-${newId()}`);
+  const { repo, hook } = configuredRepo(root, '~/hooks');
+  mkdirSync(join(root, 'hooks'), { recursive: true });
+  writeFileSync(hook, '#!/bin/sh\nexec artinarey lease-check --staged\n', { mode: 0o755 });
+  const originalHome = process.env.HOME;
+  process.env.HOME = root;
+  try {
+    const result = installHooks(repo, join(repo, '.git'));
+    assert.equal(result.installed, false, result.note);
+    assert.match(result.note, /already installed/);
+    assert.ok(result.note.includes(join(root, 'hooks', 'pre-commit')), result.note);
+  } finally {
+    process.env.HOME = originalHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('installHooks accepts a staged lease-check with varied whitespace', () => {
+  const root = join(tmpdir(), `artinarey-hooks-whitespace-${newId()}`);
+  const { repo, hook } = configuredRepo(root, 'shared-hooks');
+  mkdirSync(join(repo, 'shared-hooks'), { recursive: true });
+  writeFileSync(hook, '#!/bin/sh\nexec   artinarey   lease-check   --staged\n', { mode: 0o755 });
+  try {
+    const result = installHooks(repo, join(repo, '.git'));
+    assert.equal(result.installed, false, result.note);
+    assert.match(result.note, /already installed/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('installHooks reports invalid and unreadable configured hooks as not installed', () => {
+  const cases = [
+    {
+      label: 'marker-only',
+      body: '#!/bin/sh\n# artinarey lease-check — reject files outside the active lease\n',
+      mode: 0o755,
+      match: /restore this line: exec artinarey lease-check --staged/,
+    },
+    {
+      label: 'bare-invocation',
+      body: '#!/bin/sh\nartinarey lease-check\n',
+      mode: 0o755,
+      match: /restore this line: exec artinarey lease-check --staged/,
+    },
+    {
+      label: 'non-executable',
+      body: '#!/bin/sh\nexec artinarey lease-check --staged\n',
+      mode: 0o644,
+      match: /not executable/,
+      posixOnly: true,
+    },
+  ];
+  for (const entry of cases) {
+    if (entry.posixOnly && process.platform === 'win32') continue;
+    const root = join(tmpdir(), `artinarey-hooks-${entry.label}-${newId()}`);
+    const { repo, hook } = configuredRepo(root, 'shared-hooks');
+    mkdirSync(join(repo, 'shared-hooks'), { recursive: true });
+    writeFileSync(hook, entry.body, { mode: entry.mode });
+    try {
+      const result = installHooks(repo, join(repo, '.git'));
+      assert.equal(result.installed, false, `${entry.label}: ${result.note}`);
+      assert.doesNotMatch(result.note, /already installed/);
+      assert.match(result.note, entry.match);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  const root = join(tmpdir(), `artinarey-hooks-unreadable-${newId()}`);
+  const { repo, hook } = configuredRepo(root, 'shared-hooks');
+  mkdirSync(hook, { recursive: true }); // readFileSync on a directory throws without relying on root permissions
+  try {
+    const result = installHooks(repo, join(repo, '.git'));
+    assert.equal(result.installed, false);
+    assert.match(result.note, /cannot read/);
+    assert.match(result.note, /add this line to it: exec artinarey lease-check --staged/);
+    assert.match(result.note, new RegExp(hook.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

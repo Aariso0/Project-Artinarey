@@ -1,24 +1,17 @@
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { basename, dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
-  adoptWorktree, atomicWrite, branchChangedFiles, buildIndex, changedFiles, claimPersona,
+  adoptWorktree, branchChangedFiles, buildIndex, changedFiles, claimPersona,
   createWorktree, findMarker,
   listGitWorktrees, loadConfig, openRegistry, planWorktree, readPersona, readTasks,
   reconcileWorktrees, rehomePersona, releasePersona, removeWorktree, resolveIdentity, resolveRepo,
   resolveXdgPaths, roster, rollbackFailedClaim, saveConfig, uncoveredFiles,
-  cloneProjectInto, registerProjectAt,
+  cloneProjectInto, connectOpencodeAt, registerProjectAt,
 } from '@artinarey/core';
 import { callDaemon, daemonStatus, startDaemon, stopDaemon } from '@artinarey/daemon';
-
-const MCP_TOOLS = [
-  'check_in', 'claim_persona', 'inbox', 'read_mail',
-  'send_mail', 'mark_done', 'report', 'worktrees',
-  'task_update', 'request_scope', 'assign_task', 'request_session',
-] as const;
 
 const VENDOR_COMMANDS: Record<string, string> = { opencode: 'opencode' };
 const RUN_USAGE =
@@ -45,11 +38,6 @@ function shimCommand(): string[] {
 function rootDir(): string {
   return process.env.ARTINAREY_ROOT ?? resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 }
-
-type OpenCodeConfig = Record<string, unknown> & {
-  mcp?: { servers?: Record<string, unknown> };
-  permissions?: Array<{ action: string; resource: string; effect: string }>;
-};
 
 type RegistryHandle = ReturnType<typeof openRegistry>;
 type ClaimedPersona = Extract<ReturnType<typeof claimPersona>, { ok: true }>;
@@ -114,27 +102,7 @@ async function confirmInTerminal(question: string): Promise<boolean> {
 }
 
 function connectOpencode(cwd: string): void {
-  const file = join(cwd, 'opencode.json');
-  const config: OpenCodeConfig = existsSync(file)
-    ? JSON.parse(readFileSync(file, 'utf8')) as OpenCodeConfig
-    : {};
-
-  config.mcp = {
-    ...config.mcp,
-    servers: {
-      ...config.mcp?.servers,
-      artinarey: { type: 'local', command: shimCommand(), disabled: false },
-    },
-  };
-
-  const ours = new Set(MCP_TOOLS.map((tool) => `artinarey_${tool}`));
-  const kept = (config.permissions ?? []).filter((rule) => !ours.has(rule.action));
-  config.permissions = [
-    ...kept,
-    ...MCP_TOOLS.map((tool) => ({ action: `artinarey_${tool}`, resource: '*', effect: 'allow' })),
-  ];
-
-  atomicWrite(file, `${JSON.stringify(config, null, 2)}\n`);
+  connectOpencodeAt(join(cwd, 'opencode.json'), shimCommand());
 }
 
 export async function main(
@@ -181,7 +149,7 @@ export async function main(
       return 2;
     }
     try {
-      const result = cloneProjectInto(url, target, env, cwd);
+      const result = await cloneProjectInto(url, target, env, cwd);
       console.log(`project ${result.name}: ${result.path}`);
       console.log(`hooks: ${result.hooksNote}`);
       console.log(`global ignore: ${result.globalIgnore}`);

@@ -528,7 +528,7 @@ export async function handleGuiRequest(request: RpcRequest, ctx: RpcContext): Pr
         if (!url || !target) {
           throw new ArtinareyError('INVALID_INPUT', 'cloneProject needs a URL and a target folder');
         }
-        return ok(request.id, cloneProjectInto(url, target, setupEnv(ctx.paths)));
+        return ok(request.id, await cloneProjectInto(url, target, setupEnv(ctx.paths)));
       }
       case 'gui.createWorktree': {
         const project = knownProject(ctx, params.projectId);
@@ -593,10 +593,24 @@ export async function handleGuiRequest(request: RpcRequest, ctx: RpcContext): Pr
           action: 'reply in the next session',
           body: message,
         }, {
-          knownPersonas: ['user', ...personas.map((persona) => persona.role)],
+          knownPersonas: ['user', 'senior-dev', ...personas.map((persona) => persona.role)],
           role: 'user',
+        }, {
+          // The registry path can change during a store move, so resolve it under
+          // the same lock that serialises the switch and its late-write sync.
+          lockKey: project.id,
+          resolveStoreDir: () => ctx.registry.projects.get(project.id)?.storeDir ?? project.storeDir,
         });
-        buildIndex(join(ctx.paths.cacheRoot, project.id, 'index.sqlite'), project.storeDir);
+        const storeDir = ctx.registry.projects.get(project.id)?.storeDir ?? project.storeDir;
+        try {
+          buildIndex(join(ctx.paths.cacheRoot, project.id, 'index.sqlite'), storeDir);
+        } catch (err) {
+          throw new ArtinareyError(
+            'MAIL_PARTIAL',
+            `mail ${record.id} is committed but indexing failed: ${(err as Error).message}; do not resend; rebuild with artinarey reindex ${project.id}`,
+            record.id,
+          );
+        }
         return ok(request.id, {
           id: record.id,
           text: 'Queued as mail for the next session.',
