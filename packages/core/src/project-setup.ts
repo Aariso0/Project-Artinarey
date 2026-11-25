@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { loadConfig } from './config.ts';
@@ -81,13 +81,25 @@ function withoutCredentials(value: string): string {
   return value.replace(/\/\/[^/@\s]+@/, '//***@');
 }
 
+/** Spawn Git without blocking the daemon's request loop while a clone runs. */
+function runClone(url: string, destination: string, parent: string): Promise<void> {
+  return new Promise((finished, failed) => {
+    execFile('git', ['clone', '--', url, destination], {
+      cwd: parent, encoding: 'utf8',
+    }, (error) => {
+      if (error) failed(error);
+      else finished();
+    });
+  });
+}
+
 /** Clones into a new folder, then registers it like an existing repository. */
-export function cloneProjectInto(
+export async function cloneProjectInto(
   url: string,
   target: string,
   env: NodeJS.ProcessEnv = process.env,
   cwd: string = process.cwd(),
-): ProjectSetupResult {
+): Promise<ProjectSetupResult> {
   if (!url || typeof url !== 'string') {
     throw new ArtinareyError('INVALID_INPUT', 'clone needs a repository URL');
   }
@@ -98,11 +110,7 @@ export function cloneProjectInto(
   const parent = dirname(destination);
   mkdirSync(parent, { recursive: true });
   try {
-    execFileSync('git', ['clone', '--', url, destination], {
-      cwd: parent,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    await runClone(url, destination, parent);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new ArtinareyError('INVALID_INPUT', `clone failed: ${withoutCredentials(message)}`);

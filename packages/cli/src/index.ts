@@ -181,7 +181,7 @@ export async function main(
       return 2;
     }
     try {
-      const result = cloneProjectInto(url, target, env, cwd);
+      const result = await cloneProjectInto(url, target, env, cwd);
       console.log(`project ${result.name}: ${result.path}`);
       console.log(`hooks: ${result.hooksNote}`);
       console.log(`global ignore: ${result.globalIgnore}`);
