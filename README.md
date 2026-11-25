@@ -290,7 +290,9 @@ cd apps/gui
 pnpm exec tauri info
 ```
 
-On Linux you also need `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `librsvg2-dev`, `libayatana-appindicator3-dev` and `libxdo-dev`. A headless machine needs a display, for example Xvfb.
+On Linux you also need `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `librsvg2-dev`, `libayatana-appindicator3-dev`, `libxdo-dev`, `gstreamer1.0-plugins-base` and `gstreamer1.0-plugins-good`. A headless machine needs a display, for example Xvfb.
+
+The Linux AppImage bundles the GStreamer plugins that WebKitGTK needs (`bundleMediaFramework` is enabled in `tauri.conf.json`), so it does not depend on the host's plugin version. The `.deb` and `.rpm` packages use the host's GStreamer plugins instead.
 
 **Step 1 — install and build the webview** (from the repository root):
 

@@ -19,6 +19,11 @@
   },
   "bundle": {
     "active": true,
-    "icon": ["icons/icon.ico", "icons/icon.png"]
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": true
+      }
+    }
   }
 }

@@ -7,7 +7,7 @@ This document covers the local developer workflow for the daemon and the M7/M8 d
 - Node 26 and pnpm 10.34.9
 - Rust 1.100 or newer
 - Tauri 2 system dependencies
-  - On Linux: WebKitGTK and GTK 3 development packages
+  - On Linux: WebKitGTK and GTK 3 development packages, plus the GStreamer base and good plugins when building the AppImage
   - A desktop display session; a headless container needs Xvfb or an equivalent display
 - A registered project. Use the CLI to register one before expecting data in the window.
 
