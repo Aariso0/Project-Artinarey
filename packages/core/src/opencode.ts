@@ -42,11 +42,15 @@ export function mergeOpencodeConfig(
 
 /** Read, merge and atomically write an OpenCode config file. */
 export function connectOpencodeAt(file: string, command: string[]): OpenCodeConfig {
-  const config: OpenCodeConfig = existsSync(file)
+  const exists = existsSync(file);
+  // Global configs may hold credentials: never widen an existing file's mode,
+  // and create new ones readable only by their owner.
+  const mode = exists ? statSync(file).mode & 0o777 : 0o600;
+  const config: OpenCodeConfig = exists
     ? JSON.parse(readFileSync(file, 'utf8')) as OpenCodeConfig
     : {};
   const merged = mergeOpencodeConfig(config, command);
-  atomicWrite(file, `${JSON.stringify(merged, null, 2)}\n`);
+  atomicWrite(file, `${JSON.stringify(merged, null, 2)}\n`, mode);
   return merged;
 }
 
@@ -57,12 +61,9 @@ function absolute(value: string | undefined): string | undefined {
 /** Where a released app should write the global OpenCode config. */
 export function opencodeGlobalConfigPath(env: NodeJS.ProcessEnv): string | undefined {
   const home = absolute(env.HOME);
-  const appData = absolute(env.APPDATA);
-  const preferred = appData
-    ? join(appData, 'opencode', 'opencode.json')
-    : absolute(env.XDG_CONFIG_HOME)
-      ? join(env.XDG_CONFIG_HOME as string, 'opencode', 'opencode.json')
-      : home ? join(home, '.config', 'opencode', 'opencode.json') : undefined;
+  const preferred = absolute(env.XDG_CONFIG_HOME)
+    ? join(env.XDG_CONFIG_HOME as string, 'opencode', 'opencode.json')
+    : home ? join(home, '.config', 'opencode', 'opencode.json') : undefined;
   if (!preferred) return undefined;
 
   const legacy = home ? join(home, '.opencode.json') : undefined;
@@ -92,9 +93,7 @@ function existsOnPath(env: NodeJS.ProcessEnv): boolean {
 export function opencodeInstalled(env: NodeJS.ProcessEnv): boolean {
   if (existsOnPath(env)) return true;
   const home = absolute(env.HOME);
-  const appData = absolute(env.APPDATA);
   const candidates = [
-    appData && join(appData, 'opencode'),
     absolute(env.XDG_CONFIG_HOME) && join(env.XDG_CONFIG_HOME as string, 'opencode'),
     home && join(home, '.config', 'opencode'),
     home && join(home, '.opencode.json'),

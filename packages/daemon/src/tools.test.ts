@@ -658,6 +658,33 @@ test('a repeat claim refreshes ownership so disconnect releases the binding', as
     'the connection must still own the binding after a repeat claim');
 });
 
+test('disconnect releases a claim after an audit merge shifts its line', async (t) => {
+  const s = setup();
+  const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');
+  const cleanup = track(t, s);
+
+  const started = await serve(s);
+  cleanup.server = started.server;
+  const client = await openClient(started.socketPath);
+  cleanup.clients.push(client);
+  await attach(client, s.worktrees[0]!);
+  await claim(client, dev);
+
+  const auditFile = join(s.project.storeDir, 'events', 'audit.jsonl');
+  const lines = readFileSync(auditFile, 'utf8').trimEnd().split('\n');
+  assert.ok(lines.some((line) => line.includes('"type":"persona_claimed"')));
+  // A resumed move merges source records before destination records, moving the
+  // claim to a new line without changing which connection made it.
+  writeFileSync(auditFile, `${'{"type":"merged-source-event"}\n'}${lines.join('\n')}\n`);
+  assert.ok(s.registry.bindings.forWorktree(s.ids[0]!));
+
+  client.close();
+  cleanup.clients.splice(cleanup.clients.indexOf(client), 1);
+  await waitUntil(() => !s.registry.bindings.forWorktree(s.ids[0]!));
+  assert.equal(s.registry.bindings.forWorktree(s.ids[0]!), undefined,
+    'a stable claim identity must survive an audit merge');
+});
+
 test('mark_done rebuilds the index when the receipt already exists', async (t) => {
   const s = setup();
   const dev = createPersona(s.registry, s.project.storeDir, s.project.id, 'dev-a', 'Dev A');

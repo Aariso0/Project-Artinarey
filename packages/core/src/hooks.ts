@@ -8,6 +8,9 @@ const HOOK_LINE = `exec ${HOOK_MARKER} --staged`;
 // Only a staged-file invocation counts: a bare lease-check inspects the working
 // tree, not the index that the commit records. The template comment also has the marker.
 const HOOK_INVOCATION = /^\s*(?:exec\s+)?artinarey\s+lease-check\s+--staged(?:\s|$)/m;
+// Recognise the marker with the same whitespace-tolerant token matching so a
+// valid invocation is not mistaken for an unrelated hook.
+const HOOK_MARKER_TOKEN = /artinarey\s+lease-check\b/;
 const PRE_COMMIT = [
   '#!/bin/sh',
   `# ${HOOK_MARKER} — reject files outside the active lease`,
@@ -53,7 +56,7 @@ export function installHooks(repoDir: string, commonDir: string): HookInstall {
         note: `cannot read ${hookPath}; add this line to it: ${HOOK_LINE}`,
       };
     }
-    if (!content.includes(HOOK_MARKER)) {
+    if (!HOOK_MARKER_TOKEN.test(content)) {
       return {
         installed: false,
         note: `core.hooksPath is already ${configured}; add this line to it: ${HOOK_LINE}`,
@@ -77,7 +80,7 @@ export function installHooks(repoDir: string, commonDir: string): HookInstall {
   const hooksDir = join(commonDir, 'hooks');
   mkdirSync(hooksDir, { recursive: true });
   const hookPath = join(hooksDir, 'pre-commit');
-  if (existsSync(hookPath) && !readFileSync(hookPath, 'utf8').includes(HOOK_MARKER)) {
+  if (existsSync(hookPath) && !HOOK_MARKER_TOKEN.test(readFileSync(hookPath, 'utf8'))) {
     return {
       installed: false,
       note: `an unrelated pre-commit hook exists at ${hookPath}; add: ${HOOK_MARKER}`,

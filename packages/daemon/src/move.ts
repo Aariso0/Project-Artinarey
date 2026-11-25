@@ -160,9 +160,15 @@ function readManifest(storeDir: string): MoveManifest | undefined {
   }
 }
 
-/** Event journals are append-only; their lines can be merged without losing writes. */
+/** Only established event journals are append-only; approvals are rewritten on resolve. */
+const APPEND_ONLY_FILES = new Set([
+  'events/audit.jsonl',
+  'events/leases.jsonl',
+  'events/tasks.jsonl',
+]);
+
 function isAppendOnly(relative: string): boolean {
-  return /^events\/[^/]+\.jsonl$/.test(relative);
+  return APPEND_ONLY_FILES.has(relative);
 }
 
 /** Keep source records first, then destination-only records, each line once. */

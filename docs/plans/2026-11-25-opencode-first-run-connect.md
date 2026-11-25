@@ -11,11 +11,11 @@ first launch of the bundled daemon.
 
 ## Decision
 
-On first launch of a **bundled** Artinarey daemon, if OpenCode is installed on
+On launch of a **bundled** Artinarey daemon, if OpenCode is installed on
 the machine, merge the Artinarey MCP server and its allow rules into OpenCode's
 **global** `opencode.json`. Never overwrite unrelated config; never fail daemon
-startup. Re-run the merge on version upgrade so the server command points at
-the current bundle.
+startup. Retry until the merge succeeds, and re-run it on version upgrade so
+the server command points at the current bundle.
 
 ## Design
 
@@ -37,10 +37,10 @@ the current bundle.
 
 ## Paths
 
-- Global config: `$XDG_CONFIG_HOME/opencode/opencode.json` (POSIX),
-  `%APPDATA%/opencode/opencode.json` (Windows), falling back to
-  `$HOME/.config/opencode/opencode.json`; a legacy `$HOME/.opencode.json` is
-  reused if it is the only file present.
+- Global config: `$XDG_CONFIG_HOME/opencode/opencode.json`, falling back to
+  `$HOME/.config/opencode/opencode.json` on every platform; OpenCode does not
+  read `%APPDATA%`. A legacy `$HOME/.opencode.json` is reused if it is the only
+  file present. Existing file modes are preserved; new configs use `0600`.
 - Project config (existing command): `<cwd>/opencode.json`.
 - Marker: `<artinarey configDir>/opencode-autoconnect.json`.
 

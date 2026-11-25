@@ -162,6 +162,20 @@ test('installHooks expands ~ in core.hooksPath before checking the hook', () => 
   }
 });
 
+test('installHooks accepts a staged lease-check with varied whitespace', () => {
+  const root = join(tmpdir(), `artinarey-hooks-whitespace-${newId()}`);
+  const { repo, hook } = configuredRepo(root, 'shared-hooks');
+  mkdirSync(join(repo, 'shared-hooks'), { recursive: true });
+  writeFileSync(hook, '#!/bin/sh\nexec   artinarey   lease-check   --staged\n', { mode: 0o755 });
+  try {
+    const result = installHooks(repo, join(repo, '.git'));
+    assert.equal(result.installed, false, result.note);
+    assert.match(result.note, /already installed/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('installHooks reports invalid and unreadable configured hooks as not installed', () => {
   const cases = [
     {
@@ -181,9 +195,11 @@ test('installHooks reports invalid and unreadable configured hooks as not instal
       body: '#!/bin/sh\nexec artinarey lease-check --staged\n',
       mode: 0o644,
       match: /not executable/,
+      posixOnly: true,
     },
   ];
   for (const entry of cases) {
+    if (entry.posixOnly && process.platform === 'win32') continue;
     const root = join(tmpdir(), `artinarey-hooks-${entry.label}-${newId()}`);
     const { repo, hook } = configuredRepo(root, 'shared-hooks');
     mkdirSync(join(repo, 'shared-hooks'), { recursive: true });

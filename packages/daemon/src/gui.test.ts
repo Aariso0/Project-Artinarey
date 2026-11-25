@@ -928,6 +928,46 @@ test('a resumed move merges source and destination journal appends after a faile
   assert.equal(manifest.files[journal], hash(base + late + fresh));
 });
 
+test('a resumed move replaces approval snapshots instead of merging them', async (t) => {
+  const s = setupAcceptance(t);
+  const target = join(s.root, 'late-approval-target');
+  mkdirSync(target, { recursive: true });
+  const preview = await handleGuiRequest({
+    id: '1', method: 'gui.movePreflight', params: { projectId: s.project.id, target },
+  }, ctx(s));
+  assert.equal(preview.ok, true, preview.ok ? '' : preview.error.message);
+  const planned = preview.ok ? preview.result as MoveStatus : undefined;
+  const paths = movePaths(target, s.project.id);
+  const approvals = 'events/approvals.jsonl';
+  const pending = '{"id":"a1","status":"pending"}\n';
+  const rejected = '{"id":"a1","status":"rejected"}\n';
+  const hash = (text: string) => createHash('sha256').update(text).digest('hex');
+
+  mkdirSync(dirname(join(paths.final, approvals)), { recursive: true });
+  mkdirSync(dirname(join(s.project.storeDir, approvals)), { recursive: true });
+  writeFileSync(join(paths.final, approvals), pending);
+  writeFileSync(join(s.project.storeDir, approvals), rejected);
+  writeFileSync(join(paths.final, 'manifest.json'), `${JSON.stringify({
+    schema: 1, files: { [approvals]: hash(pending), 'a-late.md': hash('seed\n') },
+  })}\n`);
+  // Fail the first sync before approvals are handled.
+  writeFileSync(join(s.project.storeDir, 'a-late.md'), 'accepted while switching\n');
+  mkdirSync(join(paths.final, 'a-late.md'));
+  mkdirSync(dirname(moveJournalPath(s.paths, s.project.id)), { recursive: true });
+  writeFileSync(moveJournalPath(s.paths, s.project.id), `${JSON.stringify({
+    ...planned!, phase: 'switching', checkpoint: 'switching',
+  })}\n`);
+
+  const stalled = await resumeMove(ctx(s), s.project.id);
+  assert.equal(stalled.phase, 'offline', stalled.error ?? '');
+  rmSync(join(paths.final, 'a-late.md'), { recursive: true, force: true });
+
+  const resumed = await resumeMove(ctx(s), s.project.id);
+  assert.equal(resumed.phase, 'done', resumed.error ?? '');
+  assert.equal(readFileSync(join(paths.final, approvals), 'utf8'), rejected,
+    'a resolved approval must replace its stale pending snapshot, not merge with it');
+});
+
 test('a failure after the switch keeps its checkpoint and resumes finalisation', async (t) => {
   const s = setupAcceptance(t);
   const target = join(s.root, 'checkpoint-target');

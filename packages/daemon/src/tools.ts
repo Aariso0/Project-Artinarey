@@ -56,6 +56,8 @@ type ClaimedBinding = {
   worktreeId: string;
   /** Audit line of the claim that gave this connection ownership. */
   claimLine?: number;
+  /** Stable claim identity, unaffected by later journal merges. */
+  claimId?: string;
 };
 
 export type RpcContext = {
@@ -150,14 +152,20 @@ function readIds(storeDir: string, personaRole: string): Set<string> {
   return ids;
 }
 
-function claimLine(storeDir: string, personaId: string): number | undefined {
-  let line: number | undefined;
+type ClaimMarker = { line?: number; id?: string };
+
+/** Capture both the line and the stable id; older journals may lack the id. */
+function claimMarker(storeDir: string, personaId: string): ClaimMarker | undefined {
+  let marker: ClaimMarker | undefined;
   for (const entry of auditEvents(storeDir)) {
     if (entry.event.type === 'persona_claimed' && entry.event.persona_id === personaId) {
-      line = entry.line;
+      marker = {
+        line: entry.line,
+        id: typeof entry.event.claim_id === 'string' ? entry.event.claim_id : undefined,
+      };
     }
   }
-  return line;
+  return marker;
 }
 
 function hasTaskDone(storeDir: string, personaRole: string, mailId: string): boolean {
@@ -443,10 +451,12 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
     const bindings = ctx.claimedBindings ?? [];
     const owned = bindings.find((b) => b.worktreeId === result.identity.worktreeId
       && b.personaId === result.personaId);
+    const claim = claimMarker(result.identity.storeDir, result.personaId);
     if (owned) {
-      // A repeat claim by this connection appends a new audit line: refresh it so
+      // A repeat claim by this connection appends a new marker: refresh it so
       // releaseConnection still recognises the binding as ours.
-      owned.claimLine = claimLine(result.identity.storeDir, result.personaId);
+      owned.claimLine = claim?.line;
+      owned.claimId = claim?.id;
     } else if (!alreadyBound) {
       // A repeat claim of another owner's binding must not transfer ownership.
       bindings.push({
@@ -454,7 +464,8 @@ export async function dispatchTool(request: RpcRequest, ctx: RpcContext): Promis
         projectId: identity.projectId,
         storeDir: result.identity.storeDir,
         worktreeId: result.identity.worktreeId,
-        claimLine: claimLine(result.identity.storeDir, result.personaId),
+        claimLine: claim?.line,
+        claimId: claim?.id,
       });
     }
     ctx.claimedBindings = bindings;
@@ -831,8 +842,12 @@ export function releaseConnection(ctx: RpcContext): void {
       const storeDir = (binding.projectId
         ? ctx.registry.projects.get(binding.projectId)?.storeDir : undefined) ?? binding.storeDir;
       // A later claim of the same persona is a new binding instance, not ours to release.
-      if (binding.claimLine !== undefined
-          && claimLine(storeDir, binding.personaId) !== binding.claimLine) continue;
+      // Prefer the stable id: journal merges can move line positions without
+      // changing who owns the claim.
+      const current = claimMarker(storeDir, binding.personaId);
+      if (binding.claimId && current?.id) {
+        if (current.id !== binding.claimId) continue;
+      } else if (binding.claimLine !== undefined && current?.line !== binding.claimLine) continue;
       releasePersona(ctx.registry, storeDir, binding.personaId);
     } catch (err) {
       console.error(`persona release failed: ${(err as Error).message ?? String(err)}`);

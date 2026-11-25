@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -55,6 +57,26 @@ test('connectOpencodeAt writes an atomically replaced file', (t) => {
   assert.equal(readFileSync(file, 'utf8'), before);
 });
 
+test('connectOpencodeAt preserves a restrictive config mode', (t) => {
+  if (process.platform === 'win32') return; // POSIX mode bits are not authoritative on Windows
+  const dir = scratch();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, 'opencode.json');
+  writeFileSync(file, '{}', { mode: 0o600 });
+
+  connectOpencodeAt(file, ['/node', '/shim.mjs']);
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+});
+
+test('connectOpencodeAt creates a new config with owner-only mode', (t) => {
+  if (process.platform === 'win32') return;
+  const dir = scratch();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  connectOpencodeAt(join(dir, 'opencode.json'), ['/node', '/shim.mjs']);
+  assert.equal(statSync(join(dir, 'opencode.json')).mode & 0o777, 0o600);
+});
+
 test('opencodeInstalled detects a PATH binary or config dir, and nothing else', (t) => {
   const dir = scratch();
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -71,11 +93,16 @@ test('opencodeInstalled detects a PATH binary or config dir, and nothing else', 
 
   rmSync(fake);
   assert.equal(opencodeInstalled(env), false);
+  const appData = join(dir, 'appdata');
+  mkdirSync(join(appData, 'opencode'), { recursive: true });
+  assert.equal(opencodeInstalled({ ...env, APPDATA: appData }), false,
+    'OpenCode does not read a user config from APPDATA');
+  rmSync(appData, { recursive: true, force: true });
   mkdirSync(join(dir, '.config', 'opencode'), { recursive: true });
   assert.equal(opencodeInstalled(env), true);
 });
 
-test('global config path honours XDG, Windows APPDATA and legacy HOME file', (t) => {
+test('global config path ignores APPDATA and honours XDG and legacy HOME file', (t) => {
   const dir = scratch();
   t.after(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -84,8 +111,12 @@ test('global config path honours XDG, Windows APPDATA and legacy HOME file', (t)
     join(dir, 'xdg', 'opencode', 'opencode.json'),
   );
   assert.equal(
+    opencodeGlobalConfigPath({ HOME: dir, XDG_CONFIG_HOME: join(dir, 'xdg'), APPDATA: join(dir, 'appdata') }),
+    join(dir, 'xdg', 'opencode', 'opencode.json'),
+  );
+  assert.equal(
     opencodeGlobalConfigPath({ HOME: dir, APPDATA: join(dir, 'appdata') }),
-    join(dir, 'appdata', 'opencode', 'opencode.json'),
+    join(dir, '.config', 'opencode', 'opencode.json'),
   );
 
   const legacy = join(dir, '.opencode.json');
