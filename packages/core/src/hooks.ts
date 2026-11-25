@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { ArtinareyError } from './errors.ts';
 
 const HOOK_MARKER = 'artinarey lease-check';
@@ -24,6 +24,10 @@ export function installHooks(repoDir: string, commonDir: string): HookInstall {
     // core.hooksPath is unset; git uses .git/hooks, which is per-worktree.
   }
   if (configured !== '') {
+    const hookPath = resolve(repoDir, configured, 'pre-commit');
+    if (existsSync(hookPath) && readFileSync(hookPath, 'utf8').includes(HOOK_MARKER)) {
+      return { installed: false, note: `lease-check hook already installed at ${hookPath}` };
+    }
     return {
       installed: false,
       note: `core.hooksPath is already ${configured}; add this line to it: ${HOOK_MARKER}`,

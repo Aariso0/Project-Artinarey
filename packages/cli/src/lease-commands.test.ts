@@ -131,5 +131,6 @@ test('installHooks writes the shared pre-commit hook and never overrides hooksPa
 
   const second = installHooks(repo, common);
   assert.equal(second.installed, false);
-  assert.match(second.note, /already/);
+  assert.match(second.note, /already installed/);
+  assert.doesNotMatch(second.note, /add this line/);
 });
