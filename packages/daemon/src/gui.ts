@@ -607,7 +607,7 @@ export async function handleGuiRequest(request: RpcRequest, ctx: RpcContext): Pr
         } catch (err) {
           throw new ArtinareyError(
             'MAIL_PARTIAL',
-            `mail ${record.id} is committed but indexing failed: ${(err as Error).message}; do not resend; rebuild with artinarey reindex`,
+            `mail ${record.id} is committed but indexing failed: ${(err as Error).message}; do not resend; rebuild with artinarey reindex ${project.id}`,
             record.id,
           );
         }

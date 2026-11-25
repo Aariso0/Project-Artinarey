@@ -162,11 +162,17 @@ test('installHooks expands ~ in core.hooksPath before checking the hook', () => 
   }
 });
 
-test('installHooks reports marker-only, non-executable and unreadable hooks as not installed', () => {
+test('installHooks reports invalid and unreadable configured hooks as not installed', () => {
   const cases = [
     {
       label: 'marker-only',
       body: '#!/bin/sh\n# artinarey lease-check — reject files outside the active lease\n',
+      mode: 0o755,
+      match: /restore this line: exec artinarey lease-check --staged/,
+    },
+    {
+      label: 'bare-invocation',
+      body: '#!/bin/sh\nartinarey lease-check\n',
       mode: 0o755,
       match: /restore this line: exec artinarey lease-check --staged/,
     },
@@ -199,7 +205,7 @@ test('installHooks reports marker-only, non-executable and unreadable hooks as n
     const result = installHooks(repo, join(repo, '.git'));
     assert.equal(result.installed, false);
     assert.match(result.note, /cannot read/);
-    assert.match(result.note, /add this line to it: artinarey lease-check/);
+    assert.match(result.note, /add this line to it: exec artinarey lease-check --staged/);
     assert.match(result.note, new RegExp(hook.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   } finally {
     rmSync(root, { recursive: true, force: true });

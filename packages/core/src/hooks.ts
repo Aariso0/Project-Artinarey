@@ -5,8 +5,9 @@ import { ArtinareyError } from './errors.ts';
 
 const HOOK_MARKER = 'artinarey lease-check';
 const HOOK_LINE = `exec ${HOOK_MARKER} --staged`;
-// Only an actual command counts. The template's comment also contains the marker.
-const HOOK_INVOCATION = /^\s*(?:exec\s+)?artinarey\s+lease-check(?:\s|$)/m;
+// Only a staged-file invocation counts: a bare lease-check inspects the working
+// tree, not the index that the commit records. The template comment also has the marker.
+const HOOK_INVOCATION = /^\s*(?:exec\s+)?artinarey\s+lease-check\s+--staged(?:\s|$)/m;
 const PRE_COMMIT = [
   '#!/bin/sh',
   `# ${HOOK_MARKER} — reject files outside the active lease`,
@@ -49,13 +50,13 @@ export function installHooks(repoDir: string, commonDir: string): HookInstall {
     } catch {
       return {
         installed: false,
-        note: `cannot read ${hookPath}; add this line to it: ${HOOK_MARKER}`,
+        note: `cannot read ${hookPath}; add this line to it: ${HOOK_LINE}`,
       };
     }
     if (!content.includes(HOOK_MARKER)) {
       return {
         installed: false,
-        note: `core.hooksPath is already ${configured}; add this line to it: ${HOOK_MARKER}`,
+        note: `core.hooksPath is already ${configured}; add this line to it: ${HOOK_LINE}`,
       };
     }
     if (!HOOK_INVOCATION.test(content)) {

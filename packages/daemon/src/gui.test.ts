@@ -642,7 +642,7 @@ test('chat reports a committed mail when indexing fails after the write', async 
     assert.equal(reply.error.code, 'MAIL_PARTIAL');
     assert.match(reply.error.message, /mail \S+ is committed/);
     assert.match(reply.error.message, /do not resend/);
-    assert.match(reply.error.message, /reindex/);
+    assert.match(reply.error.message, new RegExp(`reindex ${s.project.id}\\b`));
   }
   const files = readdirSync(join(s.project.storeDir, 'mail'), { recursive: true });
   assert.equal(files.some((file) => String(file).endsWith('.md')), true, 'mail was not committed');
@@ -876,6 +876,53 @@ test('a late-write sync failure stays offline at the switching checkpoint', asyn
   assert.equal(resumed.phase, 'done', resumed.error ?? '');
   assert.equal(readFileSync(join(paths.final, 'a-late.md'), 'utf8'), 'accepted while switching\n');
   assert.equal(readMove(ctx(s), s.project.id).phase, 'done');
+});
+
+test('a resumed move merges source and destination journal appends after a failed sync', async (t) => {
+  const s = setupAcceptance(t);
+  const target = join(s.root, 'late-journal-target');
+  mkdirSync(target, { recursive: true });
+  const preview = await handleGuiRequest({
+    id: '1', method: 'gui.movePreflight', params: { projectId: s.project.id, target },
+  }, ctx(s));
+  assert.equal(preview.ok, true, preview.ok ? '' : preview.error.message);
+  const planned = preview.ok ? preview.result as MoveStatus : undefined;
+  const paths = movePaths(target, s.project.id);
+  const journal = 'events/audit.jsonl';
+  const base = '{"event":"base"}\n';
+  const late = '{"event":"source-late"}\n';
+  const fresh = '{"event":"destination-fresh"}\n';
+  const hash = (text: string) => createHash('sha256').update(text).digest('hex');
+
+  mkdirSync(dirname(join(paths.final, journal)), { recursive: true });
+  mkdirSync(dirname(join(s.project.storeDir, journal)), { recursive: true });
+  writeFileSync(join(paths.final, journal), base);
+  writeFileSync(join(s.project.storeDir, journal), base + late);
+  writeFileSync(join(paths.final, 'manifest.json'), `${JSON.stringify({
+    schema: 1, files: { [journal]: hash(base), 'a-late.md': hash('seed\n') },
+  })}\n`);
+  // This blocker fails the first sync before the journal is merged.
+  writeFileSync(join(s.project.storeDir, 'a-late.md'), 'accepted while switching\n');
+  mkdirSync(join(paths.final, 'a-late.md'));
+  mkdirSync(dirname(moveJournalPath(s.paths, s.project.id)), { recursive: true });
+  writeFileSync(moveJournalPath(s.paths, s.project.id), `${JSON.stringify({
+    ...planned!, phase: 'switching', checkpoint: 'switching',
+  })}\n`);
+
+  const stalled = await resumeMove(ctx(s), s.project.id);
+  assert.equal(stalled.phase, 'offline', stalled.error ?? '');
+  // A new append lands in the live store while the move is offline.
+  writeFileSync(join(paths.final, journal), base + fresh);
+  rmSync(join(paths.final, 'a-late.md'), { recursive: true, force: true });
+
+  const resumed = await resumeMove(ctx(s), s.project.id);
+  assert.equal(resumed.phase, 'done', resumed.error ?? '');
+  assert.deepEqual(
+    readFileSync(join(paths.final, journal), 'utf8').trim().split('\n'),
+    ['{"event":"base"}', '{"event":"source-late"}', '{"event":"destination-fresh"}'],
+  );
+  const manifest = JSON.parse(readFileSync(join(paths.final, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.files[journal], hash(base + late + fresh));
 });
 
 test('a failure after the switch keeps its checkpoint and resumes finalisation', async (t) => {

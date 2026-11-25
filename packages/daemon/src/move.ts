@@ -160,10 +160,30 @@ function readManifest(storeDir: string): MoveManifest | undefined {
   }
 }
 
+/** Event journals are append-only; their lines can be merged without losing writes. */
+function isAppendOnly(relative: string): boolean {
+  return /^events\/[^/]+\.jsonl$/.test(relative);
+}
+
+/** Keep source records first, then destination-only records, each line once. */
+function mergeAppendOnly(source: string, destination: string): string {
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  for (const text of [readFileSync(source, 'utf8'), readFileSync(destination, 'utf8')]) {
+    for (const line of text.split('\n')) {
+      if (line === '' || seen.has(line)) continue;
+      seen.add(line);
+      lines.push(line);
+    }
+  }
+  return lines.length > 0 ? `${lines.join('\n')}\n` : '';
+}
+
 /**
  * Mail accepted between verification and the registry switch still lives in the
- * old store. Copy those late bytes into the moved store after the switch; bytes
- * already written to the moved store win, so a fresh reply is never overwritten.
+ * old store. Copy those late bytes into the moved store after the switch. For
+ * append-only journals, merge outstanding records with writes that reached the
+ * moved store after a failed sync; other files keep the fresh reply on top.
  */
 function syncLateWrites(source: string, final: string): void {
   const manifest = readManifest(final);
@@ -175,7 +195,14 @@ function syncLateWrites(source: string, final: string): void {
     const actual = sha256(file);
     if (expected === actual) continue;
     const destination = join(final, relative);
-    if (existsSync(destination) && (!expected || sha256(destination) !== expected)) continue;
+    if (existsSync(destination)) {
+      if (isAppendOnly(relative)) {
+        writeFileSync(destination, mergeAppendOnly(file, destination));
+        manifest.files[relative] = sha256(destination);
+        continue;
+      }
+      if (!expected || sha256(destination) !== expected) continue;
+    }
     mkdirSync(dirname(destination), { recursive: true });
     writeFileSync(destination, readFileSync(file));
     manifest.files[relative] = actual;
